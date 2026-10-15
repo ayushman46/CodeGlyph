@@ -28,3 +28,5 @@ Thumbs.db
 # Documentation / Audits
 explanation.md
 PRODUCTION_AUDIT.md
+frontend/dist-e2e/
+.local/

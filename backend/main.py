@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -7,10 +8,13 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request as UrlRequest, urlopen
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi import Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from config import get_cors_origins, should_run_local_ingestion_worker, settings
 from api.ingest_router import router as ingest_router
@@ -18,6 +22,7 @@ from api.query_router import router as query_router
 from api.repos_router import router as repos_router
 from api.billing_router import router as billing_router
 from api.github_router import router as github_router
+from api.explore_router import router as explore_router
 from agent.nemotron import close_async_client
 from database import DatabaseConfigurationError, assert_turso_schema, get_turso_store
 from ingest.local_worker import process_queue_forever
@@ -27,21 +32,35 @@ _dependency_cache: dict[bool, tuple[float, dict]] = {}
 _dependency_cache_lock = asyncio.Lock()
 
 
+async def _bootstrap_schema() -> None:
+    """Apply additive migrations at startup so the first request is fast."""
+    try:
+        await assert_turso_schema()
+    except DatabaseConfigurationError as error:
+        logger.warning("Turso schema bootstrap skipped: %s", error)
+    except Exception:
+        logger.warning("Turso schema bootstrap failed; requests will retry it", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Start the automatic ingestion worker with the application."""
+    """Bootstrap the schema and start the automatic ingestion worker."""
+    bootstrap_task = asyncio.create_task(_bootstrap_schema(), name="turso-schema-bootstrap")
     worker_task = None
     if should_run_local_ingestion_worker():
         worker_task = asyncio.create_task(process_queue_forever(), name="local-ingestion-worker")
     try:
         yield
     finally:
-        if worker_task:
-            worker_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await worker_task
+        for task in (worker_task, bootstrap_task):
+            if task and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
         with suppress(Exception):
             await close_async_client()
+        with suppress(Exception):
+            await get_turso_store().close()
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
@@ -56,6 +75,109 @@ app = FastAPI(
     redoc_url=None,
 )
 
+# Request bodies are capped before routing. FastAPI reads and JSON-decodes a
+# body before it resolves Depends(get_current_user), so without this a single
+# anonymous request could buffer hundreds of MB and OOM the 512 MB instance.
+DEFAULT_MAX_BODY_BYTES = 256 * 1024
+_LARGE_BODY_PATHS = frozenset({"/api/github/push-pr"})
+
+
+def max_body_bytes_for(path: str) -> int:
+    """Per-route body cap. Push bodies carry complete reviewed files: allow
+    the configured change size with headroom for JSON string escaping."""
+    if path.rstrip("/") in _LARGE_BODY_PATHS:
+        return 2 * max(1, int(settings.max_github_change_bytes)) + 1024 * 1024
+    return DEFAULT_MAX_BODY_BYTES
+
+
+class BodySizeLimitMiddleware:
+    """Pure ASGI middleware that rejects oversized bodies with 413.
+
+    A declared Content-Length above the cap is refused without reading the
+    body. A body without a length (chunked transfer) is read here only up to
+    the cap and then replayed to the application, so memory stays bounded.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    @staticmethod
+    async def _reject(scope, receive, send, limit: int) -> None:
+        response = JSONResponse(
+            status_code=413,
+            content={"detail": f"The request body is too large (limit {limit} bytes)."},
+            headers={"Connection": "close"},
+        )
+        await response(scope, receive, send)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("method") in {"GET", "HEAD", "OPTIONS"}:
+            await self.app(scope, receive, send)
+            return
+        limit = max_body_bytes_for(scope.get("path") or "")
+        declared = None
+        for name, value in scope.get("headers") or []:
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = -1
+                break
+        if declared is not None and (declared < 0 or declared > limit):
+            await self._reject(scope, receive, send, limit)
+            return
+        if declared is not None:
+            # The server enforces the declared length; still count defensively.
+            received = 0
+
+            async def counted_receive():
+                nonlocal received
+                message = await receive()
+                if message["type"] == "http.request":
+                    received += len(message.get("body") or b"")
+                    if received > limit:
+                        raise _BodyTooLarge()
+                return message
+
+            try:
+                await self.app(scope, counted_receive, send)
+            except _BodyTooLarge:
+                logger.warning("Request body exceeded its declared length path=%s", scope.get("path"))
+            return
+        # No declared length: buffer at most ``limit`` bytes, then replay.
+        messages, total = [], 0
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                messages.append(message)
+                break
+            total += len(message.get("body") or b"")
+            if total > limit:
+                await self._reject(scope, receive, send, limit)
+                return
+            messages.append(message)
+            if not message.get("more_body"):
+                break
+        replay = iter(messages)
+
+        async def replay_receive():
+            try:
+                return next(replay)
+            except StopIteration:
+                return await receive()
+
+        await self.app(scope, replay_receive, send)
+
+
+class _BodyTooLarge(Exception):
+    pass
+
+
+# JSON payloads (repository lists, citations) compress well. Starlette skips
+# text/event-stream, so streamed answers are never buffered.
+# Added first so it sits inside CORS: a browser can still read the 413.
+app.add_middleware(BodySizeLimitMiddleware)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_cors_origins(),
@@ -64,14 +186,41 @@ app.add_middleware(
     # The editing review endpoint carries a short-lived, file-scoped ticket
     # in this header. Without it, the browser rejects the cross-origin
     # preflight before FastAPI can validate the ticket or call GitHub.
-    allow_headers=["Authorization", "Content-Type", "X-Editing-Ticket"],
+    allow_headers=["Authorization", "Content-Type", "X-Editing-Ticket", "X-Request-ID"],
+    # X-Error-Code / Retry-After let the review UI tell a GitHub permission
+    # refusal or rate limit apart from an editing-ticket 403.
+    expose_headers=["X-Request-ID", "X-Error-Code", "Retry-After"],
 )
+
+
+
+def _safe_validation_errors(errors) -> list:
+    """Validation details without the rejected input.
+
+    The default handler echoes ``input``: that can be megabytes of file
+    content, and a lone UTF-16 surrogate in it made the JSON encoder raise,
+    turning a 422 into a plain-text 500.
+    """
+    cleaned = []
+    for error in errors:
+        if isinstance(error, dict):
+            error = {key: value for key, value in error.items() if key not in {"input", "url"}}
+        cleaned.append(error)
+    return jsonable_encoder(cleaned)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(_request: Request, exc: RequestValidationError):
+    body = json.dumps({"detail": _safe_validation_errors(exc.errors())}, ensure_ascii=True, default=str)
+    return Response(content=body, status_code=422, media_type="application/json")
+
 
 app.include_router(ingest_router, prefix="/api")
 app.include_router(query_router, prefix="/api")
 app.include_router(repos_router, prefix="/api")
 app.include_router(billing_router, prefix="/api")
 app.include_router(github_router, prefix="/api")
+app.include_router(explore_router, prefix="/api")
 
 
 @app.middleware("http")
@@ -194,6 +343,9 @@ if FRONTEND_DIST.is_dir():
 
     @app.get("/{frontend_path:path}", include_in_schema=False)
     def serve_frontend(frontend_path: str):
+        # Unknown API paths are API errors, not SPA routes.
+        if frontend_path == "api" or frontend_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not Found")
         requested_file = (FRONTEND_DIST / frontend_path).resolve()
         if frontend_path and requested_file.is_relative_to(FRONTEND_DIST.resolve()) and requested_file.is_file():
             return FileResponse(requested_file)

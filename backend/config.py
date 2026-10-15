@@ -25,7 +25,8 @@ class Settings(BaseSettings):
     code_editing_fallback_model: str = "nvidia/nemotron-3.5-lightning-30b-a3b"
     embedding_model: str = "nvidia/nemotron-3-embed-1b"
     embedding_dimension: int = 2048
-    nvidia_timeout_seconds: float = 90.0
+    # Multi-file edits can generate several thousand tokens in one request.
+    nvidia_timeout_seconds: float = 150.0
     # Application-side ceiling for hosted NVIDIA calls. This is deliberately
     # configurable because NVIDIA assigns limits per account/model and may
     # show a different value in the API Catalog. Forty is the common free
@@ -35,14 +36,18 @@ class Settings(BaseSettings):
     # Preserve a few embedding slots for interactive questions while a large
     # repository is being indexed in the background.
     query_embedding_reserve_per_minute: int = 8
-    # Answers are source-grounded and intentionally concise. Avoiding extended
-    # reasoning and oversized generations keeps the interactive chat responsive.
+    # Answers are source-grounded and streamed, so a slightly larger budget
+    # gives complete explanations without making the first token slower.
     nvidia_enable_thinking: bool = False
-    answer_max_tokens: int = 900
+    answer_max_tokens: int = 1_400
     detailed_nvidia_enable_thinking: bool = True
-    detailed_answer_max_tokens: int = 1_800
+    detailed_answer_max_tokens: int = 3_000
     code_editing_enable_thinking: bool = False
-    code_editing_answer_max_tokens: int = 2_400
+    # Multi-file patches are JSON with exact search/replace hunks. A small
+    # output budget truncates the JSON and makes every non-trivial edit fail
+    # validation, so the editor gets a generous ceiling.
+    code_editing_answer_max_tokens: int = 8_192
+    code_editing_plan_max_tokens: int = 1_500
     code_editing_retry_attempts: int = 3
     # Interactive answers fail fast enough to keep the chat responsive. Long
     # embedding jobs retain their separate retry budget below.
@@ -98,10 +103,18 @@ class Settings(BaseSettings):
     ingestion_metrics_enabled: bool = True
     supabase_url: str = ""
     supabase_key: str = ""
+    # Verified Supabase sessions are cached briefly so status polling does not
+    # pay a Supabase round trip on every request.
+    auth_cache_seconds: int = 120
     # Supabase remains the authentication provider. All application data is
     # stored through this server-only Turso connection.
     turso_database_url: str = ""
     turso_auth_token: str = ""
+    turso_http_timeout_seconds: float = 60.0
+    # Additive, idempotent migrations in turso/ are applied on first use so a
+    # deployment never needs manual SQL. Set false to manage schema manually.
+    auto_migrate: bool = True
+    migrations_dir: str = ""
     # Billing is server-only. The public Razorpay key is exposed separately
     # through VITE_RAZORPAY_KEY_ID for the checkout widget.
     razorpay_key_id: str = ""
@@ -113,18 +126,31 @@ class Settings(BaseSettings):
     # Team quota is configurable and deliberately finite; do not imply unlimited storage.
     team_codebase_bytes: int = 800_000_000
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
-    # Protect the service from excessively large repository ingestion jobs.
-    max_repository_files: int = 5_000
+    # Repository limits are *budgets*, not failure thresholds. Files are ranked
+    # by importance (source and schema first; tests, fixtures, docs, and data
+    # later) and the most important files are indexed until a budget is spent.
+    # Everything omitted is reported in the coverage panel with its reason.
+    max_repository_files: int = 10_000
     max_repository_bytes: int = 100_000_000
     # Source files are chunked before embedding, so this is a per-file safety
-    # limit rather than a provider input limit. Fifty MB covers large source
-    # and schema files while the repository-wide limit remains in effect.
+    # limit rather than a provider input limit.
     max_file_size_bytes: int = 50_000_000
-    # The byte limit is the primary repository guard. Fifteen thousand
-    # bounded chunks lets a 100 MB source tree complete without the previous
-    # arbitrary 3,500-chunk failure; chunk buffers and vectors are still
-    # released incrementally for the 512 MB Render process.
+    # Chunk budget for one repository. Selection estimates chunks before
+    # chunking and the worker stops gracefully at the budget instead of
+    # failing the job.
     max_repository_chunks: int = 15_000
+    # Non-English locale catalogues (for example packages/i18n/locales/fr)
+    # are large, repetitive, and match English keys in every language, which
+    # floods keyword search. English catalogues are always indexed.
+    index_translations: bool = False
+    # Repository source is streamed from GitHub's archive endpoint (no git
+    # binary). These bound the download and its wall-clock time.
+    github_codeload_base_url: str = "https://codeload.github.com"
+    github_raw_base_url: str = "https://raw.githubusercontent.com"
+    archive_max_download_bytes: int = 1_500_000_000
+    source_fetch_timeout_seconds: int = 600
+    # The coverage report keeps this many omitted paths (counts stay exact).
+    excluded_paths_limit: int = 1_500
     # GitHub OAuth & Git Data API integration
     github_client_id: str = ""
     github_client_secret: str = ""
@@ -162,11 +188,18 @@ class Settings(BaseSettings):
     # At most this many complete files are handed to the code model. Related
     # imports/callers are selected only when they are present in the indexed
     # evidence, so a large repository never becomes a whole-repository prompt.
-    editing_max_files: int = 6
+    editing_max_files: int = 8
     editing_max_chunks_per_file: int = 256
+    # Upper bound for a single file the editor reads or creates.
+    editing_file_max_characters: int = 60_000
     # Dense reranking is restricted to lexical/path candidates so a question
     # never performs a repository-wide vector sort on Turso.
     dense_candidate_limit: int = 256
+    # File-level semantic search ranks file centroids, then reranks chunks
+    # inside this many files.
+    file_vector_top_files: int = 12
+    # A compact directory map helps answers name exact folders.
+    repo_map_max_characters: int = 2_400
     # Broad architectural questions need a representative sample of the index
     # when no code-term match exists in the user's wording.
     overview_retrieval_candidates: int = 64
@@ -178,6 +211,13 @@ class Settings(BaseSettings):
     # Run the durable worker in-process so jobs do not remain queued indefinitely.
     local_ingestion_worker: bool = True
     local_ingestion_poll_seconds: float = 3.0
+    # Render's free tier sleeps after 15 idle minutes, which would freeze a
+    # long indexing job if the user closes the tab. While a job is running the
+    # worker pings the public health endpoint so the instance stays awake;
+    # once the queue is empty the service can sleep normally.
+    keepalive_during_ingestion: bool = True
+    keepalive_interval_seconds: int = 240
+    public_app_url: str = ""
 
     model_config = SettingsConfigDict(
         env_file=str(ENV_FILE),

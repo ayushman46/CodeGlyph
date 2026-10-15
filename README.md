@@ -1,627 +1,206 @@
-# Codebase Intelligence
-
-Codebase Intelligence turns a public GitHub repository into a private workspace that can be searched and discussed with source citations. It helps a person understand an unfamiliar system without opening every file manually. Answers are grounded in the indexed source, and each citation shows the file path, the line range, and the reason that the evidence was selected.
-
-The current interface uses one responsive chat composer. Users can choose an answer model and a workflow independently, while the question field, selectors, and send action remain separated at desktop, tablet, and mobile widths. Long questions stay clipped inside the input instead of covering the model or workflow controls.
-
-## Why this project exists
-
-Modern repositories are difficult to learn because useful context is spread across application code, configuration, database scripts, tests, deployment files, and documentation. A README can describe the intended design while the implementation has changed. A normal chat model can also miss files, invent relationships, or cite a convenient document that does not answer the question.
-
-Codebase Intelligence addresses that gap by building a searchable source workspace before answering questions. It combines exact file lookup, keyword search, semantic search, dependency evidence, file metadata, and a question specific evidence plan.
-
-## Who benefits from it -
-
-### A new intern joining a company
-
-An intern can submit a public repository and ask questions in plain language. The workspace can explain where authentication is implemented, how a request reaches the database, which files create a deployment, how tests are organized, and which terms are important. The intern can learn from the actual source instead of relying on a long meeting or incomplete notes.
-
-The answer includes the relevant paths and line ranges. This gives the intern a direct route from an explanation to the implementation and makes it easier to ask a precise follow up question.
-
-### A senior employee giving knowledge transfer
-
-Knowledge transfer often repeats the same explanation for every new joiner. A senior employee can index the repository once and use the workspace as a durable first layer of context. New joiners can ask about architecture, important flows, configuration, failure handling, or the reason a component exists before requesting help from the senior employee.
-
-The senior employee can also use dependency and impact questions to explain what could be affected by changing a file. This makes a short handover more useful and reduces interruptions without replacing human review.
-
-### A person starting as an open source contributor
-
-An open source contributor can begin with questions such as where an issue should be fixed, how a feature flows through the repository, which tests cover a component, how to run the project, and which files are safe to change. The contributor can ask for the implementation behind a README statement and inspect the cited source directly.
-
-This shortens the time between finding a project and making a useful first contribution. It also helps a contributor understand conventions before opening a pull request.
-
-### A reviewer or technical investigator
-
-The workspace can support a bounded architecture review, security review, onboarding review, or technical due diligence session. The response is limited to evidence that exists in the indexed repository. If the repository does not establish a claim, the answer states that evidence is missing instead of presenting an assumption as a fact.
-
-## Problems it solves
-
-1. It reduces the time needed to find the file that implements a feature.
-
-2. It gives answers based on source rather than only on general model knowledge.
-
-3. It keeps file names, symbols, and real line ranges with every chunk.
-
-4. It uses a question specific retrieval plan. An authentication question can prioritize authentication routes, middleware, sessions, configuration, and tests. A navigation question can prioritize header and navigation components. An API location question can return implementation paths instead of a generic README.
-
-5. It explains the limits of the index. The repository list reports eligible source files, indexed files, omitted files, omission reasons, and omitted paths.
-
-6. It supports incremental re indexing. A SHA 256 manifest lets the worker skip unchanged files and replace changed or removed file evidence.
-
-7. It supports durable indexing jobs. A worker can claim a queued job, renew its lease, recover abandoned work, and allow a user to stop indexing.
-
-8. It continues to support keyword retrieval when the hosted embedding provider is temporarily unavailable.
-
-## How the system works
-
-<img width="677" height="572" alt="image" src="https://github.com/user-attachments/assets/a0b9569d-9e63-4db1-b2d6-f8a4b4dcb59c" />
-
-### Authentication
-
-The user signs in with Google through Supabase Auth. The browser receives a Supabase session token. The FastAPI server validates that token and uses the authenticated user identifier for every repository, conversation, job, usage, and billing query.
-
-Supabase is used as the identity provider. Repository content, vectors, metadata, conversations, jobs, and quota data are stored in Turso. The browser never receives the Turso authentication token, the NVIDIA API key, the Razorpay secret, or a database service credential.
-
-### Repository submission
-
-The user submits a public HTTPS GitHub repository URL. The server normalizes the URL, validates its shape, checks the account limits, and creates or reuses an owned repository row. A durable ingestion job is written before the request returns to the browser.
-
-<img width="343" height="514" alt="image" src="https://github.com/user-attachments/assets/38c41665-47a7-46f3-b632-95aada7ee184" />
-
-### Cloning
-
-The worker creates a unique temporary directory and performs a shallow Git clone. It uses a blob filter to avoid downloading unnecessary history. The clone is removed after the job completes or fails.
-
-### File selection
-
-The selection pass walks the checkout without entering ignored directories. It accepts source code, configuration, documentation, database scripts, and common deployment files. It rejects hidden files, lockfiles, minified files, unsupported formats, binary files, symlinks, files over the configured size, and files that cannot be read as text.
-
-The same selection policy produces the coverage report. This prevents the user interface from claiming that every byte of a checkout was indexed when the policy intentionally omitted files.
-
-### File manifest
-
-Every selected file receives a SHA 256 content hash and a byte size. During re indexing, the worker compares the new manifest with the stored manifest. Unchanged files are left in place. Changed files receive new chunks and vectors. Removed files have their stale chunks and file metadata removed.
-
-### Chunking
-
-The chunker reads a source file and preserves its relative path, language, symbols, starting line, ending line, and content. It uses declaration boundaries where possible and bounded line or character windows for large files. Chunk overlap helps preserve context across a boundary.
-
-The current safety settings allow a maximum of 150 lines per line based chunk window, a character ceiling of 12,000 characters per chunk, and a maximum of 15,000 chunks per repository. The worker uses a bounded pool for ordinary changed files and automatically serializes large files, then releases vectors after each bounded insert batch, keeping peak memory suitable for a 512 MB Render instance. The default repository limit is 100 MB and the default per file limit is 50 MB. The byte limit remains the primary guard; the higher chunk ceiling prevents dense but valid source trees from failing at the previous arbitrary 3,500 chunk threshold.
-
-### Dependency evidence
-
-The dependency pass recognizes common import and include forms and resolves them only when the target exists in the same checkout. It stores source file, target file, import name, and line number. Impact questions use this graph as additional evidence and label it separately from ordinary content matches. The repository menu also exposes Change impact, which accepts a relative file path and lists the indexed files that import it. Dynamic and external imports are explicitly reported as outside the graph.
-
-### Embeddings
-
-The default embedding model is NVIDIA Nemotron 3 Embed 1B. It produces native 2,048 dimensional float vectors for the configured database schema. The worker sends passage inputs in bounded batches. It starts with up to 32 passages and 160,000 characters per request and reduces the batch to four or less if the provider rejects a payload. Every chunk must still receive a vector or be retained for keyword retrieval when the provider is unavailable.
-
-The application keeps a request budget for interactive questions while indexing. The default application ceiling is 40 embedding calls per minute, with eight calls reserved for query embeddings. Set `NVIDIA_CALLS_PER_MINUTE` to the exact value shown for your NVIDIA API key; this setting throttles our worker and cannot increase NVIDIA's account quota. NVIDIA may assign a different limit per model and under concurrent load.
-
-Progress writes are throttled so Turso is not updated after every provider request. Cancellation is still checked before every embedding batch and worker leases continue to receive heartbeats.
-
-### Ingestion performance
-
-File selection, hashing, dependency extraction, and chunking are linear in the selected source size. Local dependency lookups use sets rather than repeated repository scans, and line ranges are calculated with one newline index and binary search. Changed files are chunked with a bounded worker pool instead of one file at a time. The worker uses two concurrent chunkers for ordinary files and automatically switches to one for large files, preventing a 512 MB Render instance from retaining several large source buffers at once. Unchanged files skip chunking and embedding entirely. Hosted embedding requests use a 32 passage ceiling and a 160,000 character ceiling, so small files use fewer provider round trips without sending an unbounded payload; rejected payloads are split adaptively. Chunks are persisted in configurable batches of 250 by default, reducing remote database round trips without changing ordering or evidence. Hosted embedding latency remains the dominant variable because it depends on NVIDIA service capacity.
-
-The code editing review is file complete rather than citation excerpt based. Editing retrieval expands the highest confidence target files beyond the two chunk sample used by normal chat, includes complete bounded file sequences, and adds only resolved callers or imports for issue driven changes. The model receives a separate 120,000 character editing context budget, while the number of files and chunks remains capped. Every proposed file is loaded from the current GitHub revision, compared against the generated replacement, and shown in its own tab. The review renders removed lines in red and added lines in green, reports the change counts, and uses a bounded large file fallback instead of freezing the browser. The server still applies exact grounded hunks and verifies each Git blob SHA before creating one atomic commit, so the visual diff never replaces the merge safety checks.
-
-Ingestion is two phase. Keyword chunks are written first, so the repository becomes searchable before semantic vectors finish. The status panel then reports real semantic progress and accepts questions during background embedding. Passage content hashes reuse vectors from the bounded Turso embedding cache for repositories up to 25 MB; larger indexes stream vectors without keeping a second cache copy, which avoids unnecessary memory pressure. Files above 2 MB are chunked through a bounded producer instead of materialising the whole file, and dependency extraction hashes and scans large files incrementally. Vectors remain packed float32 values in the worker and are converted to compact JSON only at the bounded Turso write boundary. Unchanged files are skipped by the SHA 256 manifest. Refreshes keep the previous searchable version until the replacement is validated, and cancelling a refresh removes only that attempt's rows. A small RSS guard reduces buffers above 350 MB and pauses new provider work above 450 MB to protect the 512 MB Render process. Deterministic onboarding metadata is built after source search is available rather than blocking it.
-
-### Turso persistence
-
-Turso stores repository rows, file manifests, source chunks, native vectors, dependency edges, coverage reports, ingestion jobs, factual metadata, conversations, account usage, and billing orders. Chunk inserts use bounded idempotent batches. Read statements avoid unnecessary remote commits, and vector JSON is compacted before it is passed to the native vector function.
-
-### Retrieval
-
-The retrieval planner first classifies the question. It can identify an explicit file request, an API location question, a security question, an indexing question, an impact question, a documentation question, or a broad architecture question.
-
-The planner then selects the smallest useful evidence set. It combines parameterized keyword search, native cosine vector search, exact file matching, path hints, dependency evidence, and a bounded overview fallback. Results are deduplicated and made file diverse before they reach the answer model.
-
-An explicit request for a file such as sql/schema.sql uses an exact file path route. A question about authentication prioritizes authentication and session implementation paths. A question about the navigation bar prioritizes header and navigation components. README content is retained for documentation and overview questions but is not used as a generic citation for a targeted implementation question.
-
-### Answer generation
-
-The answer model receives the user question, a bounded conversation history, the evidence plan, and the selected source chunks. The prompt requires a structured response, bold file names, concise explanations, source citations, and an evidence limits section when a claim is not established by the index.
-
-The system removes provider planning traces before content is displayed or saved. If the provider returns no usable answer, the API returns a safe failure without exposing internal credentials or stack details.
-
-## Current limits and coverage
-
-The defaults are intentionally finite so one user cannot exhaust the worker or database.
-
-1. Maximum selected files in one repository: 5,000.
-
-2. Maximum eligible source bytes in one repository: 100 MB.
-
-3. Maximum size of one selected source file: 50 MB.
-
-4. Maximum chunks in one repository: 15,000.
-
-5. Explorer indexed source quota: 200 MB across the account.
-
-6. Team indexed source quota: 800 MB while the Team entitlement is active.
-
-7. Team price in the current configuration: 300 Indian rupees for 30 days.
-
-These values are configuration settings, not guarantees of unlimited storage. A user can delete a repository from the indexed codebases section to release its accounted source bytes.
-
-### Files that are not indexed
-
-The current policy excludes hidden files, ignored directories, symlinks, lockfiles, minified files, binary or invalid text, unsupported formats, files over 50 MB, and files rejected by the repository safety limits. The coverage report exposes the reason and path for policy exclusions that are detected during selection.
-
-The worker does not index Git history. It indexes the current shallow checkout. A private GitHub repository is not accepted by the public URL ingestion flow.
-
-## Supported workflows
-
-The chat selector provides bounded modes for different goals.
-
-1. General understanding focuses on the best evidence for the question.
-
-2. New engineer onboarding explains structure, setup, important flows, and vocabulary.
-
-3. Security review focuses on authentication, authorization, secrets, trust boundaries, validation, and security relevant tests that are present in the index.
-
-4. Architecture interview explains components, data flow, boundaries, and tradeoffs supported by source.
-
-5. Open source contribution explains how to set up the project, locate a change, find tests, and understand contribution paths.
-
-6. Technical due diligence gives a bounded summary of architecture, dependencies, operational concerns, and evidence gaps.
-
-7. Code editing and PR is the only mode that can generate a change proposal or expose the GitHub review action. It uses NVIDIA Nemotron Super for code generation, with the configured Nemotron Lightning fallback. It asks for exact search and replace hunks across at most eight explicitly evidenced files, checks every hunk against that file's indexed source, and refuses speculative or partial patches. Inferred editing targets are expanded to complete bounded source context so imports, exports, call sites, and tests are not silently omitted. The complete current files are loaded from GitHub before the proposed hunks are applied. A short lived, file set scoped server ticket is required before the file or PR endpoints can be used.
-
-The modes change evidence priorities and answer structure. They do not create facts that are absent from the repository.
-
-The model selector shows Super 120B Fast and Ultra 550B Detailed for ordinary repository questions. Selecting Code editing and PR switches the model to Nemotron Super and enables the patch and GitHub review path. The code workflow is intentionally unavailable in the other modes so a normal explanation cannot accidentally create a branch or pull request.
-
-### Reviewed GitHub changes
-
-The Review and Push PR action is available only inside Code editing and PR mode and requires a separate GitHub OAuth connection. Google sign in remains the identity used for the Codebase Intel workspace. The complete workflow is:
-
-1. The user selects Code editing and PR and asks for a focused change or pastes an issue reference and issue text.
-
-2. The retrieval planner ranks implementation files first, then expands the selected files to complete bounded source sequences. Issue driven requests may also include resolved callers or imports. A patch is generated only from exact indexed source hunks.
-
-3. The server validates the patch against the indexed file set and issues a short lived editing ticket scoped to the user, repository, and files.
-
-4. The user opens the review. The server loads the complete current files from GitHub and their Git blob SHAs. The review modal shows every proposed file in a separate tab, never treats a citation excerpt as a complete file, and lets the user inspect or edit each replacement.
-
-5. The user connects GitHub through the OAuth popup. The callback stores the token only after GitHub returns the authenticated profile. If OAuth fails, the popup error is passed back to the modal instead of being replaced by a generic expired connection message.
-
-6. After confirmation, the server checks repository ownership, the editing ticket, relative paths, branch naming, file size, and every expected file SHA. It creates one atomic commit on a new `codebase-intel/` branch and opens a pull request.
-
-A user with write permission gets a branch in the upstream repository. A user without write permission gets a fork and a pull request targeting the upstream repository. Existing branches are never force updated, and any stale file returns a conflict so the user can refresh and review again.
-
-GitHub OAuth states are opaque, short lived, single use records in Turso. OAuth tokens are encrypted at rest with `GITHUB_TOKEN_ENCRYPTION_KEY` and are never sent to the browser or written to logs. The key may be a valid Fernet key or a stable secret of at least 32 characters. It must not change between Render deploys. Editing tickets use `EDITING_TICKET_SECRET` when set, or the existing GitHub encryption key during a rolling deployment. Set the exact callback URL in the GitHub OAuth App and in `GITHUB_REDIRECT_URI`. Run `turso/04_limits_and_github.sql` after the existing schema migrations before enabling the feature.
-
-For the current Render service, the callback URL is:
-
-```text
-https://codebase-rag-qu7s.onrender.com/api/github/callback
+# Codebase Intel
+
+Codebase Intel turns any public GitHub repository into a private, searchable workspace. Ask questions and get answers that cite the exact files and lines they came from, browse and search the code, see what a change would affect, and turn a request (or a GitHub issue) into a validated multi-file patch that you review as a green and red diff before a pull request is opened.
+
+It is built for the first hours in an unfamiliar codebase: new engineers onboarding, senior engineers giving knowledge transfer, open-source contributors finding where to make a change, and reviewers doing a security or due-diligence pass.
+
+## What it does
+
+- **Indexes huge repositories without hitting limits.** Files are ranked by importance (source, schema and configuration first; tests, fixtures, generated code and data last) and the most important are indexed within a budget instead of the job failing. Non-English translation catalogues and build artefacts are skipped. Every omission is listed with its reason in a coverage report. A repository like `calcom/cal.com` (7,700 files) indexes its core code fully.
+- **Searchable in moments.** Keyword search is ready as soon as the first sections are written; the semantic index (NVIDIA Nemotron embeddings) builds in the background with live progress. Refreshing a repository only re-processes changed files, and the previous index keeps answering questions until the new one is ready.
+- **Exact citations.** Answers stream in real time and cite code as `path/to/file.ts:L42-L118`. Every citation opens the exact lines in a built-in file viewer and links to GitHub at the indexed commit. Sources are grouped by folder.
+- **Accurate retrieval.** File-level semantic search, keyword search with prefix matching and path weighting, path-aware ranking for component questions, the import graph for impact questions, and follow-up awareness for short questions like "where is it called?".
+- **Code editing and pull requests.** Describe a change or paste a GitHub issue URL. The agent plans the change across files (call sites, types, styles, tests, new files when needed), reads the current files from GitHub, writes exact search/replace hunks, validates every hunk against the real file, and shows the result inline in the chat. The review screen has unified and split diffs, in-place editing with a live diff, a prefilled pull request, `.patch` download, and one-click PR creation (a branch in the repository, or a fork when you lack write access). Nothing is pushed without your review.
+- **Exploration tools.** Repository overview (languages, folder map, key files, suggested questions), instant code search, and change-impact analysis.
+- Light and dark themes, a command palette (`⌘K` / `Ctrl+K`), keyboard-first chat, and a responsive layout down to phone width.
+
+## Architecture
+
+```
+Browser (React SPA on Vercel or served by the API)
+   │  Supabase Google sign-in (session token)
+   ▼
+FastAPI API (Render)  ──── Server-sent events for streamed answers
+   ├── Ingestion worker (in-process, durable Turso queue)
+   │      GitHub archive (codeload) → importance budget → chunker → NVIDIA embeddings
+   ├── Retrieval: FTS5 + file-level vectors + chunk rerank + import graph
+   ├── Answers: NVIDIA Nemotron (streamed)
+   └── Code editor agent: plan → read files (GitHub raw) → hunks → validate → diff
+   ▼
+Turso / libSQL (async HTTP client): repositories, chunks, FTS, vectors, coverage,
+conversations, proposals, billing
 ```
 
-For local development, use `http://localhost:8000/api/github/callback` and register it in a separate GitHub OAuth App or temporarily replace the production callback. GitHub OAuth Apps support one callback URL, so the callback configured in GitHub must match the environment currently being tested.
+### Why the backend runs on Render
 
-If the review modal says that the GitHub connection expired, check the OAuth popup message first. A token encryption message means `GITHUB_TOKEN_ENCRYPTION_KEY` is missing, shorter than 32 characters, malformed, or different from the key used by the deployment that stored the token. A GitHub authorization message means `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, or `GITHUB_REDIRECT_URI` does not match the GitHub OAuth App. After correcting Render variables, redeploy, hard refresh the browser, and connect GitHub again. The connection is separate from Google sign in, so signing out of Google does not refresh the GitHub token.
+The frontend is a static single-page app and deploys perfectly to Vercel. The backend is not a good fit for serverless functions: indexing a large repository streams a ~150 MB archive and makes hundreds of rate-limited embedding requests, which takes minutes and needs a persistent worker. Vercel's function time limits (and daily-only cron on the Hobby plan) cannot run that reliably. The recommended topology is therefore:
 
-For an issue-driven change, select Code editing and PR mode and paste the issue number and full issue text, for example `Issue #1428: ...`. The retrieval plan records the issue reference, ranks the likely target files, expands them to complete bounded source, and adds only resolved callers or imports that can be verified in the dependency graph. The issue number is carried into the proposed pull request. The patch still appears only when every exact replacement is grounded in the selected repository evidence; if the available evidence cannot support a complete fix, the system refuses to expose a push action.
+- **Frontend on Vercel** for instant CDN page loads (`frontend/vercel.json`).
+- **API and worker on Render** (`render.yaml`). The same Render service also serves the built frontend, so a single Render service is a complete deployment on its own.
 
-## Dependencies
+On Render's free tier the instance sleeps after 15 idle minutes. The app shows a "waking up" notice on the first request, and while an indexing job is running the worker pings its own health endpoint so the job is never frozen mid-way.
 
-### Backend dependencies
+### Database access
 
-The backend dependencies are installed from backend/requirements.txt.
+Remote Turso is accessed through an asynchronous Hrana-over-HTTP client (`httpx`). The embedded `libsql` Python client holds the GIL for the duration of every statement, which froze the whole server during network round trips and made the app feel slow while a repository was indexing; it is now used only for local `file:` databases. Vectors are written as packed float32 blobs, batches are atomic, and the additive SQL migrations in `turso/` are applied automatically at startup (`AUTO_MIGRATE=true`).
 
-1. FastAPI provides the HTTP API and request validation.
+## Indexing in detail
 
-2. Uvicorn runs the FastAPI application.
+1. **Download.** The worker streams `codeload.github.com/<owner>/<repo>/tar.gz/HEAD` (or the requested ref: a `github.com/<owner>/<repo>/tree/<branch>` or `/commit/<sha>` URL indexes that branch or commit) and extracts only candidate text files (no `git` binary, binaries never touch the disk). The archive's commit SHA is recorded so citations link to the exact revision. `git clone` remains as a fallback.
+2. **Select.** Files are filtered (lockfiles, minified files, build artefacts, translations, binaries, hidden files except `.github/` workflows and `.env.example`) and ranked by importance. The worker keeps the highest-priority files within the file, byte, and section budgets and the remaining plan quota. Nothing fails because a repository is big; the coverage report explains every omission.
+3. **Compare.** SHA-256 hashes skip unchanged files on refresh. Removed files are deleted.
+4. **Chunk.** Declaration-aware chunking for JS/TS, Python, Go, Rust, Kotlin, Java, Ruby, SQL, Prisma, GraphQL and Markdown merges small declarations into coherent sections with exact line ranges and extracted symbols. Files over 2 MB stream through a bounded producer.
+5. **Keyword search.** Sections are written in batches; the repository becomes queryable immediately.
+6. **Semantic index.** Sections are embedded in adaptive batches with a shared rate limiter that reserves capacity for interactive questions. Per-file centroid vectors power file-level semantic search. If the embedding provider is down the index degrades to keyword search with a clear message.
+7. **Refresh safety.** A refresh writes replacement rows under a job-scoped prefix that retrieval hides until an atomic swap. Stopping or failing a refresh restores the previous index.
 
-3. OpenAI provides the client for the OpenAI compatible NVIDIA NIM endpoints.
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `MAX_REPOSITORY_FILES` | 10,000 | Files indexed per repository (importance order) |
+| `MAX_REPOSITORY_BYTES` | 100 MB | Source bytes indexed per repository |
+| `MAX_REPOSITORY_CHUNKS` | 15,000 | Sections per repository |
+| `MAX_FILE_SIZE_BYTES` | 50 MB | Largest single file considered |
+| `INDEX_TRANSLATIONS` | false | Include non-English locale catalogues |
+| `FREE_CODEBASE_BYTES` / `TEAM_CODEBASE_BYTES` | 200 MB / 800 MB | Indexed-source quota per plan |
+| `NVIDIA_CALLS_PER_MINUTE` | 40 | Set to your NVIDIA key's limit |
 
-4. Code editing mode uses NVIDIA's hosted Nemotron Super model with a Nemotron Lightning catalog fallback when the primary endpoint is unavailable. Both models use the same provider-neutral client boundary.
+## Answers and citations
 
-5. Supabase provides Google session validation.
+Each question is classified (explicit file, component, location, API, impact, overview, issue) and retrieved with a bounded evidence set: keyword (FTS5 with prefix matching and 4× weight on path matches), file-level semantic search followed by an exact chunk rerank, a semantic rerank of keyword candidates, path-hint targets, and the import graph for impact questions. Results are fused with reciprocal-rank fusion, kept file-diverse, and passed to the model with real line numbers and a compact repository map so it can name exact folders. Short follow-up questions inherit terms and cited files from the previous turn. Citations the answer actually uses are ranked first. When the model is unavailable the retrieved evidence is returned instead of a guess.
 
-6. libsql version 0.1.11 provides the Turso client.
+Workflows: general, new-engineer onboarding, architecture, security review, open-source contributor, and technical due diligence.
 
-7. GitPython performs shallow GitHub clones.
+## Code editing and pull requests
 
-8. pydantic settings loads and validates environment configuration.
+1. Switch the composer to **Edit & PR** and describe the change, or paste a GitHub issue URL (its title and body become acceptance criteria and the PR says `Fixes #N`).
+2. The agent ranks candidate files, plans the change (files to modify or create, symbols to trace), finds usages of those symbols, and reads the complete current files from GitHub.
+3. The code model returns exact search/replace hunks. Every hunk must match its file exactly once (a trailing-whitespace-tolerant match is accepted only when unique); one repair round fixes imperfect copies. Unvalidated output is never shown as a patch.
+4. The proposal appears in the chat with per-file green/red diffs and is saved, so it survives a reload.
+5. **Review & create PR** opens the review screen: file list with stats, unified or split diff with word-level highlights, edit mode with a live diff, title/description/branch/commit fields, GitHub connection, `.patch` download and copy.
+6. On push, the server verifies the short-lived, file-scoped editing ticket and the reviewed blob SHA of every modified file (and that new files do not already exist), creates one atomic commit on a new `codebase-intel/` branch, and opens the pull request. A stale file returns a conflict and the review screen can re-apply the change to the latest revision.
 
-9. Razorpay creates Team payment orders and supports server side signature verification.
+## Deployment
 
-### Frontend dependencies
+### 1. Turso, Supabase, NVIDIA
 
-The frontend dependencies are defined in frontend/package.json.
+- Create a Turso database and token (`turso db create`, `turso db tokens create`). The schema is created automatically on first start; you can also apply `turso/00_init.sql` … `turso/06_scale_and_editing.sql` manually.
+- In Supabase, enable the Google provider and add your frontend origins (Vercel and/or Render URL, and `http://localhost:5173`) to the redirect allow list.
+- Create an NVIDIA API key with access to the configured Nemotron models.
 
-1. React and React DOM provide the interface.
+### 2. Backend on Render
 
-2. Vite provides the development server and production build.
+Create a service from `render.yaml` (Blueprint) and fill in the secrets marked `sync: false`. The full variable list with comments is in `render.env.example`. Important values:
 
-3. React Router provides page navigation.
+- `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`, `NVIDIA_API_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`.
+- `CORS_ORIGINS`: the frontend origin(s), e.g. `https://your-app.vercel.app,https://your-service.onrender.com`. CORS exposes the `X-Error-Code` and `Retry-After` response headers to the SPA.
+- `GITHUB_FRONTEND_ORIGIN` (**required**): the single origin that serves the SPA. After GitHub authorization the API redirects the browser to `{GITHUB_FRONTEND_ORIGIN}/github/callback` with the one-time code in the URL fragment; the SPA then POSTs `/api/github/complete` with the user's bearer token. Use the Vercel origin for split deploys (e.g. `https://your-app.vercel.app`) or the Render URL for a single-service deploy.
+- `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_REDIRECT_URI=https://your-service.onrender.com/api/github/callback` (register the same callback in the GitHub OAuth App; it stays on the Render API host even when the frontend is on Vercel), `GITHUB_TOKEN_ENCRYPTION_KEY` (a stable Fernet key or a random secret of at least 32 characters), `EDITING_TICKET_SECRET`.
+- If your Render environment still sets `MAX_REPOSITORY_FILES=5000`, raise it to `10000` (or remove it) to use the new default of 10,000.
+- Request bodies over 256 KB are rejected with `413` (the GitHub push endpoint allows `2 × MAX_GITHUB_CHANGE_BYTES + 1 MB`).
 
-4. Zustand stores session, repository, conversation, usage, and indexing state.
+Health check: `/api/health`. Dependency readiness (Turso query and NVIDIA probe): `/api/ready`.
 
-5. Axios handles API requests and timeouts.
+### 3. Frontend on Vercel (recommended)
 
-6. Supabase JavaScript provides browser session management.
+Import the repository in Vercel with **Root Directory = `frontend`** (framework Vite; `frontend/vercel.json` configures SPA routing, caching and security headers). Set:
 
-7. React Markdown renders structured model answers.
+- `VITE_API_BASE_URL=https://your-service.onrender.com/api`
+- `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, optional `VITE_RAZORPAY_KEY_ID`
 
-8. Prism provides scoped source code highlighting.
-
-9. Lucide React provides the interface icons.
-
-10. Framer Motion provides restrained interface motion.
-
-11. Tailwind CSS and the Tailwind Vite integration provide utility styling support.
-
-## Repository structure
-
-1. backend/main.py creates the FastAPI application, request telemetry middleware, health and readiness routes, and frontend serving.
-
-2. backend/api/auth.py validates authenticated Supabase sessions.
-
-3. backend/api/ingest_router.py accepts ingestion requests.
-
-4. backend/api/query_router.py handles conversations and grounded questions.
-
-5. backend/api/repos_router.py lists, updates, re indexes, cancels, and deletes owned repositories.
-
-6. backend/api/billing_router.py creates Team orders and verifies Razorpay signatures.
-
-7. backend/ingest/cloner.py validates URLs, clones repositories, and reports file coverage.
-
-8. backend/ingest/chunker.py creates bounded source chunks and line ranges.
-
-9. backend/ingest/dependencies.py builds the local dependency graph.
-
-10. backend/ingest/embedder.py calls the NVIDIA embedding endpoint and validates vector dimensions.
-
-11. backend/ingest/pipeline.py coordinates the durable ingestion workflow.
-
-12. backend/ingest/local_worker.py runs queued jobs in the web service process.
-
-13. backend/ingest/summarizer.py creates factual repository metadata for overview questions.
-
-14. backend/retrieval/retriever.py plans evidence and fuses exact, keyword, semantic, and dependency matches.
-
-15. backend/agent/nemotron.py calls the answer model and removes internal planning output.
-
-16. backend/database.py provides the server only Turso data layer.
-
-17. backend/quota.py enforces indexed source limits.
-
-18. frontend/src/pages contains the landing, dashboard, account, documentation, platform, and pricing pages.
-
-19. frontend/src/components contains the chat, repository, ingestion, authentication, and payment components.
-
-20. frontend/src/store/useStore.js contains the client state and guarded asynchronous actions.
-
-21. turso/00_init.sql creates the application schema.
-
-22. turso/01_trust_features.sql adds coverage, dependency, and evidence metadata.
-
-23. turso/02_billing.sql adds account entitlement and billing tables.
-
-24. supabase/00_init.sql contains the older Supabase schema and is not the active application data layer after the Turso migration.
+Then add the Vercel origin to `CORS_ORIGINS` and set `GITHUB_FRONTEND_ORIGIN` on Render to the Vercel origin (the GitHub OAuth callback URL stays `https://your-service.onrender.com/api/github/callback`). See `frontend/.env.example`.
 
 ## Local development
-
-### Requirements
-
-Install Python 3.12, Node.js, npm, Git, a Turso database, a Supabase project with Google sign in, and an NVIDIA API key. Razorpay credentials are needed only when testing Team checkout.
-
-### Install the backend
-
-From the repository root, create the Python environment and install the dependencies.
 
 ```bash
 python3 -m venv backend/venv
 backend/venv/bin/pip install -r backend/requirements.txt
+npm --prefix frontend install
+cp .env.example .env   # fill in the values
 ```
 
-### Install the frontend
-
-```bash
-cd frontend
-npm install
-cd ..
-```
-
-### Create the Turso schema
-
-Create the database with the Turso CLI, then apply each SQL file through shell input redirection.
-
-```bash
-turso db create codebase-intel --wait
-turso db shell codebase-intel < turso/00_init.sql
-turso db shell codebase-intel < turso/01_trust_features.sql
-turso db shell codebase-intel < turso/02_billing.sql
-turso db shell codebase-intel < turso/03_github.sql
-turso db shell codebase-intel < turso/04_limits_and_github.sql
-turso db shell codebase-intel < turso/05_performance.sql
-turso db show codebase-intel --url
-turso db tokens create codebase-intel
-```
-
-The less than sign in the shell commands sends the SQL file to the Turso shell. Running the SQL file name as a positional argument makes Turso try to parse the file name as SQL and causes a syntax error.
-
-### Configure the environment
-
-Copy .env.example to .env and fill in the server and browser values. Keep server secrets out of every VITE variable.
-
-```env
-NVIDIA_API_KEY=
-NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
-NEMOTRON_MODEL=nvidia/nemotron-3-super-120b-a12b
-DETAILED_NEMOTRON_MODEL=nvidia/nemotron-3-ultra-550b-a55b
-CODE_EDITING_MODEL=nvidia/nemotron-3-super-120b-a12b
-CODE_EDITING_FALLBACK_MODEL=nvidia/nemotron-3.5-lightning-30b-a3b
-EMBEDDING_MODEL=nvidia/nemotron-3-embed-1b
-EMBEDDING_DIMENSION=2048
-EMBEDDING_BATCH_SIZE=32
-EMBEDDING_MIN_BATCH_SIZE=4
-EMBEDDING_BATCH_MAX_CHARACTERS=160000
-EMBEDDING_CHUNK_BUFFER_SIZE=256
-NVIDIA_CALLS_PER_MINUTE=40
-QUERY_EMBEDDING_RESERVE_PER_MINUTE=8
-EMBEDDING_RETRY_ATTEMPTS=5
-EMBEDDING_RETRY_BASE_SECONDS=2
-EMBEDDING_PROGRESS_INTERVAL_BATCHES=4
-EMBEDDING_HEARTBEAT_INTERVAL_BATCHES=2
-INGESTION_CHUNK_WORKERS=2
-INGESTION_LARGE_FILE_SERIAL_BYTES=8000000
-MEMORY_TARGET_MB=350
-MEMORY_WARNING_MB=400
-MEMORY_CRITICAL_MB=450
-EMBEDDING_CONCURRENCY=1
-
-SUPABASE_URL=
-SUPABASE_KEY=
-TURSO_DATABASE_URL=
-TURSO_AUTH_TOKEN=
-
-RAZORPAY_KEY_ID=
-RAZORPAY_KEY_SECRET=
-TEAM_PLAN_AMOUNT_PAISE=30000
-TEAM_PLAN_DURATION_DAYS=30
-FREE_CODEBASE_BYTES=200000000
-TEAM_CODEBASE_BYTES=800000000
-MAX_REPOSITORY_BYTES=100000000
-MAX_FILE_SIZE_BYTES=50000000
-MAX_REPOSITORY_CHUNKS=15000
-
-GITHUB_CLIENT_ID=
-GITHUB_CLIENT_SECRET=
-GITHUB_REDIRECT_URI=http://localhost:8000/api/github/callback
-GITHUB_FRONTEND_ORIGIN=http://localhost:5173
-# On Render, set GITHUB_REDIRECT_URI to the exact public callback URL:
-# https://your-service.onrender.com/api/github/callback
-# and GITHUB_FRONTEND_ORIGIN to the frontend origin. RENDER_EXTERNAL_URL is
-# used as a safe fallback when the explicit callback is omitted.
-# Use a stable Fernet key or a stable random secret of at least 32 characters.
-GITHUB_TOKEN_ENCRYPTION_KEY=
-EDITING_TICKET_SECRET=
-EDITING_TICKET_TTL_SECONDS=600
-GITHUB_OAUTH_STATE_TTL_SECONDS=600
-MAX_GITHUB_CHANGE_BYTES=10000000
-GITHUB_EDITOR_MAX_BYTES=2000000
-
-VITE_SUPABASE_URL=
-VITE_SUPABASE_ANON_KEY=
-VITE_RAZORPAY_KEY_ID=
-VITE_API_BASE_URL=http://localhost:8000/api
-CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
-MAX_CONTEXT_CHARACTERS=40000
-EDITING_CONTEXT_CHARACTERS=120000
-EDITING_RETRIEVAL_TOP_K=32
-EDITING_MAX_FILES=6
-EDITING_MAX_CHUNKS_PER_FILE=256
-DENSE_CANDIDATE_LIMIT=256
-ANSWER_RETRY_ATTEMPTS=2
-```
-
-The repository already ignores .env files. Never commit a Turso token, NVIDIA key, Razorpay secret, Supabase service role key, or any private repository credential.
-
-### Start the application
-
-Run the backend from the repository root.
+Run the backend and frontend:
 
 ```bash
 backend/venv/bin/python -m uvicorn main:app --app-dir backend --reload --port 8000
 ```
 
-In a second terminal, start the frontend.
-
 ```bash
-cd frontend
-npm run dev
+npm --prefix frontend run dev
 ```
 
-Open http://localhost:5173. The backend health endpoint is available at http://localhost:8000/api/health. Deployment readiness, including a live Turso query and a bounded NVIDIA provider probe, is available at http://localhost:8000/api/ready.
+Open http://localhost:5173.
 
-The local worker runs inside the FastAPI process by default. It claims one durable Turso job at a time. The worker can be disabled by setting LOCAL_INGESTION_WORKER to false when another worker process is responsible for the queue.
-
-## Google sign in setup
-
-1. Enable Google in the Supabase Authentication providers section.
-
-2. Add the Supabase callback URL to the Google Cloud OAuth client.
-
-3. Add http://localhost:5173 and the deployed application URL to the Supabase redirect allow list.
-
-4. Add the deployed application origin to the Google OAuth authorized JavaScript origins.
-
-5. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in the frontend environment and SUPABASE_URL and SUPABASE_KEY in the backend environment.
-
-The name shown in the Google account chooser comes from the Google Cloud OAuth consent screen. It is not controlled by the React application name.
-
-## Team billing
-
-The pricing page calls the server order endpoint. The server creates or reuses an order using the private Razorpay key and the configured amount. The browser opens the Razorpay Standard Checkout using only the public key.
-
-After payment, the browser sends the payment identifier, order identifier, and signature to the server. The server calculates an HMAC SHA256 signature with the private secret and compares it using a timing safe comparison. Only a verified payment activates the Team entitlement.
-
-The current flow grants 30 days of access and does not automatically renew. Recurring billing would require a separate Razorpay subscription and webhook design.
-
-## API surface
-
-All routes require a valid Supabase bearer token except the health and readiness routes.
-
-1. GET /api/health checks service availability.
-
-2. GET /api/ready performs a dependency readiness check with a Turso query and bounded NVIDIA provider probe.
-
-3. POST /api/ingest validates a public GitHub URL and queues indexing.
-
-4. POST /api/query retrieves evidence and returns a grounded answer.
-
-5. GET /api/conversations/{repo_name} restores the owned conversation.
-
-6. GET /api/repos lists repositories owned by the authenticated user.
-
-7. GET /api/status/{repo_name} returns indexing progress and failure details.
-
-8. GET /api/repos/statuses returns status for all owned repositories in one request.
-
-9. POST /api/repos/{repo_name}/reindex queues a re index.
-
-10. POST /api/repos/{repo_name}/cancel-indexing stops active indexing.
-
-11. PATCH /api/repos/{repo_name} changes the workspace label.
-
-12. DELETE /api/repos/{repo_name} removes the owned repository and related data.
-
-13. GET /api/repos/{repo_name}/impact?file_path=src/example.py lists indexed files that import a selected file.
-
-14. GET /api/account/usage returns indexed source usage and quota.
-
-15. POST /api/create-order creates or reuses a Team Razorpay order.
-
-16. POST /api/verify-payment verifies payment and activates the entitlement.
-
-17. GET /api/github/status reports whether the signed in user has a usable GitHub connection.
-
-18. GET /api/github/login starts the short lived GitHub OAuth flow.
-
-19. GET /api/github/callback completes GitHub OAuth and stores the encrypted token.
-
-20. GET /api/github/file loads the current complete file revision for a validated editing ticket.
-
-21. POST /api/github/disconnect removes the user's stored GitHub connection.
-
-22. POST /api/github/push-pr validates the reviewed files, creates the branch and atomic commit, and opens the pull request.
-
-## Render deployment
-
-The Render blueprint builds the Vite frontend and serves it from the FastAPI application. It runs the local ingestion worker in the same web service and uses Turso as the durable database.
-
-Set the secret values in the Render environment for NVIDIA, Supabase, Turso, Razorpay, and the browser safe Supabase and Razorpay keys. Set CORS_ORIGINS to the final deployed origin. Do not put a private secret in a VITE variable.
-
-Set `GITHUB_REDIRECT_URI` to the exact Render callback URL and register the same value in the GitHub OAuth App. Set `GITHUB_FRONTEND_ORIGIN` and `CORS_ORIGINS` to the deployed application origin. `GITHUB_TOKEN_ENCRYPTION_KEY` must be a stable valid Fernet key or a stable secret of at least 32 characters. Changing it makes previously stored GitHub tokens unreadable and requires the user to reconnect GitHub. The committed `render.env.example` file contains the full production variable list without real credentials.
-
-After deployment, verify the following flow.
-
-1. Open /api/health.
-
-2. Sign in with Google.
-
-3. Submit a small public repository.
-
-4. Confirm the status moves through queued, cloning, chunking, and ready. Once
-   keyword chunks are durable the repository is reported as searchable and can
-   be questioned immediately; the UI shows the real semantic embedding
-   percentage until it reaches ready. Repository metadata is refined in a
-   background task and never blocks source retrieval.
-
-5. Ask an implementation question and inspect the cited file paths and line ranges.
-
-6. Re index the repository and confirm unchanged files are reused.
-
-7. Test cancellation on a repository that takes long enough to show progress.
-
-8. Test Team checkout only with Razorpay test credentials.
-
-9. Open the repository three dot menu, choose Change impact, and enter a relative source path to verify the dependency graph.
-
-10. Select Code editing and PR, generate a focused patch, review every file tab, connect GitHub, and confirm that one branch and one pull request are created.
-
-## Reliability and security notes
-
-The server validates authentication and ownership at the data access boundary. Repository names and paths are treated as untrusted input. SQL values are parameterized. Payment signatures are verified on the server. The API does not return database credentials, provider keys, stack traces, or private service details.
-
-The queue uses atomic claims and worker leases. Idempotent inserts and repository scoped ownership checks reduce duplicate work and cross account access. Requests have bounded retries, timeouts, and safe user facing errors.
-
-The hosted NVIDIA endpoint remains an external dependency. A temporary provider outage can delay semantic indexing. When embedding creation is unavailable, the repository can still be stored with keyword retrieval and a clear status message. A sustained provider outage cannot be solved entirely by application code.
-
-## Verification
-
-Run the backend tests from the backend directory.
+To develop without touching a shared database, run a local libSQL server (`turso dev` or `sqld --http-listen-addr 127.0.0.1:18090`) and start the API with `scripts/dev_server.py`. It refuses non-local databases; `--insecure-local-auth` accepts a fixed local user from loopback only so the UI can be exercised without Google sign-in:
 
 ```bash
-cd backend
-./venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v
-./venv/bin/python -m compileall -q .
-cd ..
+backend/venv/bin/python scripts/dev_server.py --insecure-local-auth
 ```
 
-Build the frontend from the repository root.
+## Testing
 
 ```bash
-npm --prefix frontend run build
+cd backend && ./venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-The tests cover authentication boundaries, Turso storage, vector and keyword fallback behavior, file selection, chunking, exclusion reporting, evidence planning, dependency resolution, payment signature verification, quota enforcement, health probes, and guarded asynchronous flows. A CI workflow runs these checks and the frontend build on every push and pull request. The optional browser smoke suite lives in frontend/e2e and the standard library load probe lives in scripts/load_test.py.
+```bash
+npm --prefix frontend run test:unit
+```
+
+```bash
+npm --prefix frontend run build && npm --prefix frontend run test:e2e
+```
+
+The backend suite isolates itself from real services (it never reads production Turso or calls NVIDIA) and covers the async Turso client against libSQL, migrations, importance-budget selection and archive extraction (including hostile archives), chunking invariants, the ingestion lifecycle (refresh staging, cancellation, deletion, budgets, quotas), retrieval at scale, streaming answers, the code editor, GitHub OAuth and PR creation, billing and auth caching. Frontend unit tests cover the diff engine (verified with `git apply`), citation parsing and patch generation. Playwright tests drive the marketing pages and the full workspace (streamed answers, citation viewer, code search, edit proposal, review and PR) against mocked APIs.
+
+## API
+
+All routes require a Supabase bearer token except health/readiness and the GitHub OAuth callback.
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| GET | `/api/health`, `/api/ready` | Liveness and dependency readiness |
+| POST | `/api/ingest` | Queue a repository (URL or `owner/repo`) |
+| GET | `/api/repos`, `/api/repos/statuses`, `/api/status/{repo}` | Repository state (`is_indexing`, `queryable`, phase, progress, coverage summary) |
+| GET | `/api/repos/{repo}/coverage` | Omitted files with reasons and the indexing budget |
+| GET | `/api/repos/{repo}/overview` | Languages, folder map, key files, suggested questions |
+| GET | `/api/repos/{repo}/search?q=` | Instant code search |
+| GET | `/api/repos/{repo}/file?path=` | One file at the indexed commit |
+| GET | `/api/repos/{repo}/impact?file_path=` | Files that import a file, and what it imports |
+| POST | `/api/repos/{repo}/reindex`, `/api/repos/{repo}/cancel-indexing` | Refresh or stop indexing |
+| PATCH / DELETE | `/api/repos/{repo}` | Rename or delete |
+| POST | `/api/query` | Grounded answer (JSON) |
+| POST | `/api/query/stream` | Grounded answer as server-sent events (`stage`, `citations`, `token`, `done`, `error`) |
+| GET / DELETE | `/api/conversations/{repo}` | Conversation history / new chat |
+| GET | `/api/edits/{id}` | Saved edit proposal with a fresh editing ticket |
+| GET | `/api/github/status`, `/api/github/login`, `/api/github/callback` | GitHub connection (callback redirects to `{GITHUB_FRONTEND_ORIGIN}/github/callback`) |
+| POST | `/api/github/complete` | SPA finishes the OAuth connection with the fragment code and the user's bearer token |
+| GET | `/api/github/file` | Current file revision for review (works before connecting GitHub) |
+| POST | `/api/github/push-pr`, `/api/github/disconnect` | Create the branch, commit and PR / disconnect |
+| GET | `/api/account/usage` | Indexed-source usage and quota |
+| POST | `/api/create-order`, `/api/verify-payment` | Team plan checkout (Razorpay) |
+
+## Security
+
+- Supabase validates every session; verified sessions are cached briefly (bounded by token expiry). Every query is scoped to the authenticated user.
+- Repository content, issues and conversation history are treated as untrusted data in every prompt.
+- GitHub tokens are encrypted at rest; the OAuth state is single-use and short-lived. PR creation requires a signed, short-lived ticket scoped to the user, repository and exact file set, plus the reviewed blob SHA of every modified file.
+- Archive extraction rejects path traversal, links and devices, bounds download size and time, and never uses `tar.extract`.
+- SQL is parameterised; payment signatures are verified on the server; API errors never expose credentials or stack traces.
+
+## Troubleshooting
+
+- **The first request is slow** — a free Render instance is waking up; the UI shows a notice.
+- **GitHub popup says the connection expired** — check that `GITHUB_REDIRECT_URI` matches the OAuth App callback exactly and that `GITHUB_TOKEN_ENCRYPTION_KEY` has not changed between deploys. The review screen polls the connection, so it also works when the browser blocks the popup from messaging back.
+- **A file is "partially indexed" or "lower priority"** — the repository exceeded a budget; raise the limits above or upgrade the plan quota. The coverage report lists every skipped path.
+- **Semantic search unavailable** — the embedding provider did not respond; keyword search keeps working and a re-index adds semantic search later.
 
 ## Contributing
 
-Contributions are welcome when they improve source coverage, answer accuracy, security, reliability, accessibility, performance, or interface clarity.
+1. Run the backend tests, frontend unit tests and build before changing anything.
+2. Keep changes focused and add a regression test for the behaviour you change.
+3. Changes to retrieval should show why the selected evidence is more relevant; changes to indexing should keep line ranges, budgets, cancellation and refresh behaviour correct; changes to security boundaries need tests proving one user cannot read or change another user's data.
+4. Open a pull request with the problem, the solution, test output, and any configuration change.
 
-### Before making a change
+## License
 
-1. Read the architecture and indexing sections in this document.
-
-2. Run the backend test suite and the frontend build so you know the starting state.
-
-3. Find the narrowest component or flow that owns the behavior you want to change.
-
-4. Check whether the change affects authentication, repository ownership, quota accounting, indexing coverage, citations, or payment verification.
-
-### Development workflow
-
-1. Fork the repository on GitHub.
-
-2. Create a focused branch for one change.
-
-3. Keep credentials and local database files out of the branch.
-
-4. Make the smallest change that solves the problem.
-
-5. Add or update a regression test for the behavior.
-
-6. Run the backend tests, compilation check, frontend build, and Git whitespace check.
-
-7. Test the affected flow with an empty state, a failure state, a slow network, and a long file name when those states apply.
-
-8. Open a pull request with the problem, the solution, the affected files, test output, and any configuration or migration step.
-
-### Contribution areas
-
-New contributors can help improve token aware chunking, language specific dependency resolution, citation ranking evaluation, repository coverage reporting, accessibility testing, responsive layouts, provider failover, and documentation examples.
-
-Changes to retrieval should include examples showing why the selected evidence is more relevant. Changes to indexing should show that file counts, line ranges, vectors, cancellation, and re indexing behavior remain correct. Changes to security boundaries should include tests proving that one user cannot read or mutate another user data.
-
-## Project principles
-
-1. Source evidence should be easier to inspect than a generated claim.
-
-2. A targeted question should receive targeted citations.
-
-3. Missing evidence should be stated clearly.
-
-4. A slower answer with accurate evidence is better than a fast answer with invented context.
-
-5. Every user owned resource must be protected on the server.
-
-6. The interface should remain calm, readable, and useful on a small screen as well as a large screen.
+See the repository for license information.

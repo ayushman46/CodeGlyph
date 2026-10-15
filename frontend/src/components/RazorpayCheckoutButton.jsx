@@ -1,10 +1,15 @@
-import { Check, Loader2, LockKeyhole, Send, X } from 'lucide-react';
+import { AlertCircle, ArrowRight, Check, LockKeyhole, RefreshCw } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { createTeamOrder, verifyTeamPayment } from '../api/client';
 import useStore from '../store/useStore';
+import { useGoogleSignIn } from './GoogleSignInButton';
+import { buttonClass } from './ui/Button';
+import Spinner from './ui/Spinner';
 
 let razorpayScriptPromise;
 const PENDING_CHECKOUT_KEY = 'codebase-intel.pending-team-checkout';
+// Razorpay's hosted modal cannot read CSS variables, so pass the brand accent.
+const RAZORPAY_THEME_COLOR = '#e4561b';
 
 const loadRazorpayScript = () => {
   if (typeof window === 'undefined') return Promise.reject(new Error('Checkout is only available in a browser.'));
@@ -16,7 +21,7 @@ const loadRazorpayScript = () => {
     script.src = 'https://checkout.razorpay.com/v1/checkout.js';
     script.async = true;
     script.onload = () => (window.Razorpay ? resolve() : reject(new Error('Razorpay checkout could not be loaded.')));
-    script.onerror = () => reject(new Error('Razorpay checkout could not be loaded. Check your connection and try again.'));
+    script.onerror = () => reject(new Error('Razorpay checkout could not be loaded. Check your connection or ad blocker, then try again.'));
     document.body.appendChild(script);
   }).catch((error) => {
     razorpayScriptPromise = undefined;
@@ -26,28 +31,74 @@ const loadRazorpayScript = () => {
   return razorpayScriptPromise;
 };
 
-const providerError = (error) => {
+const providerError = (error, fallback = 'Team checkout could not be started. Please try again.') => {
   const detail = error?.response?.data?.detail;
-  return typeof detail === 'string' && detail.trim()
-    ? detail
-    : error?.message || 'Team checkout could not be completed. Please try again.';
+  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (error?.message === 'Network Error') return 'Could not reach the server. It may be waking up; try again in a few seconds.';
+  return error?.message || fallback;
 };
 
-const RazorpayCheckoutButton = ({ className = '', onSuccess }) => {
-  const { user, signInWithGoogle, isSigningIn } = useStore();
+const MESSAGE_TONE = {
+  success: 'text-success',
+  open: 'text-warning',
+  verifying: 'text-ink-2',
+  cancelled: 'text-ink-3',
+};
+
+/**
+ * Team checkout. States: idle, loading (creating the order), open (Razorpay
+ * modal on screen), verifying, success, cancelled, error (nothing charged)
+ * and unconfirmed (Razorpay took the payment but our verification failed:
+ * the user must not be nudged into paying twice).
+ *
+ * The default dark variant (bg-ink / text-canvas) keeps the label above WCAG
+ * AA contrast in both themes; white on the accent orange is only ~3.7:1.
+ */
+const RazorpayCheckoutButton = ({
+  className = '', onSuccess, variant = 'dark', size = 'lg', teamActive = false, renew = false,
+}) => {
+  const user = useStore((state) => state.user);
+  const signIn = useGoogleSignIn();
   const [state, setState] = useState('idle');
   const [message, setMessage] = useState('');
+  const [payment, setPayment] = useState(null);
   const mountedRef = useRef(true);
   const busyRef = useRef(false);
+  // The reason Razorpay gave for the last failed attempt, kept so it is still
+  // visible after the modal closes.
+  const failureRef = useRef('');
 
-  useEffect(() => () => {
-    mountedRef.current = false;
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
   }, []);
 
   const update = (nextState, nextMessage = '') => {
     if (mountedRef.current) {
       setState(nextState);
       setMessage(nextMessage);
+    }
+  };
+
+  const confirmPayment = async (response) => {
+    busyRef.current = true;
+    update('verifying', 'Confirming your payment with the server…');
+    try {
+      await verifyTeamPayment({
+        razorpay_payment_id: response.razorpay_payment_id,
+        razorpay_order_id: response.razorpay_order_id,
+        razorpay_signature: response.razorpay_signature,
+      });
+      busyRef.current = false;
+      if (mountedRef.current) setPayment(null);
+      update('success', 'Team is active. Your workspace limit is now 800 MB for 30 days.');
+      await onSuccess?.();
+    } catch (error) {
+      busyRef.current = false;
+      if (mountedRef.current) setPayment(response);
+      update('unconfirmed', providerError(error, 'Payment verification could not be completed.'));
     }
   };
 
@@ -62,14 +113,14 @@ const RazorpayCheckoutButton = ({ className = '', onSuccess }) => {
         // Storage can be disabled in privacy-restricted browsers; the user can
         // still return and click the button again after signing in.
       }
-      const signInStarted = await signInWithGoogle();
+      update('idle');
+      const signInStarted = await signIn.start();
       if (signInStarted === false) {
         try {
           window.sessionStorage.removeItem(PENDING_CHECKOUT_KEY);
         } catch {
           // Ignore storage failures; the visible error remains actionable.
         }
-        update('error', 'Google sign-in could not be started. Check your authentication settings and try again.');
       }
       return;
     }
@@ -96,42 +147,32 @@ const RazorpayCheckoutButton = ({ className = '', onSuccess }) => {
         amount: order.amount,
         currency: order.currency,
         name: 'Codebase Intel',
-        description: 'Codebase Intel Team plan',
+        description: 'Team plan · 800 MB for 30 days',
         order_id: order.order_id,
         prefill: {
           name: user.user_metadata?.full_name || '',
           email: user.email || '',
         },
-        theme: { color: '#ff9b88' },
-        handler: async (response) => {
-          update('verifying', 'Confirming your payment…');
-          try {
-            await verifyTeamPayment({
-              razorpay_payment_id: response.razorpay_payment_id,
-              razorpay_order_id: response.razorpay_order_id,
-              razorpay_signature: response.razorpay_signature,
-            });
-            busyRef.current = false;
-            update('success', 'Team plan is active for your workspace.');
-            await onSuccess?.();
-          } catch (error) {
-            busyRef.current = false;
-            update('error', providerError(error));
-          }
-        },
+        theme: { color: RAZORPAY_THEME_COLOR },
+        handler: (response) => confirmPayment(response),
         modal: {
           ondismiss: () => {
             busyRef.current = false;
-            update('cancelled', 'Checkout cancelled. No payment was recorded.');
+            const failure = failureRef.current;
+            failureRef.current = '';
+            if (failure) update('error', `${failure} Nothing was charged.`);
+            else update('cancelled', 'Checkout closed. Nothing was charged.');
           },
         },
       });
 
+      failureRef.current = '';
       checkout.on('payment.failed', (response) => {
-        const description = response?.error?.description;
+        const description = String(response?.error?.description || '').trim();
+        failureRef.current = description ? `Payment failed: ${description.replace(/\.?$/, '.')}` : 'Payment failed.';
         // Keep the trigger locked while Razorpay's modal is still open. The
         // user can retry inside the modal; ondismiss releases the guard.
-        update('open', description ? `Payment failed: ${description}` : 'Payment failed. No payment was recorded.');
+        update('open', `${failureRef.current} Try another method in the Razorpay window, or close it.`);
       });
       checkout.open();
       update('open');
@@ -150,19 +191,59 @@ const RazorpayCheckoutButton = ({ className = '', onSuccess }) => {
     } catch {
       pending = false;
     }
-    if (pending) void handleCheckout();
+    // Someone who already has Team does not need the checkout they asked
+    // for before signing in.
+    if (pending && !teamActive) void handleCheckout();
+    // handleCheckout reads the latest user from this render; resume only when
+    // the signed-in user changes (for example right after the OAuth redirect).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
-  const disabled = isSigningIn || ['loading', 'verifying', 'success', 'open'].includes(state);
-  const label = state === 'loading'
-    ? 'Preparing checkout…'
-    : state === 'verifying'
-      ? 'Confirming payment…'
-      : state === 'success'
-        ? 'Team plan active'
-        : user
-          ? 'Choose Team · ₹300/month'
-          : 'Sign in to choose Team';
+  // An active Team plan has nothing to buy: paying again would restart the
+  // 30 days from the new payment, not add to them.
+  if (teamActive && state !== 'success') {
+    return (
+      <div>
+        <p className="flex h-12 items-center justify-center gap-2 rounded-xl border border-success/25 bg-success-soft px-4 text-[15px] font-medium text-success">
+          <Check className="h-4 w-4" aria-hidden="true" />
+          Team is active on your workspace
+        </p>
+        <p className="mt-3 text-center text-xs leading-relaxed text-ink-3">
+          It runs for 30 days from your payment. Buy it again once it ends; each payment starts a new 30 days.
+        </p>
+      </div>
+    );
+  }
+
+  const redirecting = !user && signIn.busy;
+  const busy = state === 'loading' || state === 'verifying' || state === 'open' || redirecting;
+  const disabled = busy || state === 'success' || state === 'unconfirmed';
+  const price = renew ? 'Renew Team · ₹300' : 'Choose Team · ₹300';
+  const label = redirecting
+    ? 'Redirecting to Google…'
+    : state === 'loading'
+      ? 'Preparing checkout…'
+      : state === 'open'
+        ? 'Finish in the Razorpay window…'
+        : state === 'verifying'
+          ? 'Confirming payment…'
+          : state === 'success'
+            ? 'Team plan active'
+            : state === 'unconfirmed'
+              ? 'Payment awaiting confirmation'
+              : user
+                ? price
+                : 'Sign in to choose Team';
+
+  const icon = busy
+    ? <Spinner className="h-4 w-4" />
+    : state === 'success'
+      ? <Check className="h-4 w-4" aria-hidden="true" />
+      : null;
+
+  const signInError = !user && signIn.error ? `Google sign-in did not start: ${signIn.error}` : '';
+  const errorMessage = state === 'error' ? message : signInError;
+  const liveMessage = state !== 'error' && state !== 'unconfirmed' ? message : '';
 
   return (
     <div>
@@ -170,15 +251,67 @@ const RazorpayCheckoutButton = ({ className = '', onSuccess }) => {
         type="button"
         onClick={handleCheckout}
         disabled={disabled}
-        aria-busy={['loading', 'verifying'].includes(state)}
+        aria-busy={busy || undefined}
         data-testid="choose-team-button"
-        className={`inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-full bg-ink-black px-5 py-3 text-sm font-semibold text-pure-white transition hover:bg-charcoal disabled:cursor-not-allowed disabled:opacity-60 ${className}`}
+        className={buttonClass(variant, size, `group w-full ${className}`)}
       >
-        {state === 'success' ? <Check className="h-4 w-4" aria-hidden="true" /> : state === 'cancelled' ? <X className="h-4 w-4" aria-hidden="true" /> : state === 'loading' || state === 'verifying' ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> : <Send className="h-4 w-4" aria-hidden="true" />}
+        {icon}
         {label}
+        {!icon && state !== 'unconfirmed' && (
+          <ArrowRight className="h-4 w-4 transition-transform duration-150 group-hover:translate-x-0.5" aria-hidden="true" />
+        )}
       </button>
-      <p className="mt-3 flex items-center justify-center gap-1.5 text-xs text-warm-gray"><LockKeyhole className="h-3.5 w-3.5" aria-hidden="true" />Secure payment through Razorpay</p>
-      {message && <p className={`mt-3 text-center text-sm leading-relaxed ${state === 'error' ? 'text-red-700' : state === 'success' ? 'text-emerald-700' : 'text-pewter'}`} role={state === 'error' ? 'alert' : 'status'}>{message}</p>}
+      <p className="mt-3 flex items-center justify-center gap-1.5 text-xs text-ink-3">
+        <LockKeyhole className="h-3.5 w-3.5" aria-hidden="true" />
+        Secure checkout by Razorpay
+      </p>
+      {/* A persistent live region announces progress; errors use an alert. */}
+      <p
+        role="status"
+        aria-live="polite"
+        className={liveMessage ? `mt-3 text-center text-sm leading-relaxed ${MESSAGE_TONE[state] || 'text-ink-2'}` : 'sr-only'}
+      >
+        {liveMessage}
+      </p>
+      {errorMessage && (
+        <div role="alert" className="mt-3 flex items-start gap-2.5 rounded-xl border border-danger/25 bg-danger-soft px-3.5 py-3 text-sm leading-relaxed text-danger">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+          <div className="min-w-0 flex-1">
+            <p className="break-words">{errorMessage}</p>
+          </div>
+        </div>
+      )}
+      {state === 'unconfirmed' && (
+        <div role="alert" className="mt-3 rounded-xl border border-warning/30 bg-warning-soft px-3.5 py-3 text-sm leading-relaxed text-ink">
+          <p className="flex items-start gap-2.5 font-semibold text-warning">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+            Razorpay accepted the payment, but we could not confirm it yet.
+          </p>
+          <p className="mt-1.5 text-[13px] text-ink-2">
+            {message} Do not pay again. Retry the confirmation; it is safe to repeat.
+            {payment?.razorpay_payment_id && (
+              <> Payment ID <code className="break-all font-mono text-[12px] text-ink">{payment.razorpay_payment_id}</code>.</>
+            )}
+          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => payment && confirmPayment(payment)}
+              className={buttonClass('secondary', 'sm')}
+            >
+              <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+              Retry confirmation
+            </button>
+            <button
+              type="button"
+              onClick={() => { setPayment(null); update('idle'); }}
+              className={buttonClass('ghost', 'sm')}
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

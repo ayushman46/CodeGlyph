@@ -116,7 +116,13 @@ class GitHubIntegrationTests(unittest.TestCase):
         commit_mock.status_code = 200
         commit_mock.json.return_value = {"tree": {"sha": "base_tree_456"}}
 
-        mock_get.side_effect = [ref_mock, commit_mock]
+        # 2b. Directory listings that resolve the existing file's Git mode.
+        root_tree = MagicMock(status_code=200)
+        root_tree.json.return_value = {"tree": [{"path": "src", "type": "tree", "mode": "040000", "sha": "src_tree"}]}
+        src_tree = MagicMock(status_code=200)
+        src_tree.json.return_value = {"tree": [{"path": "app.py", "type": "blob", "mode": "100644", "sha": "file_sha"}]}
+
+        mock_get.side_effect = [ref_mock, commit_mock, root_tree, src_tree]
         mock_file.return_value = {"sha": "file_sha", "content": "old", "size": 3}
 
         # 3. Create blob
@@ -165,7 +171,16 @@ class GitHubIntegrationTests(unittest.TestCase):
         ref_mock.json.return_value = {"object": {"sha": "base_commit"}}
         commit_mock = MagicMock(status_code=200)
         commit_mock.json.return_value = {"tree": {"sha": "base_tree"}}
-        mock_get.side_effect = [ref_mock, commit_mock]
+        root_tree = MagicMock(status_code=200)
+        root_tree.json.return_value = {"tree": [
+            {"path": "src", "type": "tree", "mode": "040000", "sha": "src_tree"},
+            {"path": "tests", "type": "tree", "mode": "040000", "sha": "tests_tree"},
+        ]}
+        src_tree = MagicMock(status_code=200)
+        src_tree.json.return_value = {"tree": [{"path": "auth.py", "type": "blob", "mode": "100644", "sha": "a"}]}
+        tests_tree = MagicMock(status_code=200)
+        tests_tree.json.return_value = {"tree": [{"path": "test_auth.py", "type": "blob", "mode": "100644", "sha": "b"}]}
+        mock_get.side_effect = [ref_mock, commit_mock, root_tree, src_tree, tests_tree]
 
         blob_one = MagicMock(status_code=201)
         blob_one.json.return_value = {"sha": "blob_one"}

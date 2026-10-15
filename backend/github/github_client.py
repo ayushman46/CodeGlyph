@@ -6,10 +6,13 @@ import asyncio
 import base64
 import logging
 import re
+import time
 from typing import Any
 from urllib.parse import quote, urlencode
 
 import httpx
+
+from config import settings
 
 logger = logging.getLogger(__name__)
 GITHUB_API_BASE = "https://api.github.com"
@@ -29,6 +32,30 @@ class GitHubAuthRequiredError(GitHubAPIError):
 
 class GitHubConflictError(GitHubAPIError):
     """Raised when a reviewed change is stale or its branch already exists."""
+
+
+class GitHubNotFoundError(GitHubAPIError):
+    """Raised when GitHub answers 404 for a repository, ref, or file."""
+
+
+class GitHubRateLimitError(GitHubAPIError):
+    """Raised for GitHub primary/secondary rate limits (retryable later)."""
+
+    def __init__(self, message: str, retry_after: int | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class GitHubPermissionError(GitHubAPIError):
+    """Raised for a 403 that a reconnect cannot fix (org policy, no access)."""
+
+
+class GitHubFileTooLargeError(GitHubAPIError):
+    """Raised when a file exceeds the byte limit of a bounded read."""
+
+
+class GitHubForkNotReadyError(GitHubAPIError):
+    """Raised when GitHub has not finished creating a fork yet (retryable)."""
 
 
 def get_authorization_url(client_id: str, redirect_uri: str, state: str) -> str:
@@ -87,13 +114,69 @@ async def exchange_code_for_token(client_id: str, client_secret: str, code: str,
     return data
 
 
+def _response_message(response: httpx.Response) -> str:
+    try:
+        data = response.json()
+    except Exception:
+        return ""
+    return str(data.get("message") or "") if isinstance(data, dict) else ""
+
+
+def _retry_after_seconds(response: httpx.Response) -> int | None:
+    headers = getattr(response, "headers", None) or {}
+    try:
+        value = headers.get("retry-after")
+        if value and str(value).strip().isdigit():
+            return int(str(value).strip())
+        reset = headers.get("x-ratelimit-reset")
+        if reset and str(reset).strip().isdigit():
+            return max(1, int(reset) - int(time.time()))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return None
+
+
+def _is_rate_limited(response: httpx.Response, message: str) -> bool:
+    headers = getattr(response, "headers", None) or {}
+    try:
+        remaining = str(headers.get("x-ratelimit-remaining") or "").strip()
+    except AttributeError:
+        remaining = ""
+    return response.status_code == 429 or remaining == "0" or "rate limit" in message.lower()
+
+
 def _raise_for_api(response: httpx.Response, action: str) -> None:
-    if response.status_code in {401, 403}:
-        raise GitHubAuthRequiredError("GitHub credentials expired or do not have the required permission. Reconnect GitHub.")
-    if response.status_code == 404:
-        raise GitHubAPIError(f"GitHub could not find the requested {action}.")
-    if response.status_code >= 400:
-        raise GitHubAPIError(f"GitHub could not {action} (HTTP {response.status_code}).")
+    """Map a GitHub error response to a specific, actionable exception.
+
+    Only a 401 means the connection must be renewed. A 403 is a rate limit,
+    an organization OAuth-app restriction, or a missing permission: none of
+    them is fixed by reconnecting, so they must not disconnect GitHub.
+    ``action`` is a verb phrase such as "read the repository".
+    """
+    status_code = response.status_code
+    if status_code < 400:
+        return
+    if status_code == 401:
+        raise GitHubAuthRequiredError("Your GitHub connection expired or was revoked. Reconnect GitHub.")
+    if status_code in {403, 429}:
+        message = _response_message(response)
+        if _is_rate_limited(response, message):
+            retry_after = _retry_after_seconds(response)
+            when = f" Try again in about {max(1, (retry_after + 59) // 60)} minute(s)." if retry_after else " Try again in a few minutes."
+            raise GitHubRateLimitError(f"GitHub rate limit reached while trying to {action}.{when}", retry_after)
+        lowered = message.lower()
+        if "oauth app access restrictions" in lowered or "organization has enabled" in lowered or "saml" in lowered:
+            raise GitHubPermissionError(
+                f"The repository's organization blocks this app (GitHub could not {action}). "
+                "An organization owner must approve the Codebase Intel OAuth app, or SAML SSO must be authorized for your token."
+            )
+        raise GitHubPermissionError(
+            f"Your GitHub account does not have permission to {action}."
+            + (f" GitHub said: {message[:200]}" if message else "")
+        )
+    if status_code == 404:
+        raise GitHubNotFoundError(f"GitHub could not {action}: it was not found or is not visible to your account.")
+    raise GitHubAPIError(f"GitHub could not {action} (HTTP {status_code}).")
 
 
 async def get_authenticated_user(access_token: str) -> dict[str, Any]:
@@ -155,7 +238,108 @@ async def fork_repo(access_token: str, owner: str, repo: str, *, username: str =
                 ready = await client.get(f"{GITHUB_API_BASE}/repos/{_api_path(fork_owner, fork_name)}", headers=_github_headers(access_token))
                 if ready.status_code == 200:
                     return ready.json()
+            raise GitHubForkNotReadyError(
+                f"GitHub is still creating your fork {fork_owner}/{fork_name}. Nothing was pushed; try again in a minute."
+            )
         return data
+
+
+async def sync_fork_branch(access_token: str, owner: str, repo: str, branch: str) -> bool:
+    """Fast-forward a fork's branch to its upstream branch (best effort).
+
+    Reviewed blob SHAs are read from the upstream repository, but a fork that
+    was created earlier can be far behind it. Checked against the stale fork,
+    every modified file looks "changed while you were reviewing it", and a
+    commit built on it would carry old versions of other upstream changes.
+    Returns False when GitHub cannot sync it (for example a diverged fork);
+    the precondition checks that follow still refuse a stale revision.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                f"{GITHUB_API_BASE}/repos/{_api_path(owner, repo)}/merge-upstream",
+                headers=_github_headers(access_token),
+                json={"branch": branch},
+            )
+    except httpx.HTTPError as error:
+        logger.info("Could not sync fork %s/%s: %s", owner, repo, type(error).__name__)
+        return False
+    if response.status_code == 200:
+        return True
+    logger.info("Fork %s/%s was not synced with upstream (HTTP %s)", owner, repo, response.status_code)
+    return False
+
+
+_PRESERVED_MODES = {"100644", "100755", "120000"}
+# Hard ceiling on directory listings for one change; the per-request budget
+# is sized from the paths (every distinct directory prefix plus the root).
+_MAX_TREE_READS = 400
+
+
+def _tree_read_budget(paths: list[str]) -> int:
+    prefixes = {""}
+    for path in paths:
+        parts = path.split("/")[:-1]
+        prefixes.update("/".join(parts[:index]) for index in range(1, len(parts) + 1))
+    return min(_MAX_TREE_READS, len(prefixes))
+
+
+async def _current_file_modes(client: httpx.AsyncClient, owner: str, repo: str, headers: dict[str, str],
+                              base_tree_sha: str, paths: list[str]) -> dict[str, str]:
+    """Return the Git mode of each existing file in the base tree (best effort).
+
+    Every tree entry must name a mode, and always writing 100644 silently
+    dropped the executable bit of an edited script (or replaced a symlink
+    with a regular file). Directory listings are read one level at a time,
+    so the cost follows the depth of the edited paths, not the repository
+    size; the read budget is sized to cover every directory the paths need.
+    A mode that cannot be determined raises instead of silently turning an
+    executable script or symlink into a regular file.
+    """
+    listings: dict[str, list] = {}
+    budget = _tree_read_budget(paths)
+
+    async def entries(tree_sha: str) -> list:
+        if tree_sha not in listings:
+            if len(listings) >= budget:
+                raise LookupError("tree read budget exhausted")
+            response = await client.get(
+                f"{GITHUB_API_BASE}/repos/{_api_path(owner, repo)}/git/trees/{quote(tree_sha, safe='')}", headers=headers,
+            )
+            if response.status_code != 200:
+                _raise_for_api(response, "read the repository tree")
+            data = response.json() if response.status_code == 200 else None
+            if not isinstance(data, dict) or not isinstance(data.get("tree"), list):
+                raise LookupError("tree unavailable")
+            listings[tree_sha] = data["tree"]
+        return listings[tree_sha]
+
+    def find(listing: list, name: str, kind: str) -> dict | None:
+        return next((entry for entry in listing if isinstance(entry, dict) and entry.get("path") == name and entry.get("type") == kind), None)
+
+    modes: dict[str, str] = {}
+    for path in paths:
+        try:
+            *directories, name = path.split("/")
+            tree_sha = base_tree_sha
+            for directory in directories:
+                entry = find(await entries(tree_sha), directory, "tree")
+                if entry is None:
+                    raise LookupError(path)
+                tree_sha = str(entry.get("sha") or "")
+            entry = find(await entries(tree_sha), name, "blob")
+            if entry is None:
+                raise LookupError(path)
+            if str(entry.get("mode")) in _PRESERVED_MODES:
+                modes[path] = str(entry["mode"])
+        except (GitHubRateLimitError, GitHubAuthRequiredError, GitHubPermissionError):
+            raise
+        except Exception as error:
+            logger.warning("Could not determine the file mode of %s: %s", path, error)
+            raise GitHubAPIError(
+                f"Could not read the current file mode of {path} from GitHub, so nothing was pushed. Try again."
+            ) from error
+    return modes
 
 
 async def get_file_at_ref(
@@ -212,6 +396,82 @@ async def get_file_at_ref(
         return {"path": path, "sha": sha, "size": size, "content": content, "ref": ref}
 
 
+async def fetch_raw_file(
+    owner: str,
+    repo: str,
+    file_path: str,
+    *,
+    ref: str = "HEAD",
+    max_bytes: int,
+) -> bytes | None:
+    """Read a public file's exact bytes from raw.githubusercontent.com.
+
+    The raw CDN is not subject to the REST API's 60 requests/hour anonymous
+    limit, which shared Render egress IPs exhaust quickly. Returns None when
+    the file does not exist at ``ref``. The read is bounded so a huge file is
+    never buffered.
+    """
+    path = validate_file_path(file_path)
+    url = (
+        f"{settings.github_raw_base_url.rstrip('/')}/{quote(owner, safe='')}/{quote(repo, safe='')}/"
+        f"{quote(ref, safe='')}/{quote(path, safe='/')}"
+    )
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        async with client.stream("GET", url, headers={"User-Agent": "Codebase-Intelligence-App"}) as response:
+            if response.status_code == 404:
+                return None
+            if response.status_code >= 400:
+                raise GitHubAPIError(f"GitHub could not return {path} (HTTP {response.status_code}).")
+            chunks: list[bytes] = []
+            total = 0
+            async for block in response.aiter_bytes():
+                total += len(block)
+                if total > max_bytes:
+                    raise GitHubFileTooLargeError(f"{path} is too large to edit safely in the browser.")
+                chunks.append(block)
+    return b"".join(chunks)
+
+
+async def fetch_issue(owner: str, repo: str, number: int, *, access_token: str | None = None) -> dict[str, Any] | None:
+    """Return an issue's title and body, or None when it cannot be read."""
+    headers = _github_headers(access_token) if access_token else _github_public_headers()
+    endpoint = f"{GITHUB_API_BASE}/repos/{_api_path(owner, repo)}/issues/{int(number)}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(endpoint, headers=headers)
+            if response.status_code in {401, 403} and access_token:
+                response = await client.get(endpoint, headers=_github_public_headers())
+    except httpx.HTTPError:
+        return None
+    if response.status_code != 200:
+        return None
+    # The issue only adds acceptance criteria: an unreadable body must make
+    # the edit continue without it, not escape as an HTTP 500.
+    try:
+        data = response.json()
+        if not isinstance(data, dict) or data.get("pull_request"):
+            return None
+        labels = data.get("labels") if isinstance(data.get("labels"), list) else []
+        return {
+            "number": int(data.get("number") or number),
+            "title": str(data.get("title") or "")[:300],
+            "body": str(data.get("body") or "")[:12_000],
+            "state": str(data.get("state") or ""),
+            "html_url": str(data.get("html_url") or ""),
+            "labels": [str(label.get("name")) for label in labels if isinstance(label, dict)][:10],
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+async def file_exists_at_ref(access_token: str, owner: str, repo: str, file_path: str, ref: str) -> bool:
+    try:
+        await get_file_at_ref(access_token, owner, repo, file_path, ref, metadata_only=True)
+        return True
+    except GitHubNotFoundError:
+        return False
+
+
 async def create_branch_and_commit_files(
     access_token: str,
     owner: str,
@@ -222,6 +482,9 @@ async def create_branch_and_commit_files(
     commit_message: str,
     *,
     expected_base_sha: str = "",
+    source_owner: str = "",
+    source_repo: str = "",
+    resume_commit_sha: str = "",
 ) -> dict[str, Any]:
     """Create one atomic commit for a bounded set of reviewed files.
 
@@ -229,6 +492,19 @@ async def create_branch_and_commit_files(
     the review UI. The base ref and each expected file SHA are checked before
     any branch is created, so a stale multi-file review cannot overwrite a
     concurrent GitHub change.
+
+    ``source_owner``/``source_repo`` name the repository the change was
+    reviewed against (the upstream of a fork). The base commit, the file
+    preconditions and the file modes are read there, while blobs, the tree,
+    the commit and the branch are created in ``owner``/``repo``. A fork shares
+    GitHub's object network with its upstream, so the commit can use the
+    upstream head as its parent: the pull request then contains only the
+    reviewed change, whatever the state of the fork's own default branch.
+
+    ``resume_commit_sha`` is the commit an earlier attempt of the same
+    operation already put on ``branch_name``. When the branch still points at
+    it, no new objects are created and the call returns that commit, so a
+    retry after a failed pull request creation can continue.
     """
     clean_branch = validate_branch_name(branch_name)
     if not isinstance(files, list) or not files or len(files) > 8:
@@ -244,28 +520,53 @@ async def create_branch_and_commit_files(
         new_content = item.get("new_content")
         if not isinstance(new_content, str) or not new_content:
             raise GitHubAPIError("File content cannot be empty.")
+        action = str(item.get("action") or "modify")
+        if action not in {"modify", "create"}:
+            raise GitHubAPIError("Each pull request file must be modified or created.")
         seen_paths.add(clean_path)
         clean_files.append({
             "file_path": clean_path,
             "new_content": new_content,
             "expected_file_sha": str(item.get("expected_file_sha") or "").strip(),
+            "action": action,
         })
     headers = _github_headers(access_token)
+    read_owner, read_repo = (source_owner or owner).strip(), (source_repo or repo).strip()
+    if resume_commit_sha.strip():
+        head = await get_branch_head(access_token, owner, repo, clean_branch)
+        if head and head == resume_commit_sha.strip():
+            return {"commit_sha": head, "branch_name": clean_branch, "owner": owner, "repo": repo, "resumed": True}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        ref_res = await client.get(f"{GITHUB_API_BASE}/repos/{_api_path(owner, repo)}/git/ref/heads/{quote(base_branch, safe='')}", headers=headers)
+        ref_res = await client.get(f"{GITHUB_API_BASE}/repos/{_api_path(read_owner, read_repo)}/git/ref/heads/{quote(base_branch, safe='')}", headers=headers)
         _raise_for_api(ref_res, "read the base branch")
         base_commit_sha = str(ref_res.json().get("object", {}).get("sha") or "")
         if expected_base_sha and base_commit_sha != expected_base_sha:
             raise GitHubConflictError("The base branch changed while you were reviewing this change. Refresh the file and review again.")
-        # Check all file preconditions before creating any blob or ref.
+        # Check all file preconditions before creating any blob or ref: a
+        # modified file must still be at the reviewed revision, and a new
+        # file must not have appeared upstream in the meantime.
         for item in clean_files:
-            if item["expected_file_sha"]:
-                file_res = await get_file_at_ref(access_token, owner, repo, item["file_path"], base_branch, metadata_only=True)
+            if item["action"] == "create":
+                if await file_exists_at_ref(access_token, read_owner, read_repo, item["file_path"], base_branch):
+                    raise GitHubConflictError(f"{item['file_path']} now exists upstream. Regenerate the change.")
+            elif item["expected_file_sha"]:
+                try:
+                    file_res = await get_file_at_ref(access_token, read_owner, read_repo, item["file_path"], base_branch, metadata_only=True)
+                except GitHubNotFoundError as error:
+                    raise GitHubConflictError(
+                        f"{item['file_path']} was deleted or moved upstream after it was reviewed. Regenerate the change."
+                    ) from error
                 if file_res["sha"] != item["expected_file_sha"]:
-                    raise GitHubConflictError("A file changed while you were reviewing it. Refresh the files and review again.")
-        commit_res = await client.get(f"{GITHUB_API_BASE}/repos/{_api_path(owner, repo)}/git/commits/{quote(base_commit_sha, safe='')}", headers=headers)
+                    raise GitHubConflictError(
+                        f"{item['file_path']} changed while you were reviewing it. Refresh the files and review again."
+                    )
+        commit_res = await client.get(f"{GITHUB_API_BASE}/repos/{_api_path(read_owner, read_repo)}/git/commits/{quote(base_commit_sha, safe='')}", headers=headers)
         _raise_for_api(commit_res, "read the base commit")
         base_tree_sha = str(commit_res.json().get("tree", {}).get("sha") or "")
+        modes = await _current_file_modes(
+            client, read_owner, read_repo, headers, base_tree_sha,
+            [item["file_path"] for item in clean_files if item["action"] == "modify"],
+        )
         tree_entries = []
         for item in clean_files:
             blob_res = await client.post(
@@ -278,7 +579,7 @@ async def create_branch_and_commit_files(
             blob_sha = str(blob_res.json().get("sha") or "")
             if not blob_sha:
                 raise GitHubAPIError("GitHub did not return a blob revision.")
-            tree_entries.append({"path": item["file_path"], "mode": "100644", "type": "blob", "sha": blob_sha})
+            tree_entries.append({"path": item["file_path"], "mode": modes.get(item["file_path"], "100644"), "type": "blob", "sha": blob_sha})
         tree_res = await client.post(f"{GITHUB_API_BASE}/repos/{_api_path(owner, repo)}/git/trees", headers=headers, json={"base_tree": base_tree_sha, "tree": tree_entries})
         if tree_res.status_code != 201:
             _raise_for_api(tree_res, "create the file tree")
@@ -292,10 +593,54 @@ async def create_branch_and_commit_files(
         new_commit_sha = str(new_commit_res.json().get("sha") or "")
         new_ref_res = await client.post(f"{GITHUB_API_BASE}/repos/{_api_path(owner, repo)}/git/refs", headers=headers, json={"ref": f"refs/heads/{clean_branch}", "sha": new_commit_sha})
         if new_ref_res.status_code == 422:
-            raise GitHubConflictError("That branch already exists. Choose a new branch name to avoid overwriting it.")
+            # An earlier attempt (whose reply was lost, or whose PR step
+            # failed) may already have created this branch with the same
+            # change. Continue when it holds exactly this tree on this base.
+            existing = await _branch_commit(client, owner, repo, headers, clean_branch)
+            if existing and existing.get("tree") == new_tree_sha and base_commit_sha in existing.get("parents", []):
+                return {"commit_sha": existing["sha"], "branch_name": clean_branch, "owner": owner, "repo": repo, "resumed": True}
+            raise GitHubConflictError(
+                f"The branch {clean_branch} already exists with different content. Choose a new branch name to avoid overwriting it."
+            )
         if new_ref_res.status_code != 201:
             _raise_for_api(new_ref_res, "create the branch")
     return {"commit_sha": new_commit_sha, "branch_name": clean_branch, "owner": owner, "repo": repo}
+
+
+async def _branch_commit(client: httpx.AsyncClient, owner: str, repo: str, headers: dict[str, str], branch: str) -> dict | None:
+    """Return {sha, tree, parents} of a branch head, or None when absent."""
+    try:
+        ref_res = await client.get(f"{GITHUB_API_BASE}/repos/{_api_path(owner, repo)}/git/ref/heads/{quote(branch, safe='/')}", headers=headers)
+        if ref_res.status_code != 200:
+            return None
+        sha = str((ref_res.json().get("object") or {}).get("sha") or "")
+        if not sha:
+            return None
+        commit_res = await client.get(f"{GITHUB_API_BASE}/repos/{_api_path(owner, repo)}/git/commits/{quote(sha, safe='')}", headers=headers)
+        if commit_res.status_code != 200:
+            return None
+        data = commit_res.json()
+        return {
+            "sha": sha,
+            "tree": str((data.get("tree") or {}).get("sha") or ""),
+            "parents": [str(parent.get("sha") or "") for parent in data.get("parents") or [] if isinstance(parent, dict)],
+        }
+    except (httpx.HTTPError, ValueError, AttributeError, TypeError):
+        return None
+
+
+async def get_branch_head(access_token: str, owner: str, repo: str, branch: str) -> str | None:
+    """Return the commit SHA a branch points at, or None when it does not exist."""
+    headers = _github_headers(access_token)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(f"{GITHUB_API_BASE}/repos/{_api_path(owner, repo)}/git/ref/heads/{quote(branch, safe='/')}", headers=headers)
+    if response.status_code == 404:
+        return None
+    _raise_for_api(response, "read the pull request branch")
+    try:
+        return str((response.json().get("object") or {}).get("sha") or "") or None
+    except (ValueError, AttributeError):
+        return None
 
 
 async def create_branch_and_commit(
@@ -310,6 +655,7 @@ async def create_branch_and_commit(
     *,
     expected_base_sha: str = "",
     expected_file_sha: str = "",
+    **options: Any,
 ) -> dict[str, Any]:
     """Backward-compatible one-file wrapper around the atomic commit path."""
     return await create_branch_and_commit_files(
@@ -321,6 +667,7 @@ async def create_branch_and_commit(
         [{"file_path": file_path, "new_content": new_content, "expected_file_sha": expected_file_sha}],
         commit_message,
         expected_base_sha=expected_base_sha,
+        **options,
     )
 
 
@@ -332,7 +679,9 @@ async def open_pull_request(access_token: str, base_owner: str, base_repo: str, 
         if response.status_code == 422:
             data = response.json()
             if any("already exists" in str(error.get("message", "")).lower() for error in data.get("errors", [])):
-                list_res = await client.get(f"{GITHUB_API_BASE}/repos/{_api_path(base_owner, base_repo)}/pulls", params={"head": head, "state": "open"}, headers=headers)
+                # GitHub filters by head only in "owner:branch" form.
+                head_filter = head.strip() if ":" in head else f"{base_owner}:{head.strip()}"
+                list_res = await client.get(f"{GITHUB_API_BASE}/repos/{_api_path(base_owner, base_repo)}/pulls", params={"head": head_filter, "state": "open"}, headers=headers)
                 if list_res.status_code == 200 and list_res.json():
                     existing = list_res.json()[0]
                     return {"pr_url": existing["html_url"], "pr_number": existing["number"], "title": existing["title"], "already_existed": True}

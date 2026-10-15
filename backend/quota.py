@@ -108,6 +108,50 @@ async def get_account_usage(store, user_id: str) -> dict[str, Any]:
     }
 
 
+async def current_repository_bytes(store, repo_id: str) -> int:
+    """Return the indexed bytes currently attributed to one repository."""
+    current = await store.fetch_one(
+        "SELECT COALESCE(SUM(byte_size), 0) AS used_bytes FROM repo_files WHERE repo_id = ?",
+        [repo_id],
+    )
+    used = _as_int((current or {}).get("used_bytes"))
+    if used == 0:
+        # Legacy indexes predate the manifest; measure their stored chunks so
+        # a refresh does not count the same repository twice.
+        legacy = await store.fetch_one(
+            "SELECT COALESCE(SUM(length(CAST(content AS BLOB))), 0) AS used_bytes FROM chunks WHERE repo_id = ?",
+            [repo_id],
+        )
+        used = _as_int((legacy or {}).get("used_bytes"))
+    return used
+
+
+def quota_exceeded_message(usage: dict[str, Any]) -> str:
+    if usage.get("plan") == "team":
+        return (
+            f"Your Team workspace includes up to {format_bytes(usage['quota_bytes'])} of indexed source and it is full. "
+            "Remove a repository or contact support for a higher limit."
+        )
+    return (
+        f"Your Explorer workspace includes up to {format_bytes(usage['quota_bytes'])} of indexed source and it is full. "
+        "Delete a repository or choose the Team plan for ₹300/month to index more."
+    )
+
+
+async def repository_byte_budget(store, user_id: str, repo_id: str | None) -> tuple[int, dict[str, Any]]:
+    """Return the bytes this repository may index without exceeding the plan.
+
+    The file selector ranks files by importance and stops at this budget, so
+    a large repository on a nearly full plan indexes its most important code
+    instead of failing outright. The repository's own previous index is
+    excluded because a refresh replaces it.
+    """
+    usage = await get_account_usage(store, user_id)
+    replacing = await current_repository_bytes(store, repo_id) if repo_id else 0
+    committed_elsewhere = max(0, usage["used_bytes"] - replacing)
+    return max(0, usage["quota_bytes"] - committed_elsewhere), usage
+
+
 async def ensure_repository_usage_capacity(
     store,
     user_id: str,

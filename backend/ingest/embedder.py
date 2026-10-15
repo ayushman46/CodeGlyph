@@ -1,3 +1,4 @@
+import re
 import threading
 from array import array
 import time
@@ -16,14 +17,49 @@ _rate_limit_lock = threading.Lock()
 
 
 class EmbeddingUnavailableError(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
-def wait_for_embedding_slot(input_type: str):
-    """Throttle embeddings while reserving capacity for live repository questions."""
+def is_rejected_input(error: EmbeddingUnavailableError) -> bool:
+    """A 4xx (other than 429) means this input will never be accepted."""
+    code = getattr(error, "status_code", None)
+    return code is not None and 400 <= code < 500 and code != 429
+
+
+# NVIDIA's multimodal-aware embedding endpoint parses any "data:image/..."
+# substring as an image input and rejects the whole request with HTTP 400
+# ("image inputs require VLM serving"). Source code legitimately contains
+# such strings (SSRF guards, CSS, tests), so break the data-URI shape before
+# embedding. The stored chunk text used for search and citations is unchanged.
+_DATA_URI = re.compile(r"\b(data):(?=\s*(?:image|video|audio)/)", re.IGNORECASE)
+
+
+def sanitize_embedding_text(text: str) -> str:
+    return _DATA_URI.sub(r"\1 :", text)
+
+
+# Interactive questions must never stall behind the shared limiter: when no
+# slot frees up within this many seconds, the query embedding is skipped and
+# retrieval continues with keyword and path evidence.
+QUERY_SLOT_MAX_WAIT_SECONDS = 1.0
+# A query embedding is a single short request. One attempt with a short client
+# timeout keeps the keyword fallback fast when NVIDIA is slow or failing.
+QUERY_EMBEDDING_CLIENT_TIMEOUT_SECONDS = 4.0
+
+
+def wait_for_embedding_slot(input_type: str, max_wait_seconds: float | None = None):
+    """Throttle embeddings while reserving capacity for live repository questions.
+
+    ``max_wait_seconds`` bounds the wait (used for interactive queries); when
+    no slot frees up in time ``EmbeddingUnavailableError`` is raised instead
+    of sleeping for up to a minute.
+    """
     calls_per_minute = max(1, settings.nvidia_calls_per_minute)
     is_query = input_type == "query"
     passage_limit = max(1, calls_per_minute - max(0, settings.query_embedding_reserve_per_minute))
+    deadline = None if max_wait_seconds is None else time.monotonic() + max(0.0, float(max_wait_seconds))
     while True:
         with _rate_limit_lock:
             now = time.monotonic()
@@ -34,6 +70,11 @@ def wait_for_embedding_slot(input_type: str):
                 _request_times.append((now, input_type))
                 return
             wait_seconds = max(0.1, 60 - (now - _request_times[0][0]))
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or wait_seconds > remaining:
+                raise EmbeddingUnavailableError("The embedding rate limit is saturated; using keyword retrieval.", status_code=429)
+            wait_seconds = min(wait_seconds, remaining)
         time.sleep(wait_seconds)
 
 
@@ -73,19 +114,27 @@ def embed_texts(texts: List[str], *, input_type: str) -> List[List[float]]:
     if not texts:
         return []
     last_error: Exception | None = None
-    attempts = max(1, settings.embedding_retry_attempts)
+    is_query = input_type == "query"
+    if is_query:
+        # Check configuration before taking a limiter slot: without a key a
+        # question must fall back to keyword retrieval immediately.
+        require_nvidia_api_key()
+    attempts = 1 if is_query else max(1, settings.embedding_retry_attempts)
     for attempt in range(attempts):
         try:
-            wait_for_embedding_slot(input_type)
+            wait_for_embedding_slot(input_type, QUERY_SLOT_MAX_WAIT_SECONDS if is_query else None)
             embedding_model = settings.embedding_model
             # The retired E5/NVIDIA model was previously used by this project.
             # Keep old Render environment values from breaking re-indexing;
             # the current 2048-dimensional model is the safe replacement.
             if embedding_model in {"nvidia/nv-embedqa-e5-v5", "nvidia/nv-embedqa-e5-v5:latest"}:
                 embedding_model = "nvidia/nemotron-3-embed-1b"
-            response = get_embedding_client().embeddings.create(
+            client = get_embedding_client()
+            if is_query:
+                client = client.with_options(timeout=QUERY_EMBEDDING_CLIENT_TIMEOUT_SECONDS)
+            response = client.embeddings.create(
                 model=embedding_model,
-                input=texts,
+                input=[sanitize_embedding_text(text) for text in texts],
                 extra_body={"input_type": input_type, "truncate": "END"},
             )
             vectors = [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
@@ -100,13 +149,16 @@ def embed_texts(texts: List[str], *, input_type: str) -> List[List[float]]:
         last_error = RuntimeError("Embedding retry loop ended unexpectedly.")
 
     if last_error is not None:
+        if isinstance(last_error, EmbeddingUnavailableError):
+            raise last_error
         if isinstance(last_error, APITimeoutError):
             raise EmbeddingUnavailableError("NVIDIA timed out while creating repository embeddings after retries.") from last_error
         if isinstance(last_error, APIConnectionError):
             raise EmbeddingUnavailableError("Could not connect to NVIDIA for repository embeddings after retries.") from last_error
         if isinstance(last_error, APIStatusError):
             raise EmbeddingUnavailableError(
-                f"NVIDIA could not create repository embeddings after retries (HTTP {last_error.status_code})."
+                f"NVIDIA could not create repository embeddings after retries (HTTP {last_error.status_code}).",
+                status_code=last_error.status_code,
             ) from last_error
         raise EmbeddingUnavailableError("NVIDIA returned an invalid embedding response.") from last_error
 
@@ -164,9 +216,25 @@ def embed_chunks(
             if on_request is not None:
                 on_request()
             embeddings = embed_texts(texts_to_embed, input_type="passage")
-        except EmbeddingUnavailableError:
+        except EmbeddingUnavailableError as error:
             if current_size <= minimum_batch_size:
-                raise
+                if not is_rejected_input(error):
+                    raise
+                # A permanent rejection at the smallest batch: embed these
+                # passages one at a time and skip only the ones the provider
+                # refuses, so one odd file never disables semantic search for
+                # the whole repository. Skipped chunks stay keyword-searchable.
+                for chunk, text in zip(batch, texts_to_embed):
+                    try:
+                        if on_request is not None:
+                            on_request()
+                        chunk['embedding'] = array('f', embed_texts([text], input_type="passage")[0])
+                    except EmbeddingUnavailableError as single_error:
+                        if not is_rejected_input(single_error):
+                            raise
+                        chunk['_embedding_skipped'] = True
+                offset += current_size
+                continue
             # A provider can reject a large payload even while accepting the
             # same passages individually. Split only the failing batch; all
             # vectors are still generated by the same model and validated.

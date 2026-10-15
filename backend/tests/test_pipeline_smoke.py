@@ -38,11 +38,21 @@ class MemoryStore:
 
 class BackendSmokeTests(unittest.TestCase):
     def test_app_imports_and_root_endpoint_works(self):
+        import main
         from main import app
+
+        class HealthStore:
+            async def fetch_one(self, _sql, _args=None):
+                return {"ok": 1}
+
         client = TestClient(app)
         root = client.get("/")
         self.assertEqual(root.status_code, 200)
-        health = client.get("/api/health")
+        main._dependency_cache.clear()
+        # Never let the health probe reach a real database from the suite.
+        with patch.object(main, "assert_turso_schema", new=AsyncMock()), \
+             patch.object(main, "get_turso_store", return_value=HealthStore()):
+            health = client.get("/api/health")
         self.assertEqual(health.status_code, 200)
         self.assertIn(health.json()["status"], {"ok", "degraded"})
         self.assertIn("dependencies", health.json())
@@ -177,8 +187,32 @@ class BackendSmokeTests(unittest.TestCase):
 
     def test_github_url_normalization_rejects_non_repository_urls(self):
         self.assertEqual(normalize_github_url(" https://github.com/octocat/Hello-World/ "), "https://github.com/octocat/Hello-World.git")
-        for value in ("http://github.com/a/b", "https://github.com/a/b/tree/main", "https://evil.test/a/b"):
-            with self.assertRaises(RepositoryValidationError):
+        # Browser links (http, in-repository routes) and shorthand still name
+        # exactly one repository, so they resolve to the canonical clone URL.
+        for value in ("http://github.com/a/b", "https://github.com/a/b/tree/main", "a/b", "git@github.com:a/b.git"):
+            self.assertEqual(normalize_github_url(value), "https://github.com/a/b.git")
+        for value in (
+            # Other hosts, including look-alikes and scheme-less forms.
+            "https://evil.test/a/b",
+            "https://github.com.evil.test/a/b",
+            "github.com.evil.test/a/b",
+            "git@gitlab.com:a/b.git",
+            "ftp://github.com/a/b",
+            # Credentials and ports.
+            "https://user:token@github.com/a/b",
+            "https://github.com:8443/a/b",
+            # Malformed or non-repository URLs.
+            "",
+            "not a url",
+            "https://github.com/a",
+            "https://github.com/a//b",
+            "https://github.com/a/b c",
+            "https://github.com/../b",
+            "https://github.com/a/..",
+            "https://github.com/a/b/unknown",
+            "https://github.com/settings/profile",
+        ):
+            with self.subTest(value=value), self.assertRaises(RepositoryValidationError):
                 normalize_github_url(value)
 
     def test_get_files_to_process_accepts_larger_source_files_and_skips_oversized_files(self):
@@ -290,7 +324,36 @@ class BackendSmokeTests(unittest.TestCase):
 
             asyncio.run(run())
 
-        self.assertEqual(captured[0].args[0], "[0.25,0.5]")
+        # Vectors cross the database boundary as packed little-endian float32
+        # blobs (8 KB per 2,048-d vector instead of ~20 KB of JSON text).
+        import struct
+        self.assertEqual(captured[0].args[0], struct.pack("<2f", 0.25, 0.5))
+
+    def test_embedded_store_accepts_packed_vector_blobs(self):
+        from database import TursoStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TursoStore(f"file:{Path(tmp) / 'test.db'}", "local-test-token")
+
+            async def run():
+                await store.execute(
+                    "CREATE TABLE chunks (id TEXT PRIMARY KEY, repo_id TEXT, file_path TEXT, start_line INTEGER, "
+                    "end_line INTEGER, language TEXT, symbols TEXT, content TEXT, embedding F32_BLOB(3))"
+                )
+                await store.insert_chunks([{
+                    "id": "chunk-1", "repo_id": "repo-1", "file_path": "src/a.py", "start_line": 1,
+                    "end_line": 1, "language": "py", "symbols": [], "content": "a = 1", "embedding": [0.5, -1.0, 2.0],
+                }])
+                row = await store.fetch_one(
+                    "SELECT vector_extract(embedding) AS v, vector_distance_cos(embedding, vector32(?)) AS d "
+                    "FROM chunks WHERE id = ?", ["[0.5,-1.0,2.0]", "chunk-1"],
+                )
+                await store.close()
+                return row
+
+            row = asyncio.run(run())
+        self.assertEqual(row["v"], "[0.5,-1,2]")
+        self.assertAlmostEqual(row["d"], 0.0, places=5)
 
     def test_embed_chunks_splits_only_a_rejected_batch_without_dropping_chunks(self):
         from config import settings
@@ -415,7 +478,7 @@ class BackendSmokeTests(unittest.TestCase):
             return {"rows_affected": 1}
 
         store.fetch_one = fetch_one
-        with patch("ingest.pipeline.clone_repo_shallow", side_effect=IngestionCancelledError("stop")):
+        with patch("ingest.pipeline.acquire_repository_source", side_effect=IngestionCancelledError("stop")):
             result = asyncio.run(run_ingestion_for_repo(
                 store, "https://github.com/octocat/Hello-World", "user-1", repo_id="repo-1",
             ))
@@ -788,6 +851,7 @@ class BackendSmokeTests(unittest.TestCase):
             [{"file_path": "src/auth.py"}],
             [{"source_file": "src/main.py", "target_file": "src/auth.py", "import_name": "src.auth", "line_number": 4}],
             [{"id": "caller", "file_path": "src/main.py", "start_line": 1, "end_line": 8}],
+            [{"target_file": "src/session.py"}],
         ])
         user = SimpleNamespace(id="user-1")
         with patch("api.repos_router.assert_turso_schema", new=AsyncMock()), \
@@ -798,6 +862,7 @@ class BackendSmokeTests(unittest.TestCase):
         self.assertEqual(response["target_files"], ["src/auth.py"])
         self.assertEqual(response["dependent_files"], ["src/main.py"])
         self.assertEqual(response["edges"][0]["line_number"], 4)
+        self.assertEqual(response["imported_files"], ["src/session.py"])
 
     def test_repository_impact_rejects_path_traversal(self):
         from api.repos_router import repository_impact
@@ -1021,8 +1086,15 @@ class BackendSmokeTests(unittest.TestCase):
             "language": "py", "symbols": [], "content": "def login():\n    return True",
         }]
         suggestion = {
-            "file_path": "src/auth.py", "summary": "Use the validated session helper",
-            "changes": [{"old": "def login():\n    return True", "new": "def login():\n    return validate_session()", "reason": ""}],
+            "id": "11111111-2222-3333-4444-555555555555",
+            "title": "Use the validated session helper",
+            "files": [{
+                "file_path": "src/auth.py", "action": "modify", "summary": "Use the validated session helper",
+                "changes": [{"old": "def login():\n    return True", "new": "def login():\n    return validate_session()", "reason": ""}],
+                "before": "def login():\n    return True\n", "after": "def login():\n    return validate_session()\n",
+                "base_blob_sha": "abc", "additions": 1, "deletions": 1,
+            }],
+            "file_path": "src/auth.py",
             "validation": ["python -m compileall src/auth.py"],
         }
         with patch.object(settings, "editing_ticket_secret", "test-editing-secret"), \
@@ -1031,9 +1103,14 @@ class BackendSmokeTests(unittest.TestCase):
              patch("api.query_router.get_owned_repo", new=AsyncMock(return_value={"id": "repo-1", "status": "ready"})), \
              patch("api.query_router.retrieve_context", new=AsyncMock(return_value=chunks)), \
              patch("api.query_router.get_conversation_history", new=AsyncMock(return_value=[])), \
-             patch("api.query_router.run_agent_loop", new=AsyncMock(return_value=("## Proposed change", [], suggestion))):
+             patch("api.query_router.build_repo_map", new=AsyncMock(return_value={"text": ""})), \
+             patch("api.query_router.run_code_edit", new=AsyncMock(return_value=("## Proposed change", [], suggestion))):
             response = asyncio.run(query_repo(request, user))
         self.assertEqual(response["model_profile"], "code")
+        self.assertEqual(response["mode"], "editing")
+        self.assertEqual(response["edit_suggestion"]["files"][0]["file_path"], "src/auth.py")
+        # The proposal is persisted so the review survives a reload.
+        self.assertTrue(any("INSERT INTO edit_proposals" in sql for sql, _ in store.executed))
         self.assertEqual(response["workflow"], "editing")
         self.assertIsNotNone(response["edit_ticket"])
         verify_edit_ticket("test-editing-secret", response["edit_ticket"], user_id="user-edit", repo_name="demo", file_path="src/auth.py")

@@ -1,3 +1,14 @@
+# Render runs the API and the durable ingestion worker (a persistent process
+# is required: indexing a large repository takes minutes under NVIDIA's rate
+# limits). It also serves the built frontend, so this single service is a
+# complete deployment. For the fastest page loads, deploy frontend/ to Vercel
+# as well (see frontend/vercel.json), add its origin to CORS_ORIGINS and set
+# GITHUB_FRONTEND_ORIGIN below to it. GITHUB_FRONTEND_ORIGIN is REQUIRED: after
+# GitHub OAuth the API redirects to {GITHUB_FRONTEND_ORIGIN}/github/callback
+# (code in the URL fragment) and the SPA POSTs /api/github/complete. Use the
+# Vercel origin for split deploys, or this service's URL for single-service.
+# The GitHub OAuth app callback (GITHUB_REDIRECT_URI) stays
+# https://<render-service>/api/github/callback.
 services:
   - type: web
     name: codebase-rag
@@ -12,6 +23,12 @@ services:
       - key: VITE_API_BASE_URL
         value: /api
       - key: LOCAL_INGESTION_WORKER
+        value: "true"
+      # Additive migrations in turso/ are applied at startup.
+      - key: AUTO_MIGRATE
+        value: "true"
+      # Keeps a free instance awake only while an indexing job is running.
+      - key: KEEPALIVE_DURING_INGESTION
         value: "true"
       - key: VITE_SUPABASE_URL
         sync: false
@@ -45,6 +62,7 @@ services:
         sync: false
       - key: GITHUB_REDIRECT_URI
         sync: false
+      # Required: SPA origin (Vercel origin for split deploys, else this service's URL).
       - key: GITHUB_FRONTEND_ORIGIN
         sync: false
       - key: GITHUB_TOKEN_ENCRYPTION_KEY
@@ -105,6 +123,8 @@ services:
         value: "450"
       - key: EMBEDDING_CONCURRENCY
         value: "1"
+      - key: MAX_REPOSITORY_FILES
+        value: "10000"
       - key: MAX_REPOSITORY_BYTES
         value: "100000000"
       - key: MAX_FILE_SIZE_BYTES
@@ -118,7 +138,13 @@ services:
       - key: EDITING_CONTEXT_CHARACTERS
         value: "120000"
       - key: EDITING_MAX_FILES
-        value: "6"
+        value: "8"
+      - key: CODE_EDITING_ANSWER_MAX_TOKENS
+        value: "8192"
+      - key: NVIDIA_TIMEOUT_SECONDS
+        value: "150"
+      - key: INDEX_TRANSLATIONS
+        value: "false"
       - key: EDITING_MAX_CHUNKS_PER_FILE
         value: "256"
       - key: DENSE_CANDIDATE_LIMIT

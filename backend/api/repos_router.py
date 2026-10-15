@@ -1,5 +1,6 @@
 """Owned repository management backed by Turso."""
 
+import json
 import logging
 import posixpath
 from datetime import UTC, datetime
@@ -8,9 +9,22 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from api.auth import get_current_user
-from database import DatabaseConfigurationError, assert_turso_schema, explain_database_error, get_turso_store
-from ingest.pipeline import ACTIVE_REPOSITORY_STATUSES, IngestionConflictError, enforce_ingestion_capacity, ensure_repo_record, queue_existing_repo
-from retrieval.retriever import dependent_file_chunks
+from api.repository_state import (
+    fetch_owned_repository,
+    friendly_conflict,
+    list_repositories,
+    public_view,
+    raise_storage_error,
+)
+from database import assert_turso_schema, get_turso_store
+from ingest.pipeline import (
+    IngestionConflictError,
+    cancel_repository_indexing,
+    delete_repository,
+    enforce_ingestion_capacity,
+    is_safe_repo_label,
+    queue_existing_repo,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -28,13 +42,19 @@ def _normalise_impact_path(file_path: str) -> str:
     """Validate one relative source path before it reaches a SQL LIKE clause."""
     candidate = file_path.strip().replace("\\", "/")
     if not candidate or len(candidate) > 500 or "\x00" in candidate:
-        raise HTTPException(status_code=422, detail="Enter a relative source file path.")
+        raise HTTPException(status_code=422, detail="Enter a file path from this repository, such as src/app.ts.")
     if candidate.startswith("/"):
-        raise HTTPException(status_code=422, detail="The impact path must be relative to the repository.")
+        raise HTTPException(
+            status_code=422,
+            detail="Enter the path relative to the repository root, without a leading slash (for example src/app.ts).",
+        )
     normalised = posixpath.normpath(candidate)
     parts = normalised.split("/")
     if normalised in {"", "."} or normalised.startswith("../") or ".." in parts:
-        raise HTTPException(status_code=422, detail="The impact path must stay inside the repository.")
+        raise HTTPException(
+            status_code=422,
+            detail="Enter a path inside this repository; \"..\" segments aren't allowed (for example src/app.ts).",
+        )
     return normalised
 
 
@@ -43,94 +63,99 @@ def _escape_like(value: str) -> str:
 
 
 async def owned_repo(store, user_id: str, repo_name: str):
-    repo = await store.fetch_one(
-        "SELECT r.id, r.repo_name, r.github_url, "
-        "COALESCE(s.phase, r.status) AS status, "
-        "r.chunk_count, r.error_message, r.created_at, COALESCE(s.phase, r.status) AS index_phase, "
-        "COALESCE(s.semantic_progress, 0) AS semantic_progress, COALESCE(s.embedding_status, 'complete') AS embedding_status, "
-        "COALESCE(c.total_seen_files, 0) AS total_seen_files, COALESCE(c.eligible_files, 0) AS eligible_files, "
-        "COALESCE(c.indexed_files, 0) AS indexed_files, COALESCE(c.excluded_files, 0) AS excluded_files, "
-        "COALESCE(c.excluded_bytes, 0) AS excluded_bytes, COALESCE(c.excluded_reasons, '{}') AS excluded_reasons, "
-        "COALESCE(c.excluded_paths, '[]') AS excluded_paths "
-        "FROM repos r LEFT JOIN repo_coverage c ON c.repo_id = r.id "
-        "LEFT JOIN repo_index_state s ON s.repo_id = r.id "
-        "WHERE r.user_id = ? AND r.repo_name = ?",
-        [user_id, repo_name],
-    )
-    if not repo:
-        raise HTTPException(status_code=404, detail="Repository not found.")
-    return repo
+    """Compatibility wrapper used by other routers and tests."""
+    return await fetch_owned_repository(store, user_id, repo_name)
+
+
+def _database_errors(action: str):
+    """Map storage failures to safe responses with one consistent policy.
+
+    ``action`` completes "Couldn't ..." in the message the user sees.
+    """
+    def handle(error: Exception):
+        if isinstance(error, IngestionConflictError):
+            raise HTTPException(status_code=409, detail=friendly_conflict(error)) from error
+        raise_storage_error(error, action, logger)
+    return handle
 
 
 @router.get("/status/{repo_name}")
 async def get_status(repo_name: str, current_user=Depends(get_current_user)):
     try:
         await assert_turso_schema()
-        repo = await owned_repo(get_turso_store(), current_user.id, repo_name)
-        return {key: repo[key] for key in (
-            "status", "chunk_count", "error_message", "total_seen_files", "eligible_files",
-            "indexed_files", "excluded_files", "excluded_bytes", "excluded_reasons",
-            "excluded_paths", "index_phase", "semantic_progress", "embedding_status",
-        )}
-    except HTTPException:
-        raise
-    except DatabaseConfigurationError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+        return public_view(await owned_repo(get_turso_store(), current_user.id, repo_name))
     except Exception as error:
-        logger.exception("Could not fetch repository status")
-        raise HTTPException(status_code=502, detail=explain_database_error(error)) from error
+        _database_errors("load the repository status")(error)
 
 
 @router.get("/repos")
 async def list_repos(current_user=Depends(get_current_user)):
     try:
         await assert_turso_schema()
-        return await get_turso_store().fetch_all(
-            "SELECT r.id, r.repo_name, r.github_url, "
-            "COALESCE(s.phase, r.status) AS status, "
-            "r.chunk_count, r.created_at, r.error_message, COALESCE(s.phase, r.status) AS index_phase, "
-            "COALESCE(s.semantic_progress, 0) AS semantic_progress, COALESCE(s.embedding_status, 'complete') AS embedding_status, "
-            "COALESCE(c.total_seen_files, 0) AS total_seen_files, COALESCE(c.eligible_files, 0) AS eligible_files, "
-            "COALESCE(c.indexed_files, 0) AS indexed_files, COALESCE(c.excluded_files, 0) AS excluded_files, "
-            "COALESCE(c.excluded_bytes, 0) AS excluded_bytes, COALESCE(c.excluded_reasons, '{}') AS excluded_reasons, "
-            "COALESCE(c.excluded_paths, '[]') AS excluded_paths "
-            "FROM repos r LEFT JOIN repo_coverage c ON c.repo_id = r.id "
-            "LEFT JOIN repo_index_state s ON s.repo_id = r.id "
-            "WHERE r.user_id = ? ORDER BY r.created_at DESC",
-            [current_user.id],
-        )
-    except DatabaseConfigurationError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+        return await list_repositories(get_turso_store(), current_user.id)
     except Exception as error:
-        logger.exception("Could not list repositories")
-        raise HTTPException(status_code=502, detail=explain_database_error(error)) from error
+        _database_errors("load your repositories")(error)
 
 
 @router.get("/repos/statuses")
 async def list_repo_statuses(current_user=Depends(get_current_user)):
-    """Return all repository statuses in one tenant-scoped query."""
+    """Return every repository's status in one tenant-scoped query.
+
+    The payload deliberately omits the omitted-path list; that can be
+    thousands of entries for a large repository and this endpoint is polled.
+    """
     try:
         await assert_turso_schema()
-        return await get_turso_store().fetch_all(
-            "SELECT r.repo_name, "
-            "COALESCE(s.phase, r.status) AS status, "
-            "r.chunk_count, r.error_message, COALESCE(s.phase, r.status) AS index_phase, "
-            "COALESCE(s.semantic_progress, 0) AS semantic_progress, COALESCE(s.embedding_status, 'complete') AS embedding_status, "
-            "COALESCE(c.total_seen_files, 0) AS total_seen_files, COALESCE(c.eligible_files, 0) AS eligible_files, "
-            "COALESCE(c.indexed_files, 0) AS indexed_files, COALESCE(c.excluded_files, 0) AS excluded_files, "
-            "COALESCE(c.excluded_bytes, 0) AS excluded_bytes, COALESCE(c.excluded_reasons, '{}') AS excluded_reasons, "
-            "COALESCE(c.excluded_paths, '[]') AS excluded_paths "
-            "FROM repos r LEFT JOIN repo_coverage c ON c.repo_id = r.id "
-            "LEFT JOIN repo_index_state s ON s.repo_id = r.id "
-            "WHERE r.user_id = ? "
-            "ORDER BY r.created_at DESC",
-            [current_user.id],
-        )
-    except DatabaseConfigurationError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+        return await list_repositories(get_turso_store(), current_user.id)
     except Exception as error:
-        logger.exception("Could not list repository statuses")
-        raise HTTPException(status_code=502, detail=explain_database_error(error)) from error
+        _database_errors("refresh indexing progress")(error)
+
+
+@router.get("/repos/{repo_name}/coverage")
+async def repository_coverage(repo_name: str, current_user=Depends(get_current_user)):
+    """Detailed coverage: why files were omitted and the indexing budget."""
+    try:
+        await assert_turso_schema()
+        store = get_turso_store()
+        repo = await owned_repo(store, current_user.id, repo_name)
+        row = await store.fetch_one(
+            "SELECT excluded_paths, excluded_reasons FROM repo_coverage WHERE repo_id = ?", [repo["id"]]
+        ) or {}
+        snapshot = await store.fetch_one(
+            "SELECT selection_json FROM repo_snapshots WHERE repo_id = ?", [repo["id"]]
+        ) or {}
+        selection = snapshot.get("selection_json")
+        if isinstance(selection, str):
+            try:
+                selection = json.loads(selection)
+            except ValueError:
+                selection = {}
+        if not isinstance(selection, dict):
+            selection = {}
+        excluded_paths = row.get("excluded_paths") if isinstance(row.get("excluded_paths"), list) else []
+        budget_sample = selection.get("budget_omitted_sample")
+        return {
+            "repository": repo_name,
+            "total_seen_files": repo["total_seen_files"],
+            "eligible_files": repo["eligible_files"],
+            "indexed_files": repo["indexed_files"],
+            "excluded_files": repo["excluded_files"],
+            "excluded_bytes": repo["excluded_bytes"],
+            "excluded_reasons": row.get("excluded_reasons") if isinstance(row.get("excluded_reasons"), dict) else {},
+            "excluded_paths": excluded_paths,
+            # The path list is a bounded sample; these say how much of it is shown.
+            "excluded_paths_shown": len(excluded_paths),
+            "excluded_paths_total": repo["excluded_files"],
+            # What the importance budget skipped, by kind, and the most
+            # important skipped files first (path, category, priority).
+            "budget_omitted_by_category": selection.get("budget_omitted_by_category")
+            if isinstance(selection.get("budget_omitted_by_category"), dict) else {},
+            "budget_omitted_sample": budget_sample if isinstance(budget_sample, list) else [],
+            "selection": repo["selection"],
+            "commit_sha": repo["commit_sha"],
+        }
+    except Exception as error:
+        _database_errors("load the coverage report")(error)
 
 
 @router.get("/repos/{repo_name}/impact")
@@ -152,15 +177,25 @@ async def repository_impact(
         store = get_turso_store()
         repo = await owned_repo(store, current_user.id, repo_name)
         escaped = _escape_like(target.lower())
+        # During a refresh the replacement rows are hidden from every read
+        # endpoint until the swap, exactly like search and chat.
+        staging = repo.get("staging_prefix")
+        stage_sql, stage_args = ("", []) if not staging else (" AND id NOT LIKE ?", [f"{staging}%"])
         target_rows = await store.fetch_all(
             "SELECT DISTINCT file_path FROM chunks WHERE repo_id = ? AND (lower(file_path) = ? "
-            "OR (lower(file_path) LIKE ? ESCAPE '\\' AND instr(lower(file_path), '/') > 0)) "
-            "ORDER BY file_path LIMIT ?",
-            [repo["id"], target.lower(), f"%/{escaped}", limit],
+            "OR (lower(file_path) LIKE ? ESCAPE '\\' AND instr(lower(file_path), '/') > 0))"
+            f"{stage_sql} ORDER BY file_path LIMIT ?",
+            [repo["id"], target.lower(), f"%/{escaped}", *stage_args, limit],
         )
         target_paths = [str(row["file_path"]) for row in target_rows]
         if not target_paths:
-            raise HTTPException(status_code=404, detail="That source file is not present in the indexed repository.")
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No indexed file matches {target}. Check the spelling and use the path from the repository "
+                    "root, or open the file tree to pick one. Skipped files are listed in the coverage report."
+                ),
+            )
 
         dependency_conditions = []
         dependency_args = [repo["id"]]
@@ -175,26 +210,57 @@ async def repository_impact(
             "ORDER BY d.source_file, d.line_number, d.target_file LIMIT ?",
             [*dependency_args, limit * 4],
         )
-        dependents = await dependent_file_chunks(store, repo["id"], target_paths, limit=limit)
-        dependent_paths = sorted({str(chunk["file_path"]) for chunk in dependents})
+        # Distinct dependent *files* (not chunk rows, which let a few large
+        # files use up the limit) that are part of the published index.
+        indexed_source = (
+            "EXISTS (SELECT 1 FROM chunks c WHERE c.repo_id = d.repo_id AND c.file_path = d.source_file"
+            + (" AND c.id NOT LIKE ?" if staging else "") + ")"
+        )
+        dependents_where = f"d.repo_id = ? AND ({' OR '.join(dependency_conditions)}) AND {indexed_source}"
+        dependents_args = [*dependency_args, *stage_args]
+        dependents = await store.fetch_all(
+            f"SELECT DISTINCT d.source_file AS file_path FROM repo_dependencies d WHERE {dependents_where} "
+            "ORDER BY d.source_file LIMIT ?",
+            [*dependents_args, limit],
+        )
+        dependent_paths = sorted({str(row["file_path"]) for row in dependents})
+        counted = await store.fetch_one(
+            f"SELECT COUNT(DISTINCT d.source_file) AS count FROM repo_dependencies d WHERE {dependents_where}",
+            dependents_args,
+        )
+        dependent_total = max(len(dependent_paths), int((counted or {}).get("count") or 0))
+        # Imports of the target (what it depends on) give the other half of
+        # the change surface.
+        target_conditions = " OR ".join("d.source_file = ?" for _ in target_paths)
+        imports = await store.fetch_all(
+            f"SELECT DISTINCT d.target_file FROM repo_dependencies d WHERE d.repo_id = ? AND ({target_conditions}) "
+            "ORDER BY d.target_file LIMIT ?",
+            [repo["id"], *target_paths, limit],
+        )
+        truncated = dependent_total > len(dependent_paths)
+        if dependent_paths:
+            summary = (
+                f"{dependent_total:,} indexed file(s) import the selected file"
+                + (f" (showing {len(dependent_paths):,})." if truncated else ".")
+            )
+        else:
+            summary = "No other indexed file imports the selected file."
+        summary += (
+            " Counts include resolved local imports (relative paths, workspace packages and tsconfig path "
+            "aliases); external packages and computed import paths are not included."
+        )
         return {
             "repository": repo_name,
             "target_files": target_paths,
             "dependent_files": dependent_paths,
+            "dependent_count": dependent_total,
+            "truncated": truncated,
+            "imported_files": [str(row["target_file"]) for row in imports],
             "edges": edges,
-            "summary": (
-                f"{len(dependent_paths)} indexed file(s) import the selected file."
-                if dependent_paths else
-                "No resolved indexed dependents were found. External or dynamic imports are not included."
-            ),
+            "summary": summary,
         }
-    except HTTPException:
-        raise
-    except DatabaseConfigurationError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
     except Exception as error:
-        logger.exception("Could not analyze repository impact")
-        raise HTTPException(status_code=502, detail=explain_database_error(error)) from error
+        _database_errors("analyze the change impact")(error)
 
 
 @router.delete("/repos/{repo_name}")
@@ -203,30 +269,25 @@ async def delete_repo(repo_name: str, current_user=Depends(get_current_user)):
         await assert_turso_schema()
         store = get_turso_store()
         repo = await owned_repo(store, current_user.id, repo_name)
-        if repo["status"] in ACTIVE_REPOSITORY_STATUSES:
-            raise HTTPException(status_code=409, detail="Stop indexing before deleting this repository.")
-        # Explicit deletes make cleanup reliable even if a Turso connection was
-        # created without SQLite's per-connection foreign-key pragma.
-        for table in ("chat_messages", "ingestion_jobs", "kt_cache", "repo_dependencies", "repo_files", "repo_coverage", "chunks"):
-            await store.execute(f"DELETE FROM {table} WHERE repo_id = ?", [repo["id"]])
-        await store.execute("DELETE FROM repos WHERE id = ? AND user_id = ?", [repo["id"], current_user.id])
-    except HTTPException:
-        raise
-    except DatabaseConfigurationError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+        await delete_repository(store, repo["id"], current_user.id)
     except Exception as error:
-        logger.exception("Could not delete repository")
-        raise HTTPException(status_code=502, detail=explain_database_error(error)) from error
-    return {"message": f"Repository {repo_name} deleted successfully"}
+        _database_errors("delete the repository")(error)
+    return {"message": f"Deleted {repo_name} and its index."}
 
 
 @router.patch("/repos/{repo_name}")
 async def rename_repo(repo_name: str, payload: RenameRepositoryRequest, current_user=Depends(get_current_user)):
     new_name = " ".join(payload.repo_name.split())
     if not new_name:
-        raise HTTPException(status_code=422, detail="Repository name must contain visible text.")
-    if any(character in new_name for character in ("/", "\\", "\x00")):
-        raise HTTPException(status_code=422, detail="Repository names cannot contain path separators.")
+        raise HTTPException(status_code=422, detail="Enter a name with at least one letter or number.")
+    if any(character in new_name for character in ("/", "\\", "\x00", "?", "#", "%")):
+        raise HTTPException(status_code=422, detail="Names can't contain /, \\, ?, # or %. Try a hyphen instead.")
+    if not is_safe_repo_label(new_name) or any(ord(character) < 0x20 or ord(character) == 0x7F for character in new_name):
+        # Browsers resolve "." and ".." path segments (even as %2e) before
+        # sending a request, so such a repository could never be reached.
+        raise HTTPException(
+            status_code=422, detail="Names can't be only dots or contain control characters. Choose another name.",
+        )
     if new_name == repo_name:
         return {"repo_name": new_name}
     try:
@@ -237,18 +298,15 @@ async def rename_repo(repo_name: str, payload: RenameRepositoryRequest, current_
             "SELECT id FROM repos WHERE user_id = ? AND repo_name = ?", [current_user.id, new_name]
         )
         if duplicate:
-            raise HTTPException(status_code=409, detail="You already have a repository with that name.")
+            raise HTTPException(
+                status_code=409, detail=f"You already have a repository named {new_name}. Choose a different name.",
+            )
         await store.execute(
             "UPDATE repos SET repo_name = ?, updated_at = ? WHERE id = ? AND user_id = ?",
             [new_name, now(), repo["id"], current_user.id],
         )
-    except HTTPException:
-        raise
-    except DatabaseConfigurationError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
     except Exception as error:
-        logger.exception("Could not rename repository")
-        raise HTTPException(status_code=502, detail=explain_database_error(error)) from error
+        _database_errors("rename the repository")(error)
     return {"repo_name": new_name}
 
 
@@ -258,18 +316,22 @@ async def reindex_repository(repo_name: str, current_user=Depends(get_current_us
         await assert_turso_schema()
         store = get_turso_store()
         existing = await owned_repo(store, current_user.id, repo_name)
+        if existing["is_indexing"]:
+            raise IngestionConflictError(
+                "This repository is already being indexed. Wait for it to finish, or stop it first."
+            )
         await enforce_ingestion_capacity(store, current_user.id, existing["github_url"])
         _repo_id, normalized_name = await queue_existing_repo(store, existing, current_user.id)
-    except HTTPException:
-        raise
-    except IngestionConflictError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
-    except DatabaseConfigurationError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
     except Exception as error:
-        logger.exception("Could not re-index repository")
-        raise HTTPException(status_code=502, detail=explain_database_error(error)) from error
-    return {"message": "Repository queued for re-indexing", "repo_name": normalized_name}
+        _database_errors("queue a re-index")(error)
+    return {
+        "message": (
+            "Re-index queued. Questions keep using the current index until the new one is ready."
+            if existing["queryable"] else "Re-index queued. Indexing starts as soon as a worker is free."
+        ),
+        "repo_name": normalized_name,
+        "status": "queued",
+    }
 
 
 @router.post("/repos/{repo_name}/cancel-indexing")
@@ -278,31 +340,14 @@ async def cancel_indexing(repo_name: str, current_user=Depends(get_current_user)
         await assert_turso_schema()
         store = get_turso_store()
         repo = await owned_repo(store, current_user.id, repo_name)
-        if repo["status"] not in ACTIVE_REPOSITORY_STATUSES:
-            raise HTTPException(status_code=409, detail="This repository is not currently being indexed.")
-        cancelled = await store.execute(
-            "UPDATE ingestion_jobs SET status = 'cancelled', claimed_at = NULL, heartbeat_at = NULL, claim_token = NULL, "
-            "last_error = 'Indexing stopped by the user.', updated_at = ? "
-            "WHERE repo_id = ? AND status IN ('queued', 'processing') RETURNING id",
-            [now(), repo["id"]],
-        )
-        if not cancelled.rows:
-            raise HTTPException(status_code=409, detail="This repository finished indexing before it could be stopped.")
-        await store.execute("DELETE FROM chunks WHERE repo_id = ?", [repo["id"]])
-        await store.execute("DELETE FROM kt_cache WHERE repo_id = ?", [repo["id"]])
-        await store.execute("DELETE FROM repo_files WHERE repo_id = ?", [repo["id"]])
-        await store.execute("DELETE FROM repo_dependencies WHERE repo_id = ?", [repo["id"]])
-        await store.execute("DELETE FROM repo_coverage WHERE repo_id = ?", [repo["id"]])
-        await store.execute(
-            "UPDATE repos SET status = 'cancelled', chunk_count = 0, error_message = 'Indexing stopped by you.', "
-            "updated_at = ? WHERE id = ? AND user_id = ?",
-            [now(), repo["id"], current_user.id],
-        )
-    except HTTPException:
-        raise
-    except DatabaseConfigurationError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+        outcome = await cancel_repository_indexing(store, repo["id"], current_user.id)
     except Exception as error:
-        logger.exception("Could not cancel repository ingestion")
-        raise HTTPException(status_code=502, detail=explain_database_error(error)) from error
-    return {"message": "Indexing stopped", "repo_name": repo_name}
+        _database_errors("stop indexing")(error)
+    return {
+        "message": (
+            "Stopping indexing. This takes a few seconds." if outcome == "stopping" else
+            "Indexing stopped. Re-index whenever you're ready."
+        ),
+        "repo_name": repo_name,
+        "state": outcome,
+    }
