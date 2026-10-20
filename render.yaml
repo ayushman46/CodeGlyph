@@ -82,11 +82,11 @@ services:
       - key: NVIDIA_BASE_URL
         value: https://integrate.api.nvidia.com/v1
       - key: NEMOTRON_MODEL
-        value: nvidia/nemotron-3-super-120b-a12b
+        value: nvidia/nemotron-3.5-super-vl-120b-a12b
       - key: DETAILED_NEMOTRON_MODEL
         value: nvidia/nemotron-3-ultra-550b-a55b
       - key: CODE_EDITING_MODEL
-        value: nvidia/nemotron-3-super-120b-a12b
+        value: nvidia/nemotron-3.5-super-vl-120b-a12b
       - key: CODE_EDITING_FALLBACK_MODEL
         value: nvidia/nemotron-3.5-lightning-30b-a3b
       - key: EMBEDDING_MODEL

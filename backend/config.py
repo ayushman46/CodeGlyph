@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
     # A strong, low-latency MoE model for source-grounded RAG. It has far fewer
     # active parameters than Ultra while retaining long-context coding support.
-    nemotron_model: str = "nvidia/nemotron-3-super-120b-a12b"
+    nemotron_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b"
     detailed_nemotron_model: str = "nvidia/nemotron-3-ultra-550b-a55b"
     # Dedicated code-review model. Qwen2.5-Coder is served through the same
     # OpenAI-compatible NVIDIA endpoint and is trained specifically for code
@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     # Use models confirmed available to the configured NVIDIA account. The
     # Super model is trained for coding and long-context agentic work; the
     # Lightning model is a smaller fallback when the primary is busy.
-    code_editing_model: str = "nvidia/nemotron-3-super-120b-a12b"
+    code_editing_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b"
     code_editing_fallback_model: str = "nvidia/nemotron-3.5-lightning-30b-a3b"
     embedding_model: str = "nvidia/nemotron-3-embed-1b"
     embedding_dimension: int = 2048
@@ -266,6 +266,18 @@ def get_editing_ticket_secret() -> str:
     return settings.editing_ticket_secret.strip() or settings.github_token_encryption_key.strip()
 
 
+# Model IDs NVIDIA no longer serves to this account (listed by /models, but
+# every call returns 404 "Function not found"). Deployments whose environment
+# still names one keep working: the request goes to the current model.
+RETIRED_CHAT_MODELS = {
+    "nvidia/nemotron-3-super-120b-a12b": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+}
+
+
+def _current_chat_model(model_id: str) -> str:
+    return RETIRED_CHAT_MODELS.get(model_id.strip(), model_id)
+
+
 def get_answer_model_options(profile: str, workflow: str = "general") -> tuple[str, bool, int]:
     """Resolve an allow-listed chat profile without accepting model IDs from clients."""
     if workflow == "editing" or profile == "code":
@@ -279,19 +291,19 @@ def get_answer_model_options(profile: str, workflow: str = "general") -> tuple[s
             "mistralai/codestral-22b-instruct-v0.1",
             "deepseek-ai/deepseek-coder-6.7b-instruct",
         }
-        code_model = settings.code_editing_model if settings.code_editing_model not in unavailable_ids else "nvidia/nemotron-3-super-120b-a12b"
+        code_model = settings.code_editing_model if settings.code_editing_model not in unavailable_ids else "nvidia/nemotron-3.5-super-vl-120b-a12b"
         return (
-            code_model,
+            _current_chat_model(code_model),
             settings.code_editing_enable_thinking,
             settings.code_editing_answer_max_tokens,
         )
     if profile == "detailed":
         return (
-            settings.detailed_nemotron_model,
+            _current_chat_model(settings.detailed_nemotron_model),
             settings.detailed_nvidia_enable_thinking,
             settings.detailed_answer_max_tokens,
         )
-    return settings.nemotron_model, settings.nvidia_enable_thinking, settings.answer_max_tokens
+    return _current_chat_model(settings.nemotron_model), settings.nvidia_enable_thinking, settings.answer_max_tokens
 
 
 class RateLimiter:

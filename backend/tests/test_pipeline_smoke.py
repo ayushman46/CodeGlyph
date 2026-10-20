@@ -169,10 +169,10 @@ class BackendSmokeTests(unittest.TestCase):
         from api.query_router import QueryRequest
         from config import get_answer_model_options
         from pydantic import ValidationError
-        self.assertEqual(get_answer_model_options("fast")[0], "nvidia/nemotron-3-super-120b-a12b")
+        self.assertEqual(get_answer_model_options("fast")[0], "nvidia/nemotron-3.5-super-vl-120b-a12b")
         self.assertEqual(get_answer_model_options("detailed")[0], "nvidia/nemotron-3-ultra-550b-a55b")
-        self.assertEqual(get_answer_model_options("fast", "editing")[0], "nvidia/nemotron-3-super-120b-a12b")
-        self.assertEqual(get_answer_model_options("code")[0], "nvidia/nemotron-3-super-120b-a12b")
+        self.assertEqual(get_answer_model_options("fast", "editing")[0], "nvidia/nemotron-3.5-super-vl-120b-a12b")
+        self.assertEqual(get_answer_model_options("code")[0], "nvidia/nemotron-3.5-super-vl-120b-a12b")
         with self.assertRaises(ValidationError):
             QueryRequest(repo_name="demo", question="Where is login?", model_profile="untrusted/model")
         with self.assertRaises(ValidationError):
