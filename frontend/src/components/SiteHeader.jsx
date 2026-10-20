@@ -15,7 +15,7 @@ const NAV = [
   { to: '/docs', label: 'Docs' },
 ];
 
-const navClass = ({ isActive }) => `inline-flex h-9 items-center rounded-lg px-3 text-[13.5px] font-medium transition-colors ${isActive ? 'bg-surface-2 text-ink' : 'text-ink-3 hover:bg-surface-2/70 hover:text-ink'}`;
+const navClass = ({ isActive }) => `inline-flex h-9 items-center rounded-lg px-3.5 text-[15px] transition-colors ${isActive ? 'text-ink' : 'text-ink-3 hover:text-ink'}`;
 
 const mobileNavClass = ({ isActive }) => `flex min-h-11 items-center rounded-lg px-3 text-[15px] font-medium transition-colors ${isActive ? 'bg-surface-2 text-ink' : 'text-ink-2 hover:bg-surface-2 hover:text-ink'}`;
 
@@ -41,8 +41,8 @@ const Avatar = ({ user, size = 'h-8 w-8' }) => {
   return avatar ? (
     <img src={avatar} alt="" className={`${size} rounded-full border border-line object-cover`} referrerPolicy="no-referrer" />
   ) : (
-    <span className={`${size} flex items-center justify-center rounded-full bg-accent-soft text-[11px] font-semibold uppercase text-accent-strong`}>
-      {name.slice(0, 2)}
+    <span className={`${size} flex items-center justify-center rounded-full bg-accent text-[14px] font-medium uppercase text-accent-ink`}>
+      {name.slice(0, 1)}
     </span>
   );
 };
@@ -96,7 +96,7 @@ const SiteHeader = ({ variant = 'marketing', onToggleSidebar, onOpenPalette }) =
         >
           Skip to content
         </a>
-        <nav className={`${isApp ? 'px-3 sm:px-4' : 'content-shell'} flex h-14 items-center gap-2`} aria-label="Main">
+        <nav className={`${isApp ? 'px-3 sm:px-4' : 'content-shell relative'} flex h-14 items-center gap-2`} aria-label="Main">
           {isApp && onToggleSidebar && (
             <button type="button" onClick={onToggleSidebar} className={`${ICON_BUTTON} -ml-1 lg:hidden`} aria-label="Show repositories">
               <PanelLeft className="h-4 w-4" aria-hidden="true" />
@@ -104,10 +104,16 @@ const SiteHeader = ({ variant = 'marketing', onToggleSidebar, onOpenPalette }) =
           )}
           {/* Below 360px the wordmark would wrap beside the controls; the
               mark alone remains, and the link keeps its accessible name. */}
-          <Logo to={user ? '/app' : '/'} className="h-11 whitespace-nowrap md:h-9 max-[359px]:[&>span]:hidden" />
+          {isApp ? (
+            <Logo to={user ? '/app' : '/'} className="h-11 whitespace-nowrap md:h-9 max-[359px]:[&>span]:hidden" />
+          ) : (
+            <NavLink to="/" className="inline-flex h-11 items-center whitespace-nowrap text-[17px] font-semibold tracking-tight text-ink md:h-9">
+              Codebase Intel
+            </NavLink>
+          )}
 
           {!isApp && (
-            <div className="ml-5 hidden items-center gap-0.5 md:flex">
+            <div className="absolute left-1/2 hidden -translate-x-1/2 items-center gap-1 md:flex">
               {NAV.map((item) => <NavLink key={item.to} to={item.to} className={navClass}>{item.label}</NavLink>)}
             </div>
           )}
@@ -125,14 +131,9 @@ const SiteHeader = ({ variant = 'marketing', onToggleSidebar, onOpenPalette }) =
                 <span className="ml-3 flex gap-0.5"><Kbd>⌘</Kbd><Kbd>K</Kbd></span>
               </button>
             )}
-            <ThemeToggle />
+            {isApp && <ThemeToggle />}
             {user ? (
               <>
-                {!isApp && (
-                  <NavLink to="/app" className="hidden h-9 items-center rounded-lg bg-ink px-3.5 text-[13px] font-medium text-canvas transition-opacity hover:opacity-90 sm:inline-flex">
-                    Open workspace
-                  </NavLink>
-                )}
                 <Menu
                   label="Account menu"
                   trigger={({ toggle, props }) => (
