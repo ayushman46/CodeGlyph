@@ -1,25 +1,14 @@
 import { AlertCircle, AlertTriangle, Check, ChevronDown, ChevronUp, Copy, ExternalLink, Link2, RotateCcw, X } from 'lucide-react';
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { isBeyondEnd } from '../../lib/lines';
 import { highlightLines } from '../../lib/prism';
-import { basename, githubBlobUrl } from '../../lib/citations';
+import { basename, dirname, githubBlobUrl } from '../../lib/citations';
 import { shortSha } from '../../lib/format';
 import useStore from '../../store/useStore';
+import { ArtifactPanel } from '../ai/ArtifactPanel';
 import Badge from '../ui/Badge';
-
-const Breadcrumbs = ({ path }) => {
-  const parts = String(path || '').split('/');
-  return (
-    <div className="flex min-w-0 flex-wrap items-center gap-0.5 font-mono text-[12px] text-ink-3" title={path}>
-      {parts.map((part, index) => (
-        <span key={`${part}-${index}`} className="flex min-w-0 items-center gap-0.5">
-          {index > 0 && <span className="text-line-strong" aria-hidden="true">/</span>}
-          <span className={index === parts.length - 1 ? 'break-all font-semibold text-ink' : ''}>{part}</span>
-        </span>
-      ))}
-    </div>
-  );
-};
+import Button from '../ui/Button';
+import { mergeRefs } from '../ui/Popover';
 
 // Rows never wrap (whitespace-pre) and use a fixed 20px line box, so large
 // files can be windowed: only the rows near the viewport are in the DOM.
@@ -31,6 +20,12 @@ const reducedMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce
 const anchorFor = (start, end) => (start ? `#L${start}${end && end !== start ? `-L${end}` : ''}` : '');
 const rangeText = (start, end) => (end && end !== start ? `${start}–${end}` : `${start}`);
 const inside = (number, range) => Boolean(range?.start) && number >= range.start && number <= (range.end || range.start);
+
+// The Artifact Panel body is the code's scroll container: dark like the
+// code, with the code scrollbar. No scroll anchoring: windowing resizes the
+// spacer rows above the visible lines, and the browser would otherwise
+// shift the scroll position by the same amount.
+const CODE_BODY = '[&>[data-slot=artifact-panel-body]]:bg-code [&>[data-slot=artifact-panel-body]]:[scrollbar-width:thin] [&>[data-slot=artifact-panel-body]]:[scrollbar-color:#3a342e_transparent] [&>[data-slot=artifact-panel-body]]:[overflow-anchor:none]';
 
 const CodeRow = ({ number, html, cited, other, selected, onSelectLine }) => {
   let rowTone = '';
@@ -55,28 +50,48 @@ const CodeRow = ({ number, html, cited, other, selected, onSelectLine }) => {
   );
 };
 
-const IconButton = ({ label, onClick, children, href }) => {
-  const className = 'inline-flex h-8 w-8 items-center justify-center rounded-lg text-ink-3 transition-colors hover:bg-surface-2 hover:text-ink';
-  if (href) {
-    return <a href={href} target="_blank" rel="noreferrer" className={className} aria-label={label} title={label}>{children}</a>;
-  }
-  return <button type="button" onClick={onClick} className={className} aria-label={label} title={label}>{children}</button>;
-};
+const IconButton = ({ label, onClick, children }) => (
+  <button
+    type="button"
+    onClick={onClick}
+    className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-ink-3 transition-colors hover:bg-surface-2 hover:text-ink"
+    aria-label={label}
+    title={label}
+  >
+    {children}
+  </button>
+);
 
 /**
- * Full file at the indexed commit with the cited range highlighted. Other
- * ranges the same answer cites in this file get a lighter tint and can be
- * stepped through; clicking line numbers selects lines for a GitHub link.
+ * Full file at the indexed commit with the cited range highlighted, framed
+ * as an Artifact Panel: the file name titles it, folder and lines describe
+ * it, Copy GitHub link / Open on GitHub (at the pinned commit) sit in the
+ * header. Other ranges the same answer cites in this file get a lighter tint
+ * and can be stepped through; clicking line numbers selects lines for a
+ * GitHub link. The panel body is the scroll container (keyboard-scrollable);
+ * the file toolbar stays pinned at its top.
  */
-const FileViewer = ({ repoName, path, startLine, endLine, githubUrl, commitSha, ranges = [] }) => {
+const FileViewer = ({
+  repoName, path, startLine, endLine, githubUrl, commitSha, ranges = [],
+  onClose, navigation = null, autoFocus = false, panelRef, panelProps,
+}) => {
   const loadFile = useStore((state) => state.loadFile);
   const entry = useStore((state) => state.files[`${repoName}::${path}`]);
+  const sectionRef = useRef(null);
+  const setSectionRef = useMemo(() => mergeRefs(sectionRef, panelRef), [panelRef]);
   const scrollRef = useRef(null);
+  const tableRef = useRef(null);
+  const toolbarRef = useRef(null);
   const [copied, setCopied] = useState('');
   const [selection, setSelection] = useState(null);
   const [lineInput, setLineInput] = useState('');
   const [lineError, setLineError] = useState('');
   const lineInputId = useId();
+
+  // The Artifact Panel's body scrolls the code.
+  useLayoutEffect(() => {
+    scrollRef.current = sectionRef.current?.querySelector('[data-slot="artifact-panel-body"]') ?? null;
+  }, []);
 
   // Every cited range of this file, with the opened one active.
   const allRanges = useMemo(() => {
@@ -99,14 +114,28 @@ const FileViewer = ({ repoName, path, startLine, endLine, githubUrl, commitSha, 
   const virtual = lines.length > VIRTUALIZE_ABOVE;
   const [viewport, setViewport] = useState({ top: 0, height: 800 });
   const frameRef = useRef(0);
+  // Where the table starts inside the scroll container (below the pinned
+  // toolbar and any notes), in scroll coordinates.
+  const tableTop = useCallback(() => {
+    const node = scrollRef.current;
+    const table = tableRef.current;
+    if (!node || !table) return 0;
+    return table.getBoundingClientRect().top - node.getBoundingClientRect().top + node.scrollTop;
+  }, []);
   const measure = useCallback(() => {
     frameRef.current = 0;
     const node = scrollRef.current;
-    if (node) setViewport({ top: node.scrollTop, height: node.clientHeight || 800 });
-  }, []);
+    if (node) setViewport({ top: Math.max(0, node.scrollTop - tableTop()), height: node.clientHeight || 800 });
+  }, [tableTop]);
   const onScroll = useCallback(() => {
     if (virtual && !frameRef.current) frameRef.current = window.requestAnimationFrame(measure);
   }, [virtual, measure]);
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (!node) return undefined;
+    node.addEventListener('scroll', onScroll, { passive: true });
+    return () => node.removeEventListener('scroll', onScroll);
+  }, [onScroll]);
   useEffect(() => () => { if (frameRef.current) window.cancelAnimationFrame(frameRef.current); }, []);
   // The longest line fixes the table width, so windowing never makes the
   // horizontal scroll range jump.
@@ -123,19 +152,23 @@ const FileViewer = ({ repoName, path, startLine, endLine, githubUrl, commitSha, 
     if (virtual) measure();
   }, [lines, virtual, measure]);
 
+  // Puts the line a quarter of the way down the code below the pinned toolbar.
   const scrollToLine = useCallback((line, { smooth = true } = {}) => {
     const node = scrollRef.current;
     if (!node || !line) return;
-    const top = Math.max(0, (line - 1) * ROW_HEIGHT - node.clientHeight / 4);
+    const pinned = toolbarRef.current?.offsetHeight || 0;
+    const row = virtual ? null : node.querySelector(`[data-line="${line}"]`);
+    const rowTop = row
+      ? row.getBoundingClientRect().top - node.getBoundingClientRect().top + node.scrollTop
+      : tableTop() + (line - 1) * ROW_HEIGHT;
+    const top = Math.max(0, rowTop - pinned - (node.clientHeight - pinned) / 4);
     if (virtual) {
       node.scrollTop = top;
-      setViewport({ top, height: node.clientHeight || 800 });
+      setViewport({ top: Math.max(0, top - tableTop()), height: node.clientHeight || 800 });
       return;
     }
-    const row = node.querySelector(`[data-line="${line}"]`);
-    const offset = row ? Math.max(0, row.offsetTop - node.clientHeight / 4) : top;
-    node.scrollTo({ top: offset, behavior: smooth && !reducedMotion() ? 'smooth' : 'auto' });
-  }, [virtual]);
+    node.scrollTo({ top, behavior: smooth && !reducedMotion() ? 'smooth' : 'auto' });
+  }, [virtual, tableTop]);
 
   useEffect(() => {
     if (!lines.length || !activeStart || beyondEnd || beyondShown) return;
@@ -202,11 +235,50 @@ const FileViewer = ({ repoName, path, startLine, endLine, githubUrl, commitSha, 
   };
 
   const otherRanges = allRanges.filter((_, index) => index !== activeIndex);
+  const folder = dirname(path);
+  const description = (
+    <span title={path}>
+      {folder || 'Repository root'}
+      {active ? ` · lines ${rangeText(active.start, active.end)}` : ''}
+    </span>
+  );
+
+  const actions = (
+    <>
+      {navigation}
+      {link && (
+        <Button
+          variant="link"
+          size="icon-sm"
+          aria-label={copied === 'link' ? 'Copied GitHub link' : 'Copy GitHub link'}
+          title="Copy GitHub link"
+          onClick={() => copyText(link, 'link')}
+        >
+          {copied === 'link' ? <Check className="text-success" aria-hidden="true" /> : <Link2 aria-hidden="true" />}
+        </Button>
+      )}
+      {link && (
+        <Button variant="link" size="icon-sm" href={link} target="_blank" rel="noreferrer" aria-label="Open on GitHub" title="Open on GitHub">
+          <ExternalLink aria-hidden="true" />
+        </Button>
+      )}
+    </>
+  );
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <div className="space-y-2 border-b border-line px-4 py-3">
-        <Breadcrumbs path={path} />
+    <ArtifactPanel
+      ref={setSectionRef}
+      title={basename(path)}
+      description={description}
+      actions={actions}
+      onClose={onClose}
+      autoFocus={autoFocus}
+      flush
+      className={CODE_BODY}
+      {...panelProps}
+    >
+      {/* Pinned to the top-left of the scrolling body, so it never scrolls away horizontally or vertically. */}
+      <div ref={toolbarRef} className="sticky left-0 top-0 z-10 space-y-2 border-b border-line bg-surface px-3 py-2">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex min-w-0 flex-wrap items-center gap-1.5">
             {active ? (
@@ -216,7 +288,7 @@ const FileViewer = ({ repoName, path, startLine, endLine, githubUrl, commitSha, 
                 className="rounded-full focus-visible:outline-offset-1"
                 title="Scroll to the cited lines"
               >
-                <Badge tone={beyondEnd ? 'warning' : 'accent'}>Lines {rangeText(active.start, active.end)}</Badge>
+                <Badge tone={beyondEnd ? 'warning' : 'accent'}>Cited lines</Badge>
               </button>
             ) : null}
             {allRanges.length > 1 && (
@@ -266,16 +338,6 @@ const FileViewer = ({ repoName, path, startLine, endLine, githubUrl, commitSha, 
             >
               {copied === 'path' ? <Check className="h-4 w-4 text-success" aria-hidden="true" /> : <Copy className="h-4 w-4" aria-hidden="true" />}
             </IconButton>
-            {link && (
-              <IconButton label={copied === 'link' ? 'Copied GitHub link' : 'Copy GitHub link'} onClick={() => copyText(link, 'link')}>
-                {copied === 'link' ? <Check className="h-4 w-4 text-success" aria-hidden="true" /> : <Link2 className="h-4 w-4" aria-hidden="true" />}
-              </IconButton>
-            )}
-            {link && (
-              <IconButton label="Open on GitHub" href={link}>
-                <ExternalLink className="h-4 w-4" aria-hidden="true" />
-              </IconButton>
-            )}
           </div>
         </div>
         {lineError && <p id={`${lineInputId}-error`} className="text-[12px] text-danger" role="alert">{lineError}</p>}
@@ -284,13 +346,13 @@ const FileViewer = ({ repoName, path, startLine, endLine, githubUrl, commitSha, 
         </p>
       </div>
       {data?.exact === false && (
-        <div className="flex items-start gap-2 border-b border-warning/30 bg-warning-soft px-4 py-2 text-[12.5px] text-ink-2" role="note">
+        <div className="sticky left-0 flex items-start gap-2 border-b border-warning/30 bg-warning-soft px-3 py-2 text-[12.5px] text-ink-2" role="note">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
           <span>Reconstructed from the index: whitespace or skipped sections may differ from the file on GitHub.</span>
         </div>
       )}
       {truncated && (
-        <div className="flex items-start gap-2 border-b border-warning/30 bg-warning-soft px-4 py-2 text-[12.5px] text-ink-2" role="note">
+        <div className="sticky left-0 flex items-start gap-2 border-b border-warning/30 bg-warning-soft px-3 py-2 text-[12.5px] text-ink-2" role="note">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
           <span>
             This file is large: showing the first {lines.length.toLocaleString()} of {totalLines.toLocaleString()} lines.
@@ -300,70 +362,62 @@ const FileViewer = ({ repoName, path, startLine, endLine, githubUrl, commitSha, 
         </div>
       )}
       {beyondEnd && (
-        <div className="flex items-start gap-2 border-b border-warning/30 bg-warning-soft px-4 py-2 text-[12.5px] text-ink-2" role="note">
+        <div className="sticky left-0 flex items-start gap-2 border-b border-warning/30 bg-warning-soft px-3 py-2 text-[12.5px] text-ink-2" role="note">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
           <span>The cited lines are past the end of this file, which has {totalLines.toLocaleString()} line{totalLines === 1 ? '' : 's'}. The reference may be out of date.</span>
         </div>
       )}
-      <div
-        ref={scrollRef}
-        onScroll={onScroll}
-        tabIndex={0}
-        role="region"
-        aria-label={`Contents of ${basename(path)}`}
-        className="code-scroll relative min-h-0 flex-1 overflow-auto bg-code outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
-      >
-        {entry?.loading && (
-          <div className="space-y-2 p-4" role="status" aria-label={`Loading ${basename(path)}`}>
-            {Array.from({ length: 12 }, (_, index) => <div key={index} className="h-3 rounded bg-code-line/70" style={{ width: `${40 + ((index * 37) % 50)}%` }} />)}
+      {entry?.loading && (
+        <div className="space-y-2 p-4" role="status" aria-label={`Loading ${basename(path)}`}>
+          {Array.from({ length: 12 }, (_, index) => <div key={index} className="h-3 rounded bg-code-line/70" style={{ width: `${40 + ((index * 37) % 50)}%` }} />)}
+        </div>
+      )}
+      {entry?.error && (
+        <div className="m-4 rounded-xl border border-danger/30 bg-danger-soft p-3 text-sm text-danger" role="alert">
+          <p className="flex items-start gap-2"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" /> {entry.error}</p>
+          <div className="mt-3 flex flex-wrap gap-2 pl-6">
+            <button
+              type="button"
+              onClick={() => void loadFile(repoName, path)}
+              className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-line bg-surface px-3 text-[12.5px] font-semibold text-ink hover:bg-surface-2"
+            >
+              <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" /> Try again
+            </button>
+            {link && (
+              <a href={link} target="_blank" rel="noreferrer" className="inline-flex h-8 items-center gap-1.5 rounded-lg px-3 text-[12.5px] font-medium text-ink-2 hover:bg-surface hover:text-ink">
+                <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" /> View on GitHub
+              </a>
+            )}
           </div>
-        )}
-        {entry?.error && (
-          <div className="m-4 rounded-xl border border-danger/30 bg-danger-soft p-3 text-sm text-danger" role="alert">
-            <p className="flex items-start gap-2"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" /> {entry.error}</p>
-            <div className="mt-3 flex flex-wrap gap-2 pl-6">
-              <button
-                type="button"
-                onClick={() => void loadFile(repoName, path)}
-                className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-line bg-surface px-3 text-[12.5px] font-semibold text-ink hover:bg-surface-2"
-              >
-                <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" /> Try again
-              </button>
-              {link && (
-                <a href={link} target="_blank" rel="noreferrer" className="inline-flex h-8 items-center gap-1.5 rounded-lg px-3 text-[12.5px] font-medium text-ink-2 hover:bg-surface hover:text-ink">
-                  <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" /> View on GitHub
-                </a>
-              )}
-            </div>
-          </div>
-        )}
-        {data && (
-          <table
-            className="code-tokens w-full border-collapse font-mono text-[12.5px] leading-5"
-            style={virtual ? { minWidth: `calc(${widestLine}ch + 6rem)` } : undefined}
-          >
-            <tbody>
-              {first > 0 && <tr aria-hidden="true" style={{ height: first * ROW_HEIGHT }}><td colSpan={2} /></tr>}
-              {lines.slice(first, last).map((html, offset) => {
-                const number = first + offset + 1;
-                return (
-                  <CodeRow
-                    key={number}
-                    number={number}
-                    html={html}
-                    cited={inside(number, active)}
-                    other={otherRanges.some((range) => inside(number, range))}
-                    selected={inside(number, selection)}
-                    onSelectLine={selectLine}
-                  />
-                );
-              })}
-              {last < lines.length && <tr aria-hidden="true" style={{ height: (lines.length - last) * ROW_HEIGHT }}><td colSpan={2} /></tr>}
-            </tbody>
-          </table>
-        )}
-      </div>
-    </div>
+        </div>
+      )}
+      {data && (
+        <table
+          ref={tableRef}
+          className="code-tokens w-full border-collapse font-mono text-[12.5px] leading-5"
+          style={virtual ? { minWidth: `calc(${widestLine}ch + 6rem)` } : undefined}
+        >
+          <tbody>
+            {first > 0 && <tr aria-hidden="true" style={{ height: first * ROW_HEIGHT }}><td colSpan={2} /></tr>}
+            {lines.slice(first, last).map((html, offset) => {
+              const number = first + offset + 1;
+              return (
+                <CodeRow
+                  key={number}
+                  number={number}
+                  html={html}
+                  cited={inside(number, active)}
+                  other={otherRanges.some((range) => inside(number, range))}
+                  selected={inside(number, selection)}
+                  onSelectLine={selectLine}
+                />
+              );
+            })}
+            {last < lines.length && <tr aria-hidden="true" style={{ height: (lines.length - last) * ROW_HEIGHT }}><td colSpan={2} /></tr>}
+          </tbody>
+        </table>
+      )}
+    </ArtifactPanel>
   );
 };
 

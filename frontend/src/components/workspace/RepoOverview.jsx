@@ -3,7 +3,9 @@ import { useEffect, useRef, useState } from 'react';
 import { errorMessage, searchRepository } from '../../api/client';
 import { parseRepository } from '../../lib/citations';
 import { formatBytes, formatCount, relativeTime, shortSha } from '../../lib/format';
+import { formatExact } from '../../lib/phase';
 import useStore from '../../store/useStore';
+import ContextMeter, { filesLabels } from '../ai/ContextMeter';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
 import ProgressBar from '../ui/ProgressBar';
@@ -180,6 +182,25 @@ const CoverageCard = ({ repo, onOpenCoverage }) => {
   );
 };
 
+/**
+ * Files indexed against the indexing file budget (the selector's
+ * `selection_budget.max_files`), as a Context Meter. Only rendered when the
+ * snapshot records that budget; nothing here is estimated.
+ */
+const FileBudgetMeter = ({ indexed, budget, selection }) => {
+  const omitted = Number(selection.budget_omitted_files) || 0;
+  const note = (
+    <>
+      Each repository indexes up to {formatExact(budget)} files, most important first.
+      {omitted > 0
+        ? ` ${formatExact(omitted)} lower-priority ${omitted === 1 ? 'file was' : 'files were'} left out ${selection.quota_limited ? 'to fit your plan' : 'by the indexing budget'}; the coverage report lists them.`
+        : ' Nothing was left out by the budget.'}
+    </>
+  );
+  // Sits in the tile's value row: the 24px trigger overlaps the padding so the tile keeps its height.
+  return <ContextMeter used={Number(indexed) || 0} limit={budget} labels={filesLabels} note={note} className="-my-0.5 -me-2" />;
+};
+
 /** Deterministic repository tour: stats, languages, folders, starters, search. */
 const RepoOverview = ({ repo, onAsk, compact = false, onOpenCoverage, onShowOverview }) => {
   const loadOverview = useStore((state) => state.loadOverview);
@@ -196,6 +217,9 @@ const RepoOverview = ({ repo, onAsk, compact = false, onOpenCoverage, onShowOver
   const repository = parseRepository(repo.github_url);
   const commitUrl = repository && repo.commit_sha ? `https://github.com/${repository.fullName}/commit/${repo.commit_sha}` : null;
   const questions = data?.suggested_questions || [];
+  const indexedFiles = repo.indexed_files || data?.total_files;
+  // The selector's per-repository file budget, recorded with the snapshot.
+  const fileBudget = Number(selection.selection_budget?.max_files) || 0;
 
   return (
     <div className="space-y-5">
@@ -215,13 +239,20 @@ const RepoOverview = ({ repo, onAsk, compact = false, onOpenCoverage, onShowOver
       {!compact && (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           {[
-            ['Indexed files', formatCount(repo.indexed_files || data?.total_files)],
+            ['Indexed files', formatCount(indexedFiles), fileBudget > 0 && <FileBudgetMeter indexed={indexedFiles} budget={fileBudget} selection={selection} />],
             ['Code sections', formatCount(repo.chunk_count)],
             ['Indexed source', formatBytes(selection.selected_bytes || 0)],
-          ].map(([label, value]) => (
+          ].map(([label, value, meter]) => (
             <div key={label} className="rounded-xl border border-line bg-surface px-4 py-3">
               <p className="text-[11.5px] text-ink-3">{label}</p>
-              <p className="mt-1 truncate font-mono text-[15px] font-semibold text-ink">{value}</p>
+              {meter ? (
+                <div className="mt-1 flex items-center justify-between gap-1">
+                  <p className="min-w-0 truncate font-mono text-[15px] font-semibold text-ink">{value}</p>
+                  {meter}
+                </div>
+              ) : (
+                <p className="mt-1 truncate font-mono text-[15px] font-semibold text-ink">{value}</p>
+              )}
             </div>
           ))}
           <div className="rounded-xl border border-line bg-surface px-4 py-3">

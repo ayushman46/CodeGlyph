@@ -30,3 +30,4 @@ explanation.md
 PRODUCTION_AUDIT.md
 frontend/dist-e2e/
 .local/
+frontend/preview-harness/

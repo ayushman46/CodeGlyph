@@ -23,15 +23,18 @@ for (const scheme of ['light', 'dark']) {
     await page.getByRole('button', { name: /handleConfirmation\.ts:42–118/ }).click();
     await page.waitForTimeout(600);
     await page.screenshot({ path: `${OUT}/answer-sources-${scheme}.png` });
-    await page.keyboard.press('Escape');
+    // The file panel is an Artifact Panel: Close (not Escape) closes it.
+    await page.getByRole('complementary', { name: /^File / }).getByRole('button', { name: 'Close' }).click();
     await page.getByRole('radio', { name: 'Edit & PR' }).click();
     const editor = page.getByRole('textbox', { name: 'Describe the code change' });
     await editor.fill('Send confirmation emails in the attendee timezone');
     await editor.press('Enter');
     await expect(page.getByText('2 files changed')).toBeVisible();
+    await page.locator('[data-slot="artifact-card"]').last().click();
+    await expect(page.locator('#proposal-artifact-panel')).toBeVisible();
     await page.waitForTimeout(300);
     await page.screenshot({ path: `${OUT}/proposal-${scheme}.png` });
-    await page.getByRole('button', { name: 'Review & create PR' }).click();
+    await page.locator('[data-slot="proposal"]').getByRole('button', { name: 'Review & open PR' }).click();
     await page.waitForTimeout(400);
     await page.screenshot({ path: `${OUT}/pr-modal-${scheme}.png` });
     await page.getByRole('radio', { name: 'Split' }).click();

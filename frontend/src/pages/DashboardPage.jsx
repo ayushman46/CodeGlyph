@@ -162,8 +162,6 @@ const DashboardPage = () => {
   const fetchRepos = useStore((state) => state.fetchRepos);
   const [retrying, setRetrying] = useState(false);
   const selectRepo = useStore((state) => state.selectRepo);
-  const sourcesOpen = useStore((state) => state.sources.open);
-  const closeSources = useStore((state) => state.closeSources);
   const review = useStore((state) => state.review);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -219,10 +217,11 @@ const DashboardPage = () => {
       event.preventDefault();
       setPaletteOpen((value) => !value);
     } else if (event.key === 'Escape' && !paletteOpen && !dialog && !review) {
-      if (sourcesOpen) closeSources();
-      else if (drawerOpen) setDrawerOpen(false);
+      // The sources/file panel beside the conversation is an Artifact Panel:
+      // not a dialog, so Escape does not close it (its Close button does).
+      if (drawerOpen) setDrawerOpen(false);
     }
-  }, [paletteOpen, dialog, review, sourcesOpen, closeSources, drawerOpen]);
+  }, [paletteOpen, dialog, review, drawerOpen]);
 
   useEffect(() => {
     document.addEventListener('keydown', onKeyDown);

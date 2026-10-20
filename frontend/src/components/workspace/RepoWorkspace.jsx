@@ -1,25 +1,34 @@
 import {
-  AlertTriangle, CheckCircle2, Download, ExternalLink, GitBranch, GitCommitHorizontal, GitFork, Info, LayoutDashboard,
-  MessageSquareText, MoreHorizontal, Pencil, PieChart, RefreshCw, Square, SquarePen, Tag, Trash2, X,
+  AlertTriangle, Check, CheckCircle2, Copy, Download, ExternalLink, FileDiff, FilePlus2, GitBranch, GitCommitHorizontal, GitFork,
+  GitPullRequest, Info, LayoutDashboard, MessageSquareText, MoreHorizontal, Pencil, PieChart, RefreshCw, Square, SquarePen, Tag,
+  Trash2, X,
 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
-import useFocusTrap from '../../hooks/useFocusTrap';
 import useMediaQuery from '../../hooks/useMediaQuery';
 import { errorMessage } from '../../api/client';
 import { parseRepository } from '../../lib/citations';
 import { formatCount, shortSha } from '../../lib/format';
-import { STEPS, isKeywordOnly, overallProgress, phaseIndex, phaseLabel, remainingLabel, statusTone } from '../../lib/phase';
-import { downloadText, slugify } from '../../lib/patch';
+import { isKeywordOnly, phaseLabel, statusTone } from '../../lib/phase';
+import { downloadText, proposalPatch, slugify } from '../../lib/patch';
+import { approximatePaths } from '../../lib/proposal';
+import useArtifacts, {
+  PROPOSAL_PANEL_ID, artifactCardId, proposalArtifactStatus, proposalArtifactSummary,
+} from '../../store/useArtifacts';
 import useStore from '../../store/useStore';
+import { ArtifactPanel } from '../ai/ArtifactPanel';
+import { LoadingState } from '../ai/LoadingState';
+import { MessageScroller } from '../ai/MessageScroller';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
 import Menu from '../ui/Menu';
-import ProgressBar from '../ui/ProgressBar';
-import Spinner from '../ui/Spinner';
 import Composer from './Composer';
-import IngestionProgress, { useIndexingEta } from './IngestionProgress';
+import DiffView from './DiffView';
+import { REVIEW_LABEL, isEditRun } from './EditProposalCard';
+import IngestionProgress, { IndexingLoadingState, useIndexingEta } from './IngestionProgress';
 import MessageBubble from './MessageBubble';
+import ProposalNotices from './ProposalNotices';
 import RepoOverview from './RepoOverview';
 import SourcesPanel from './SourcesPanel';
 
@@ -118,6 +127,160 @@ const IndexingProblem = ({ repo, onRetry, retrying, onDelete }) => {
   );
 };
 
+/**
+ * An Edit & PR reply's proposal as an Artifact Panel: the multi-file diff,
+ * with "Review & open PR" (the existing review dialog, opened exactly as the
+ * inline proposal card opens it) and Copy patch in the header. Status
+ * follows the reply: streaming while it is written, error when it finished
+ * without a proposal.
+ */
+const ProposalArtifact = ({ message, openedBy, onClose, onRetry }) => {
+  const openReview = useStore((state) => state.openReview);
+  const loadProposal = useStore((state) => state.loadProposal);
+  const status = proposalArtifactStatus(message);
+  const { title, description } = proposalArtifactSummary(message);
+  const proposal = message.edit_suggestion;
+  const files = proposal?.files || [];
+  const approximate = approximatePaths(proposal);
+  const canCopy = status === 'complete' && files.length > 0 && files.every((file) => file.after != null);
+  const [copied, setCopied] = useState(false);
+  // A reply from history carries only its proposal's id: load the proposal
+  // (its diff, counts and patch) when the panel shows it.
+  const needsProposal = status === 'complete' && !proposal && Boolean(message.proposal_id);
+  const [loadError, setLoadError] = useState('');
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const panelRef = useRef(null);
+  // Try again leaves with the error row (the Loading State takes its place):
+  // keep keyboard focus in the panel instead of letting it fall to <body>.
+  const retryLoad = () => {
+    panelRef.current?.focus({ preventScroll: true });
+    setLoadAttempt((count) => count + 1);
+  };
+  useEffect(() => {
+    if (!needsProposal) return undefined;
+    let current = true;
+    setLoadError('');
+    loadProposal(message.id).catch((error) => {
+      if (current) setLoadError(errorMessage(error, 'The diff could not be loaded.'));
+    });
+    return () => { current = false; };
+  }, [needsProposal, message.id, loadProposal, loadAttempt]);
+  useEffect(() => {
+    if (!copied) return undefined;
+    const timer = window.setTimeout(() => setCopied(false), 1600);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+  const copyPatch = async () => {
+    try {
+      await navigator.clipboard.writeText(proposalPatch(proposal));
+      setCopied(true);
+    } catch {
+      // Clipboard can be unavailable; the review dialog can still download it.
+    }
+  };
+
+  // A failed run never gets a proposal, so it has no review to open; a
+  // streaming one shows it disabled until the proposal arrives.
+  const actions = (
+    <>
+      {status !== 'error' && (
+        <Button variant="link" size="sm" disabled={status !== 'complete'} title={REVIEW_LABEL} onClick={() => openReview(message.id)}>
+          <GitPullRequest aria-hidden="true" />
+          <span className="max-sm:sr-only">{REVIEW_LABEL}</span>
+        </Button>
+      )}
+      {canCopy && (
+        <Button variant="link" size="icon-sm" aria-label={copied ? 'Copied patch' : 'Copy patch'} title="Copy patch" onClick={copyPatch}>
+          {copied ? <Check className="text-success" aria-hidden="true" /> : <Copy aria-hidden="true" />}
+        </Button>
+      )}
+    </>
+  );
+
+  // The error row names why there is no change, like the reply's card.
+  let errorLabel;
+  if (status === 'error' && !message.stopped && !message.error) {
+    if (message.mode === 'editing') errorLabel = 'No safe patch was produced.';
+    else if (message.mode === 'retrieval_fallback') errorLabel = 'The model was unavailable, so no change was written.';
+  }
+
+  let body;
+  if (status === 'streaming') {
+    // The description carries the live stage.
+    body = <p className="m-0 text-ink-2">The diff appears here once every hunk is validated.</p>;
+  } else if (status === 'error') {
+    body = (
+      <p className="m-0 text-ink-2">
+        {message.stopped
+          ? 'Stopped before a change was written.'
+          : message.error || 'The reply in the conversation explains why.'}
+      </p>
+    );
+  } else if (needsProposal) {
+    body = loadError ? (
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1" role="alert">
+        <p className="m-0 min-w-0 flex-1 basis-48 text-ink-2">{loadError}</p>
+        <Button variant="link" size="sm" className="shrink-0" onClick={retryLoad}>Try again</Button>
+      </div>
+    ) : (
+      <LoadingState label="Loading the diff" pattern="dots" showElapsed={false} />
+    );
+  } else if (!files.length) {
+    body = <p className="m-0 text-ink-2">The diff loads with the review. Choose {REVIEW_LABEL} to see it.</p>;
+  } else {
+    body = (
+      <div className="flex flex-col gap-4">
+        <ProposalNotices proposal={proposal} />
+        {files.map((file) => {
+          const created = file.action === 'create';
+          const Icon = created ? FilePlus2 : FileDiff;
+          return (
+            <div key={file.file_path} className="flex min-w-0 flex-col gap-1.5">
+              <div className="flex min-w-0 items-center gap-2">
+                <Icon className={`size-3.5 shrink-0 ${created ? 'text-success' : 'text-ink-3'}`} aria-hidden="true" />
+                <p className="m-0 min-w-0 flex-1 truncate font-mono text-[11px] leading-4 text-ink-2" title={file.file_path}>{file.file_path}</p>
+                {created && <Badge tone="success">New</Badge>}
+                {approximate.has(file.file_path) && <span title="Reconstructed from the index; refresh from GitHub before pushing."><Badge tone="info">Approximate</Badge></span>}
+                {/* The diff's own stats bar shows the counts; a file too large to diff here shows them in its row. */}
+                {file.after == null && (
+                  <span className="shrink-0 font-mono text-[11px] leading-4">
+                    <span className="text-success">+{file.additions ?? 0}</span>{' '}
+                    <span className="text-danger-strong">−{file.deletions ?? 0}</span>
+                  </span>
+                )}
+              </div>
+              {file.summary && <p className="m-0 text-ink-2">{file.summary}</p>}
+              {file.after != null ? (
+                <DiffView before={created ? '' : file.before} after={file.after} />
+              ) : (
+                <p className="m-0 rounded-xl border border-line bg-surface-2 p-3 text-ink-2">This file is large; open the review to load the full diff.</p>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  return (
+    <ArtifactPanel
+      ref={panelRef}
+      id={PROPOSAL_PANEL_ID}
+      title={title}
+      description={description}
+      status={status}
+      actions={actions}
+      onClose={onClose}
+      onRetry={status === 'error' ? onRetry : undefined}
+      autoFocus={openedBy !== 'reply'}
+      labels={errorLabel ? { error: errorLabel } : undefined}
+      className="[&>[data-slot=artifact-panel-body]]:[scrollbar-width:thin] [&>[data-slot=artifact-panel-body]]:[scrollbar-color:var(--color-line-strong)_transparent]"
+    >
+      {body}
+    </ArtifactPanel>
+  );
+};
+
 const RepoWorkspace = ({ repo, onRequestDialog }) => {
   const messages = useStore((state) => state.messages);
   const isHistoryLoading = useStore((state) => state.isHistoryLoading);
@@ -127,8 +290,12 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
   const askQuestion = useStore((state) => state.askQuestion);
   const stopQuery = useStore((state) => state.stopQuery);
   const clearChat = useStore((state) => state.clearChat);
-  const sourcesOpen = useStore((state) => state.sources.open);
+  const sources = useStore((state) => state.sources);
+  const sourcesOpen = sources.open;
   const closeSources = useStore((state) => state.closeSources);
+  const artifact = useArtifacts((state) => state.artifact);
+  const openProposal = useArtifacts((state) => state.openProposal);
+  const closeArtifact = useArtifacts((state) => state.close);
   const reindexRepo = useStore((state) => state.reindexRepo);
   const location = useLocation();
   const navigate = useNavigate();
@@ -139,9 +306,13 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
   const [finished, setFinished] = useState(false);
   const [dismissed, setDismissed] = useState(readDismissed);
   const scrollRef = useRef(null);
+  const viewportRef = useRef(null);
   const composerRef = useRef(null);
   const tabRefs = useRef({});
-  const stickToBottom = useRef(true);
+  const [pinRequest, setPinRequest] = useState(0);
+  // The last reply's paced text is still appearing (it can outlast the
+  // request): the log stays busy and following stays instant until it is final.
+  const [revealing, setRevealing] = useState(false);
   const repository = parseRepository(repo.github_url);
   const eta = useIndexingEta(repo);
   const notice = location.state?.notice || '';
@@ -160,17 +331,25 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
   useEffect(() => {
     setActionError('');
     setFinished(false);
-    stickToBottom.current = true;
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
   }, [repo.id]);
 
-  // Follow the conversation only when there is one and the reader is near
-  // the bottom; progress and empty states always open at the top.
+  // The Message Scroller follows the conversation while the reader is at
+  // its end. Asking a question returns there from anywhere, so the new
+  // question and its answer are in view (and following resumes).
   useEffect(() => {
-    const node = scrollRef.current;
-    if (!node || tab !== 'chat' || !messages.length) return;
-    if (stickToBottom.current) node.scrollTop = node.scrollHeight;
-  }, [messages, tab]);
+    const node = viewportRef.current;
+    if (pinRequest && node) node.scrollTop = node.scrollHeight;
+  }, [pinRequest]);
+  // Whether the transcript follows new output (reported by the scroller,
+  // which starts following each time it mounts).
+  const following = useRef(true);
+  const onFollowChange = useCallback((next) => { following.current = next; }, []);
+  const showTranscript = tab === 'chat' && repo.queryable && !isHistoryLoading && messages.length > 0;
+  useEffect(() => {
+    if (showTranscript) following.current = true;
+  }, [showTranscript]);
+  // Progress, empty and overview states always open at the top.
   useEffect(() => {
     const node = scrollRef.current;
     if (node && tab === 'overview') node.scrollTop = 0;
@@ -178,7 +357,8 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
 
   // Screen readers hear when an answer finishes or fails (the stage
   // indicator's live region unmounts as soon as text starts streaming), and
-  // when indexing reaches a new step.
+  // when indexing finishes, fails, stops or makes keyword search ready (each
+  // step's progress is announced by the indexing Loading State's status).
   const [announcement, setAnnouncement] = useState('');
   const lastAssistant = [...messages].reverse().find((message) => message.role === 'assistant');
   const wasStreaming = useRef(false);
@@ -192,11 +372,10 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
     wasStreaming.current = streaming;
   }, [lastAssistant?.streaming, lastAssistant?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const step = phaseIndex(repo);
   const previous = useRef(null);
   useEffect(() => {
     const before = previous.current;
-    previous.current = { id: repo.id, step, status: repo.status, queryable: repo.queryable, indexing: repo.is_indexing };
+    previous.current = { id: repo.id, status: repo.status, queryable: repo.queryable, indexing: repo.is_indexing };
     if (!before || before.id !== repo.id) return;
     if (before.indexing && !repo.is_indexing) {
       if (repo.status === 'failed') setAnnouncement(`Indexing ${repo.repo_name} failed. ${repo.message || ''}`);
@@ -207,10 +386,8 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
       }
     } else if (!before.queryable && repo.queryable && repo.is_indexing) {
       setAnnouncement('Keyword search is ready. You can ask questions now while the semantic index finishes.');
-    } else if (repo.is_indexing && step !== before.step && STEPS[step]) {
-      setAnnouncement(`Indexing step ${Math.min(step + 1, 6)} of 6: ${STEPS[step].label}.`);
     }
-  }, [repo.id, step, repo.status, repo.queryable, repo.is_indexing]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [repo.id, repo.status, repo.queryable, repo.is_indexing]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!finished) return undefined;
@@ -218,27 +395,108 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
     return () => window.clearTimeout(timer);
   }, [finished]);
 
-  // Only one sources panel is mounted: docked on large screens, a sheet below.
-  const isLarge = useMediaQuery('(min-width: 1024px)');
-  const sheetRef = useRef(null);
-  useFocusTrap(sheetRef, sourcesOpen && !isLarge, { onEscape: closeSources });
+  // One artifact slot beside the conversation: the sources panel (a file
+  // opened from a citation, or the source list) or a reply's proposal.
+  // Docked where the conversation keeps a readable width beside it and the
+  // sidebar (from 1280px); on narrower screens it covers the conversation,
+  // which is then inert and hidden from assistive technology.
+  const isLarge = useMediaQuery('(min-width: 1280px)');
+  const proposalMessage = artifact?.kind === 'proposal' ? messages.find((message) => message.id === artifact.messageId) || null : null;
+  const slot = proposalMessage ? 'proposal' : sourcesOpen ? 'sources' : null;
+  const covered = Boolean(slot) && !isLarge;
+  const slotRef = useRef(null);
 
-  const onScroll = () => {
-    const node = scrollRef.current;
-    if (node) stickToBottom.current = node.scrollHeight - node.scrollTop - node.clientHeight < 120;
+  // Remember the control outside the slot that last opened or changed the
+  // sources panel (a citation, a source chip), so closing returns focus to
+  // it. Clicks count too: Safari does not focus a clicked button.
+  const lastActivated = useRef(null);
+  const sourcesOpener = useRef(null);
+  useEffect(() => {
+    const remember = (event) => {
+      const target = event.target instanceof Element
+        ? event.target.closest('a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"])')
+        : null;
+      if (target && !slotRef.current?.contains(target)) lastActivated.current = target;
+    };
+    document.addEventListener('focusin', remember, true);
+    document.addEventListener('click', remember, true);
+    return () => {
+      document.removeEventListener('focusin', remember, true);
+      document.removeEventListener('click', remember, true);
+    };
+  }, []);
+  useLayoutEffect(() => {
+    if (sources.open && lastActivated.current) sourcesOpener.current = lastActivated.current;
+  }, [sources]);
+
+  // Docking or undocking the panel changes the transcript's width (and its
+  // height a lot): a reader following the conversation stays at its end at
+  // once, instead of a long smooth scroll that new output could outrun.
+  const docked = Boolean(slot) && isLarge;
+  useLayoutEffect(() => {
+    const node = viewportRef.current;
+    if (node && following.current) node.scrollTop = node.scrollHeight;
+  }, [docked]);
+
+  // Closing the panel (Close, or anything else that leaves focus
+  // nowhere) returns focus to what opened it, else to the transcript.
+  const previousSlot = useRef(slot);
+  useEffect(() => {
+    const before = previousSlot.current;
+    previousSlot.current = slot;
+    if (!before || slot) return;
+    const active = document.activeElement;
+    if (active && active !== document.body && active.isConnected) return;
+    const returnId = useArtifacts.getState().returnFocusId;
+    const target = before === 'proposal' ? (returnId ? document.getElementById(returnId) : null) : sourcesOpener.current;
+    (target?.isConnected ? target : viewportRef.current)?.focus();
+  }, [slot]);
+
+  // Close renders first (so a narrow layout un-inerts the conversation),
+  // then returns focus to the card that opened the proposal.
+  const closeProposal = () => {
+    const returnId = useArtifacts.getState().returnFocusId;
+    flushSync(() => closeArtifact());
+    const card = returnId ? document.getElementById(returnId) : null;
+    if (card) card.focus();
   };
 
   const ask = (question, options) => {
-    stickToBottom.current = true;
+    setPinRequest((count) => count + 1);
     setTab('chat');
     void askQuestion(question, options);
   };
+  // A stable `ask` for the (memoized) replies, e.g. their follow-ups.
+  const askRef = useRef(ask);
+  askRef.current = ask;
+  const askFromReply = useCallback((question, options) => askRef.current(question, options), []);
 
   const lastUser = [...messages].reverse().find((message) => message.role === 'user');
   const lastMessage = messages[messages.length - 1];
   const regenerate = lastUser && lastMessage?.role === 'assistant' && !isQuerying
-    ? () => ask(lastUser.content, { workflow: lastMessage.workflow || 'general', modelProfile: lastMessage.model_profile || 'fast' })
+    // A stored reply carries only its mode (or proposal), not the workflow.
+    ? () => {
+      ask(lastUser.content, {
+        workflow: lastMessage.workflow || (isEditRun(lastMessage) ? 'editing' : 'general'),
+        modelProfile: lastMessage.model_profile || 'fast',
+      });
+      // The reply's Try again leaves with it (it is no longer the last
+      // reply): keep keyboard focus in the conversation, not on <body>.
+      window.requestAnimationFrame(() => {
+        const focused = document.activeElement;
+        if (!focused || focused === document.body) viewportRef.current?.focus({ preventScroll: true });
+      });
+    }
     : null;
+  // Try again on a failed proposal asks again and shows the new attempt in
+  // the panel (the retry may replace the failed reply).
+  const retryProposal = regenerate && proposalMessage && proposalMessage.id === lastMessage?.id
+    ? () => {
+      regenerate();
+      const next = useStore.getState().messages.at(-1);
+      if (next?.role === 'assistant') openProposal(next.id, artifactCardId(next.id), { openedBy: 'person' });
+    }
+    : undefined;
 
   const runAction = async (action, fallback) => {
     setActionError('');
@@ -288,16 +546,30 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
     <IngestionProgress repo={repo} onStop={repo.is_indexing ? () => onRequestDialog('stop', repo) : null} stopping={stopping} />
   );
 
+  // A conversation renders in the Message Scroller; progress, loading,
+  // empty and overview states keep the plain scroll container.
+  const tabPanelProps = { id: 'workspace-panel', role: 'tabpanel', 'aria-labelledby': `workspace-tab-${tab}` };
+  const historyAlert = historyError ? (
+    <div className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-danger/30 bg-danger-soft px-4 py-3 text-[13px] text-danger" role="alert">
+      <span>{historyError}</span>
+      <button type="button" onClick={retryHistory} className="shrink-0 font-semibold underline underline-offset-2">Retry</button>
+    </div>
+  ) : null;
+
   return (
-    <div className="flex h-full min-h-0">
-      <div className="flex min-w-0 flex-1 flex-col">
+    <div className="relative flex h-full min-h-0">
+      <div
+        className="flex min-w-0 flex-1 flex-col"
+        aria-hidden={covered ? 'true' : undefined}
+        inert={covered ? '' : undefined}
+      >
         {/* Header: one row of controls; status and links underneath. */}
         <div className="shrink-0 border-b border-line bg-canvas px-4 py-2.5 sm:px-6 sm:py-3">
           <div className="flex items-center gap-2 sm:gap-3">
             <div className="min-w-0 flex-1">
               <div className="flex min-w-0 items-center gap-2">
                 <h1 className="truncate text-[15px] font-semibold tracking-tight text-ink" title={repo.repo_name}>{repo.repo_name}</h1>
-                <Badge tone={statusTone(repo)} dot className="hidden sm:inline-flex">{phaseLabel(repo)}</Badge>
+                <span className="hidden sm:inline-flex"><Badge tone={statusTone(repo)} dot>{phaseLabel(repo)}</Badge></span>
               </div>
               <div className="mt-0.5 flex min-w-0 items-center gap-x-3 text-[12px] text-ink-3">
                 <Badge tone={statusTone(repo)} dot className="sm:hidden">{phaseLabel(repo)}</Badge>
@@ -363,17 +635,10 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
         </div>
 
         {repo.is_indexing && repo.queryable && (
-          <div className="flex shrink-0 items-center gap-3 border-b border-line bg-surface-2/70 px-4 py-2 text-[12.5px] text-ink-2 sm:px-6">
-            <Spinner className="h-3.5 w-3.5 shrink-0 text-accent" />
-            <p className="min-w-0 flex-1 truncate">
-              {repo.refreshing ? (
-                <><span className="font-medium text-ink">Refreshing the index</span><span className="hidden sm:inline"> · answers use the previous version until it finishes</span></>
-              ) : (
-                <><span className="font-medium text-ink">Keyword search is ready</span> · semantic index {semantic}%{remainingLabel(eta) && <span className="hidden sm:inline"> · {remainingLabel(eta)}</span>}</>
-              )}
-            </p>
-            <ProgressBar value={overallProgress(repo)} className="hidden max-w-32 sm:block" label="Indexing progress" />
-            <button type="button" onClick={() => onRequestDialog('stop', repo)} disabled={stopping} className="shrink-0 rounded-md px-2 py-1 font-medium text-ink-2 transition-colors hover:bg-surface-3 hover:text-ink disabled:opacity-50" aria-label={`Stop indexing ${repo.repo_name}`}>
+          <div className="flex shrink-0 items-start gap-3 border-b border-line bg-surface-2/70 px-4 py-2 text-ink-2 sm:px-6">
+            {/* Indexing continues after keyword search is ready: the same Loading State as the indexing card, one detail line. */}
+            <IndexingLoadingState repo={repo} eta={eta} brief className="min-w-0 flex-1" />
+            <button type="button" onClick={() => onRequestDialog('stop', repo)} disabled={stopping} className="-my-0.5 shrink-0 rounded-md px-2 py-1 text-[12.5px] font-medium text-ink-2 transition-colors hover:bg-surface-3 hover:text-ink disabled:opacity-50" aria-label={`Stop indexing ${repo.repo_name}`}>
               {stopping ? 'Stopping…' : 'Stop'}
             </button>
           </div>
@@ -403,74 +668,78 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
         )}
 
         {/* Body */}
-        <div
-          ref={scrollRef}
-          onScroll={onScroll}
-          id="workspace-panel"
-          role="tabpanel"
-          aria-labelledby={`workspace-tab-${tab}`}
-          className="scroll-thin min-h-0 flex-1 overflow-y-auto"
-        >
-          <div className={`mx-auto w-full px-4 py-6 sm:px-6 ${tab === 'overview' ? 'max-w-4xl' : 'max-w-3xl'}`}>
-            {problem ? problemPanel : tab === 'overview' ? (
-              notQueryable ? progressPanel : (
-                <RepoOverview
-                  repo={repo}
-                  onAsk={(question) => ask(question, { workflow: 'general', modelProfile: 'fast' })}
-                  onOpenCoverage={() => onRequestDialog('coverage', repo)}
-                />
-              )
-            ) : notQueryable ? progressPanel : isHistoryLoading ? (
-              <div className="space-y-6 py-4" aria-busy="true">
-                <span className="sr-only" role="status">Loading conversation</span>
-                {[0, 1].map((index) => (
-                  <div key={index} className="space-y-2.5" aria-hidden="true">
-                    <div className="skeleton ml-auto h-9 w-2/5 rounded-2xl" />
-                    <div className="skeleton h-4 w-11/12" />
-                    <div className="skeleton h-4 w-4/5" />
-                    <div className="skeleton h-4 w-3/5" />
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <>
-                {historyError && (
-                  <div className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-danger/30 bg-danger-soft px-4 py-3 text-[13px] text-danger" role="alert">
-                    <span>{historyError}</span>
-                    <button type="button" onClick={retryHistory} className="shrink-0 font-semibold underline underline-offset-2">Retry</button>
-                  </div>
-                )}
-                {messages.length === 0 ? (
-                  <div className="animate-rise py-2 sm:py-4">
-                    <p className="eyebrow">Ask anything</p>
-                    <h2 className="mt-2 text-xl font-semibold tracking-tight text-ink sm:text-2xl">What do you want to know about {repo.repo_name}?</h2>
-                    <p className="mt-2 text-sm leading-relaxed text-ink-3">
-                      {repo.is_indexing && !repo.refreshing
-                        ? <>Keyword search is ready, so you can ask now. The semantic index is {semantic}% built; when it finishes, answers get better at finding code by meaning.</>
-                        : <>Answers cite exact files and lines. Switch to <span className="font-medium text-ink-2">Edit &amp; PR</span> to have a change written, validated and turned into a pull request.</>}
-                    </p>
-                    <div className="mt-6">
-                      <RepoOverview
-                        repo={repo}
-                        compact
-                        onAsk={(question) => ask(question, { workflow: 'general', modelProfile: 'fast' })}
-                        onShowOverview={() => setTab('overview')}
-                      />
+        {showTranscript ? (
+          <MessageScroller
+            {...tabPanelProps}
+            className="min-h-0 flex-1"
+            label={`Conversation about ${repo.repo_name}`}
+            busy={isQuerying || revealing}
+            navigation="rail"
+            onFollowChange={onFollowChange}
+            viewportRef={viewportRef}
+            contentClassName="mx-auto w-full max-w-3xl px-4 py-6 sm:px-6"
+          >
+            {historyAlert}
+            <div className="space-y-7">
+              {messages.map((message, index) => (
+                <MessageBubble key={message.id} message={message} repo={repo} isLast={index === messages.length - 1} onRegenerate={index === messages.length - 1 ? regenerate : null} onAsk={askFromReply} onRevealChange={index === messages.length - 1 ? setRevealing : undefined} />
+              ))}
+            </div>
+          </MessageScroller>
+        ) : (
+          <div
+            ref={scrollRef}
+            {...tabPanelProps}
+            className="scroll-thin min-h-0 flex-1 overflow-y-auto"
+          >
+            <div className={`mx-auto w-full px-4 py-6 sm:px-6 ${tab === 'overview' ? 'max-w-4xl' : 'max-w-3xl'}`}>
+              {problem ? problemPanel : tab === 'overview' ? (
+                notQueryable ? progressPanel : (
+                  <RepoOverview
+                    repo={repo}
+                    onAsk={(question) => ask(question, { workflow: 'general', modelProfile: 'fast' })}
+                    onOpenCoverage={() => onRequestDialog('coverage', repo)}
+                  />
+                )
+              ) : notQueryable ? progressPanel : isHistoryLoading ? (
+                <div className="space-y-6 py-4" aria-busy="true">
+                  <span className="sr-only" role="status">Loading conversation</span>
+                  {[0, 1].map((index) => (
+                    <div key={index} className="space-y-2.5" aria-hidden="true">
+                      <div className="skeleton ml-auto h-9 w-2/5 rounded-2xl" />
+                      <div className="skeleton h-4 w-11/12" />
+                      <div className="skeleton h-4 w-4/5" />
+                      <div className="skeleton h-4 w-3/5" />
                     </div>
-                  </div>
-                ) : (
-                  <div className="space-y-7" role="log" aria-label="Conversation" aria-live="off">
-                    {messages.map((message, index) => (
-                      <MessageBubble key={message.id} message={message} repo={repo} isLast={index === messages.length - 1} onRegenerate={index === messages.length - 1 ? regenerate : null} />
-                    ))}
-                  </div>
-                )}
-              </>
-            )}
+                  ))}
+                </div>
+              ) : (
+                <>
+                  {historyAlert}
+                  {messages.length === 0 && (
+                    <div className="animate-rise py-2 sm:py-4">
+                      <p className="eyebrow">Ask anything</p>
+                      <h2 className="mt-2 text-xl font-semibold tracking-tight text-ink sm:text-2xl">What do you want to know about {repo.repo_name}?</h2>
+                      <p className="mt-2 text-sm leading-relaxed text-ink-3">
+                        {repo.is_indexing && !repo.refreshing
+                          ? <>Keyword search is ready, so you can ask now. The semantic index is {semantic}% built; when it finishes, answers get better at finding code by meaning.</>
+                          : <>Answers cite exact files and lines. Switch to <span className="font-medium text-ink-2">Edit &amp; PR</span> to have a change written, validated and turned into a pull request.</>}
+                      </p>
+                      <div className="mt-6">
+                        <RepoOverview
+                          repo={repo}
+                          compact
+                          onAsk={(question) => ask(question, { workflow: 'general', modelProfile: 'fast' })}
+                          onShowOverview={() => setTab('overview')}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
           </div>
-        </div>
-
-        <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">{announcement}</div>
+        )}
 
         <div className="shrink-0 border-t border-line bg-canvas px-3 pb-3 pt-3 sm:px-6">
           <Composer
@@ -484,18 +753,30 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
         </div>
       </div>
 
-      {/* Sources: docked on large screens, sheet on small screens */}
-      {sourcesOpen && (isLarge ? (
-        <div className="flex w-[min(46vw,42rem)] shrink-0 flex-col border-l border-line">
-          <SourcesPanel repo={repo} onClose={closeSources} />
+      {/* Outside the conversation column, so it is heard while a panel covers it. */}
+      <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">{announcement}</div>
+
+      {/* Artifact slot: docked beside the conversation on large screens, over it on narrow ones (Close leads back). */}
+      {slot && (
+        <div
+          ref={slotRef}
+          className={isLarge
+            ? 'flex w-[min(46vw,42rem)] shrink-0 flex-col py-3 pe-3'
+            : 'absolute inset-0 z-20 flex flex-col bg-canvas p-2 sm:p-3'}
+        >
+          {slot === 'proposal' ? (
+            <ProposalArtifact
+              key={proposalMessage.id}
+              message={proposalMessage}
+              openedBy={artifact.openedBy}
+              onClose={closeProposal}
+              onRetry={retryProposal}
+            />
+          ) : (
+            <SourcesPanel repo={repo} onClose={closeSources} autoFocus />
+          )}
         </div>
-      ) : (
-        <div className="fixed inset-0 z-[70] flex flex-col bg-black/40 pt-12" role="dialog" aria-modal="true" aria-label="Sources">
-          <div ref={sheetRef} tabIndex={-1} className="flex min-h-0 flex-1 animate-rise flex-col overflow-hidden rounded-t-3xl border-t border-line bg-surface outline-none">
-            <SourcesPanel repo={repo} onClose={closeSources} />
-          </div>
-        </div>
-      ))}
+      )}
     </div>
   );
 };

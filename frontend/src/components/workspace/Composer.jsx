@@ -1,23 +1,45 @@
-import { ArrowUp, ChevronDown, Clock, GitPullRequest, MessageSquareText, SlidersHorizontal, Square } from 'lucide-react';
-import { forwardRef, useEffect, useId, useImperativeHandle, useRef, useState } from 'react';
+import {
+  ChevronDown, ClipboardCheck, Clock, FileCode2, FileText, GitPullRequest, GraduationCap, Layers,
+  MessageCircleQuestion, MessageSquareText, ShieldCheck, Sparkles, Users, Zap,
+} from 'lucide-react';
+import { forwardRef, useCallback, useEffect, useId, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import { searchRepository } from '../../api/client';
 import useMediaQuery from '../../hooks/useMediaQuery';
+import { findSuggestion } from '../../lib/ai/promptBar';
 import useStore from '../../store/useStore';
+import { PromptBar } from '../ai/PromptBar';
+import Button from '../ui/Button';
 import Kbd from '../ui/Kbd';
+import { MenuPopup, MenuRadioGroup, MenuRadioItem, MenuRoot, MenuTrigger } from '../ui/Menu';
 import Segmented from '../ui/Segmented';
 import Spinner from '../ui/Spinner';
 
+/*
+ * The workspace composer, built on the Prompt Bar port (components/ai/PromptBar.jsx):
+ * - Ask vs Edit & PR stays a radio group, next to Send;
+ * - the answer workflows are `/` commands and a menu beside the model menu;
+ * - the answer model (Fast / Detailed) is the Prompt Bar's model menu;
+ * - `@` lists the repository's indexed files and inserts the path.
+ */
+
+/** `command` is the one-word `/` command; `short` labels the menu button. */
 export const WORKFLOWS = [
-  { value: 'general', label: 'General question', short: 'General' },
-  { value: 'onboarding', label: 'New engineer onboarding', short: 'Onboarding' },
-  { value: 'architecture', label: 'Architecture deep dive', short: 'Architecture' },
-  { value: 'security', label: 'Security review', short: 'Security' },
-  { value: 'contributor', label: 'Open-source contributor', short: 'Contributor' },
-  { value: 'due_diligence', label: 'Technical due diligence', short: 'Due diligence' },
+  { value: 'general', label: 'General question', short: 'General', command: 'general', icon: MessageCircleQuestion },
+  { value: 'onboarding', label: 'New engineer onboarding', short: 'Onboarding', command: 'onboarding', icon: GraduationCap },
+  { value: 'architecture', label: 'Architecture deep dive', short: 'Architecture', command: 'architecture', icon: Layers },
+  { value: 'security', label: 'Security review', short: 'Security', command: 'security', icon: ShieldCheck },
+  { value: 'contributor', label: 'Open-source contributor', short: 'Contributor', command: 'contributor', icon: Users },
+  { value: 'due_diligence', label: 'Technical due diligence', short: 'Due diligence', command: 'diligence', icon: ClipboardCheck },
 ];
 
+const WORKFLOW_COMMANDS = WORKFLOWS.map(({ value, label, command, icon: Icon }) => ({
+  id: value, label: command, description: label, icon: <Icon />,
+}));
+
+/** The answer models, as Prompt Bar models (ids are the API's model_profile). */
 const MODELS = [
-  { value: 'fast', label: 'Fast · Super 120B', short: 'Fast' },
-  { value: 'detailed', label: 'Detailed · Ultra 550B', short: 'Detailed' },
+  { id: 'fast', label: 'Fast', description: 'Super 120B', icon: <Zap /> },
+  { id: 'detailed', label: 'Detailed', description: 'Ultra 550B', icon: <Sparkles /> },
 ];
 
 // The API rejects longer questions; count down before that happens.
@@ -25,6 +47,13 @@ const MAX_QUESTION_LENGTH = 8000;
 const WARN_QUESTION_LENGTH = 7000;
 
 const PREFERENCES_KEY = 'ci-composer';
+
+// `@` file suggestions: at most this many are offered; code search runs
+// (debounced) once the typed word has two characters.
+export const MENTION_LIMIT = 50;
+const MENTION_SEARCH_MIN = 2;
+const MENTION_SEARCH_DELAY_MS = 150;
+const MENTION_POOL_LIMIT = 600;
 
 const readPreferences = () => {
   try {
@@ -39,126 +68,264 @@ const readPreferences = () => {
   }
 };
 
-const shortLabel = (options, value) => options.find((option) => option.value === value)?.short || '';
+const unique = (values) => [...new Set(values.filter(Boolean))];
+
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
- * A compact pill that shows a short label while the native select (stretched
- * invisibly over it) keeps the full option names, keyboard support and the
- * platform picker on phones.
+ * Applies workflow commands in a question: a leading `/command` (typed or
+ * picked) and any command picked from the list elsewhere in the text. The
+ * command words are removed from the question; the last one wins.
+ *
+ * @param {string} text the trimmed prompt
+ * @param {string[]} [picked] command labels picked from the `/` list
+ * @returns {{ question: string, workflow: string | null }}
  */
-const PillSelect = ({ label, value, onChange, options, disabled }) => (
-  <div className="relative inline-flex h-7 items-center gap-1 rounded-lg border border-transparent pl-2 pr-1.5 text-[12px] font-medium text-ink-3 transition-colors hover:border-line hover:bg-surface-2 hover:text-ink has-[select:focus-visible]:border-accent has-[select:focus-visible]:text-ink has-[select:focus-visible]:ring-2 has-[select:focus-visible]:ring-accent/25 has-[select:disabled]:opacity-50">
-    <span aria-hidden="true" className="whitespace-nowrap">{shortLabel(options, value)}</span>
-    <ChevronDown className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-    <select
-      value={value}
-      onChange={(event) => onChange(event.target.value)}
-      disabled={disabled}
-      aria-label={label}
-      title={label}
-      className="absolute inset-0 h-full w-full cursor-pointer appearance-none opacity-0 outline-none disabled:cursor-not-allowed"
-    >
-      {options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-    </select>
-  </div>
-);
+export const applyWorkflowCommands = (text, picked = []) => {
+  let question = text;
+  let workflow = null;
+  const leading = /^\/([\w-]+)(?=\s|$)/.exec(question);
+  const lead = leading && WORKFLOWS.find((item) => item.command === leading[1].toLowerCase());
+  if (lead) {
+    workflow = lead.value;
+    question = question.slice(leading[0].length);
+  }
+  picked.forEach((label) => {
+    const item = WORKFLOWS.find((option) => option.command === label);
+    if (!item) return;
+    const match = new RegExp(`(^|\\s)/${escapeRegExp(label)}(?:[ \\t]+|(?=\\s)|$)`, 'i').exec(question);
+    if (!match) return;
+    question = question.slice(0, match.index + match[1].length) + question.slice(match.index + match[0].length);
+    workflow = item.value;
+  });
+  return { question: question.trim(), workflow };
+};
 
-/** Narrow composers fold the workflow and model pickers into one popover. */
-const AnswerOptions = ({ preferences, onChange, disabled }) => {
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef(null);
-  const buttonRef = useRef(null);
-  const panelId = useId();
+/**
+ * Orders indexed paths for the `@` list and caps it. Paths containing the
+ * query come first (file name prefix, then file name, then a folder, then
+ * anywhere; shorter paths first); the rest follow so the list never empties
+ * (the Prompt Bar hides non-matches and says "No matches").
+ *
+ * @param {string[]} paths
+ * @param {string} [query]
+ * @param {number} [limit]
+ * @returns {string[]}
+ */
+export const rankMentionPaths = (paths, query = '', limit = MENTION_LIMIT) => {
+  const needle = query.toLowerCase();
+  if (!needle) return paths.slice(0, limit);
+  const matched = [];
+  const rest = [];
+  paths.forEach((path, order) => {
+    const lower = path.toLowerCase();
+    if (!lower.includes(needle)) {
+      rest.push(path);
+      return;
+    }
+    const name = lower.slice(lower.lastIndexOf('/') + 1);
+    let rank = 3;
+    if (name.startsWith(needle)) rank = 0;
+    else if (name.includes(needle)) rank = 1;
+    else if (lower.startsWith(needle) || lower.includes(`/${needle}`)) rank = 2;
+    matched.push({ path, rank, order });
+  });
+  matched.sort((a, b) => a.rank - b.rank || a.path.length - b.path.length || a.order - b.order);
+  return [...matched.map((item) => item.path), ...rest].slice(0, limit);
+};
+
+/**
+ * What code search looks for while an `@` mention is typed: the word itself,
+ * or for a path the file name being typed without its extension
+ * (`source/utils/normalize.ts` → `normalize`; `src/` → `src`).
+ *
+ * @param {string} query the typed mention word (lower-case)
+ * @returns {string}
+ */
+export const mentionSearchTerm = (query = '') => {
+  if (!/[/.]/.test(query)) return query;
+  const segment = query.split('/').filter(Boolean).pop() ?? '';
+  const stem = segment.split('.')[0];
+  return stem.length >= MENTION_SEARCH_MIN ? stem : segment;
+};
+
+const DOCUMENT_FILE = /\.(md|mdx|markdown|txt|rst|adoc)$/i;
+const mentionIcon = (path) => (DOCUMENT_FILE.test(path) || !/\.[^/]+$/.test(path) ? <FileText /> : <FileCode2 />);
+
+/** Files the conversation cited, newest first, as one string (a stable store selection). */
+const citedPathsKey = (messages) => {
+  const seen = new Set();
+  for (let index = messages.length - 1; index >= 0 && seen.size < 40; index -= 1) {
+    (messages[index].citations || []).forEach((citation) => {
+      if (citation?.file_path) seen.add(citation.file_path);
+    });
+  }
+  return [...seen].join('\n');
+};
+
+const NO_SEARCHES = { repo: null, queries: [], paths: [] };
+
+/**
+ * The `@` suggestions: the repository's indexed files, loaded lazily on the
+ * first `@` (the overview's key, root and starter-question files, the files
+ * this conversation cited) and widened by code search as the word grows.
+ *
+ * @param {string | null} repoName
+ * @param {{ kind: 'mention' | 'command', query: string } | null} suggestion the word at the caret
+ */
+function useFileMentions(repoName, suggestion) {
+  const loadOverview = useStore((state) => state.loadOverview);
+  const overview = useStore((state) => (repoName ? state.overviews[repoName]?.data : null));
+  const cited = useStore((state) => citedPathsKey(state.messages));
+  const [found, setFound] = useState(NO_SEARCHES);
+  const [pendingQuery, setPendingQuery] = useState(null);
+  const active = Boolean(repoName && suggestion?.kind === 'mention');
+  const query = active ? suggestion.query : '';
+  // Code search matches file text, not paths: for a typed path search the
+  // file name being typed (`source/utils/norm` searches `norm`); the list
+  // then keeps the paths that contain the whole typed path.
+  const term = mentionSearchTerm(query);
+  const searches = found.repo === repoName ? found : NO_SEARCHES;
+  const needsSearch = active && term.length >= MENTION_SEARCH_MIN && !searches.queries.includes(term);
 
   useEffect(() => {
-    if (!open) return undefined;
-    const onPointerDown = (event) => {
-      if (!rootRef.current?.contains(event.target)) setOpen(false);
-    };
-    const onKeyDown = (event) => {
-      if (event.key !== 'Escape') return;
-      event.stopPropagation();
-      setOpen(false);
-      buttonRef.current?.focus();
-    };
-    document.addEventListener('pointerdown', onPointerDown);
-    document.addEventListener('keydown', onKeyDown, true);
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown);
-      document.removeEventListener('keydown', onKeyDown, true);
-    };
-  }, [open]);
+    if (active) void loadOverview(repoName);
+  }, [active, repoName, loadOverview]);
 
-  const summary = `${shortLabel(WORKFLOWS, preferences.workflow)} · ${shortLabel(MODELS, preferences.model)}`;
-  const selectClass = 'mt-1 block h-9 w-full rounded-lg border border-line bg-surface-2 px-2.5 text-[13px] font-medium text-ink outline-none focus-visible:border-accent focus-visible:ring-2 focus-visible:ring-accent/25 disabled:opacity-50';
+  useEffect(() => {
+    if (!needsSearch) return undefined;
+    const controller = new AbortController();
+    setPendingQuery(term);
+    const timer = window.setTimeout(async () => {
+      let paths = [];
+      try {
+        const response = await searchRepository(repoName, term, { signal: controller.signal });
+        paths = (response.data?.results || []).map((result) => result.file_path);
+      } catch {
+        if (controller.signal.aborted) return;
+      }
+      setFound((current) => {
+        const base = current.repo === repoName ? current : { ...NO_SEARCHES, repo: repoName };
+        return {
+          repo: repoName,
+          queries: [...base.queries, term].slice(-200),
+          paths: unique([...base.paths, ...paths]).slice(-MENTION_POOL_LIMIT),
+        };
+      });
+      setPendingQuery((current) => (current === term ? null : current));
+    }, MENTION_SEARCH_DELAY_MS);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [needsSearch, repoName, term]);
+
+  const items = useMemo(() => {
+    const pool = unique([
+      ...(cited ? cited.split('\n') : []),
+      ...(overview?.key_files || []),
+      ...(overview?.suggested_question_details || []).flatMap((detail) => detail?.paths || []),
+      ...(overview?.root_files || []),
+      ...searches.paths,
+    ]);
+    return rankMentionPaths(pool, query).map((path) => ({ id: path, label: path, icon: mentionIcon(path) }));
+  }, [cited, overview, searches.paths, query]);
+
+  return { items, searching: needsSearch && pendingQuery === term };
+}
+
+/** The workflow menu: the same `/` commands as a radio menu beside the model menu. */
+const WorkflowMenu = ({ value, onChange, disabled }) => {
+  const selected = WORKFLOWS.find((item) => item.value === value) || WORKFLOWS[0];
+  const Icon = selected.icon;
   return (
-    <div ref={rootRef} className="relative min-w-0">
-      <button
-        ref={buttonRef}
-        type="button"
-        onClick={() => setOpen((value) => !value)}
-        aria-expanded={open}
-        aria-controls={panelId}
-        aria-label={`Answer options: ${summary}`}
-        className="inline-flex h-7 min-w-0 max-w-full items-center gap-1 rounded-lg border border-transparent px-1.5 text-[12px] font-medium text-ink-3 transition-colors hover:border-line hover:bg-surface-2 hover:text-ink aria-expanded:border-line aria-expanded:bg-surface-2 aria-expanded:text-ink"
-      >
-        <SlidersHorizontal className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-        <span className="truncate">{summary}</span>
-      </button>
-      {open && (
-        <div
-          id={panelId}
-          role="group"
-          aria-label="Answer options"
-          className="absolute bottom-full left-0 z-30 mb-2 w-[min(16rem,calc(100vw-3rem))] animate-fade-in space-y-3 rounded-xl border border-line bg-surface p-3 shadow-[var(--shadow-lift)]"
-        >
-          <label className="block text-[11.5px] font-medium text-ink-3">
-            Workflow
-            <select value={preferences.workflow} disabled={disabled} onChange={(event) => onChange({ workflow: event.target.value })} className={selectClass}>
-              {WORKFLOWS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-            </select>
-          </label>
-          <label className="block text-[11.5px] font-medium text-ink-3">
-            Answer model
-            <select value={preferences.model} disabled={disabled} onChange={(event) => onChange({ model: event.target.value })} className={selectClass}>
-              {MODELS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-            </select>
-          </label>
-          <p className="text-[11px] leading-snug text-ink-3">Detailed answers take longer but reason across more files.</p>
-        </div>
-      )}
-    </div>
+    <MenuRoot>
+      <MenuTrigger disabled={disabled} render={<Button variant="link" size="sm" className="max-w-full min-w-0" />}>
+        <span className="sr-only">Workflow: </span>
+        <Icon aria-hidden="true" />
+        <span className="min-w-0 truncate @max-sm:sr-only">{selected.short}</span>
+        <ChevronDown aria-hidden="true" className="size-3 text-ink-3" />
+      </MenuTrigger>
+      <MenuPopup align="start" className="min-w-56">
+        <MenuRadioGroup value={selected.value} onValueChange={(next) => onChange(String(next))}>
+          {WORKFLOWS.map((item) => {
+            const ItemIcon = item.icon;
+            return (
+              <MenuRadioItem key={item.value} value={item.value}>
+                <span className="flex min-w-0 items-center justify-between gap-3">
+                  <span className="flex min-w-0 items-center gap-1">
+                    <ItemIcon aria-hidden="true" />
+                    <span className="min-w-0 truncate">{item.label}</span>
+                  </span>
+                  <span className="shrink-0 font-mono text-[11px] text-ink-2">/{item.command}</span>
+                </span>
+              </MenuRadioItem>
+            );
+          })}
+        </MenuRadioGroup>
+      </MenuPopup>
+    </MenuRoot>
   );
 };
+
+const Separator = () => <span aria-hidden="true" className="px-1">·</span>;
+
+/*
+ * Layout hooks on the Prompt Bar's slots:
+ * - the actions join the controls row, so the workflow menu sits beside the
+ *   model menu and the mode switch beside Send, in reading order;
+ * - a suggestion's last text (a file path, which has no description) may
+ *   wrap instead of running past a phone-width list.
+ */
+const PROMPT_BAR_LAYOUT = [
+  '[&_[data-slot=prompt-bar-actions]]:contents',
+  '[&_[data-slot=prompt-bar-suggestions]_[role=option]>span:last-child]:min-w-0',
+  '[&_[data-slot=prompt-bar-suggestions]_[role=option]>span:last-child]:shrink',
+  '[&_[data-slot=prompt-bar-suggestions]_[role=option]>span:last-child]:[overflow-wrap:anywhere]',
+].join(' ');
 
 const Composer = forwardRef(({ onSubmit, onStop, busy, disabled, disabledReason }, ref) => {
   const [text, setText] = useState('');
   const [preferences, setPreferences] = useState(readPreferences);
-  const textareaRef = useRef(null);
-  const composingRef = useRef(false);
+  // The `@word` / `/word` at the caret, tracked like the Prompt Bar does.
+  const [suggestion, setSuggestion] = useState(null);
+  const [announcement, setAnnouncement] = useState('');
+  const rootRef = useRef(null);
+  const keepDraftRef = useRef(false);
+  const pickedCommandsRef = useRef([]);
   const hintId = useId();
   const historyLoading = useStore((state) => state.isHistoryLoading);
   const draft = useStore((state) => state.composerDraft);
+  const repoName = useStore((state) => state.selectedRepo);
+  const stopQuery = useStore((state) => state.stopQuery);
   // Phones and tablets have no Shift+Enter: Enter adds a line and the send
   // button sends.
   const touchKeyboard = useMediaQuery('(hover: none) and (pointer: coarse)');
+  const { items: mentions, searching } = useFileMentions(repoName, suggestion);
 
-  const focusAtEnd = () => window.setTimeout(() => {
-    const node = textareaRef.current;
+  const editing = preferences.mode === 'edit';
+  const length = text.trim().length;
+  const tooLong = length > MAX_QUESTION_LENGTH;
+  const stop = onStop || stopQuery;
+
+  const getInput = useCallback(() => rootRef.current?.querySelector('[data-slot="prompt-bar-input"]') ?? null, []);
+
+  const focusAtEnd = useCallback(() => window.setTimeout(() => {
+    const node = getInput();
     if (!node) return;
     node.focus();
     const end = node.value.length;
     node.setSelectionRange?.(end, end);
-  }, 0);
+  }, 0), [getInput]);
 
   useImperativeHandle(ref, () => ({
-    focus: () => textareaRef.current?.focus(),
+    focus: () => getInput()?.focus(),
     setText: (value, mode) => {
       setText(value);
       if (mode) setPreferences((current) => ({ ...current, mode }));
       focusAtEnd();
     },
-  }), []);
+  }), [getInput, focusAtEnd]);
 
   // Drafts sent from elsewhere in the chat (follow-ups, "edit question").
   useEffect(() => {
@@ -176,29 +343,64 @@ const Composer = forwardRef(({ onSubmit, onStop, busy, disabled, disabledReason 
     }
   }, [preferences]);
 
-  // Auto-grow up to ~10 lines.
+  // The hint row describes the text area; touch keyboards show "return".
   useEffect(() => {
-    const node = textareaRef.current;
+    const node = getInput();
     if (!node) return;
-    node.style.height = 'auto';
-    node.style.height = `${Math.min(node.scrollHeight, 240)}px`;
-  }, [text]);
+    node.setAttribute('aria-describedby', hintId);
+    node.setAttribute('enterkeyhint', touchKeyboard ? 'enter' : 'send');
+  }, [getInput, hintId, touchKeyboard]);
 
-  const editing = preferences.mode === 'edit';
-  const length = text.trim().length;
-  const tooLong = length > MAX_QUESTION_LENGTH;
-  const canSend = Boolean(length) && !tooLong && !busy && !disabled;
+  const syncSuggestion = useCallback(() => {
+    const node = getInput();
+    if (!node) return;
+    const next = findSuggestion(node.value, node.selectionStart ?? node.value.length);
+    setSuggestion((current) => (current?.kind === next?.kind && current?.query === next?.query ? current : next));
+  }, [getInput]);
 
-  const submit = () => {
-    const value = text.trim();
-    if (!canSend) return;
-    onSubmit(value, {
-      workflow: editing ? 'editing' : preferences.workflow,
-      modelProfile: editing ? 'code' : preferences.model,
+  // After the Prompt Bar has placed the caret (its layout effect runs first).
+  useEffect(syncSuggestion, [text, syncSuggestion]);
+
+  const chooseWorkflow = (workflow, { announce = false } = {}) => {
+    setPreferences((current) => (current.workflow === workflow ? current : { ...current, workflow }));
+    const item = WORKFLOWS.find((option) => option.value === workflow);
+    if (announce && item) setAnnouncement(`Workflow: ${item.label}`);
+  };
+
+  const changeText = (next) => {
+    // A refused send (too long) keeps the draft the Prompt Bar would clear.
+    if (keepDraftRef.current) {
+      keepDraftRef.current = false;
+      if (next === '') return;
+    }
+    if (next === '') pickedCommandsRef.current = [];
+    setText(next);
+  };
+
+  const submit = ({ text: value, model }) => {
+    if (value.length > MAX_QUESTION_LENGTH) {
+      // The Prompt Bar would send and clear; keep the draft and say why.
+      keepDraftRef.current = true;
+      setAnnouncement(`Shorten this to ${MAX_QUESTION_LENGTH.toLocaleString()} characters to send it.`);
+      return;
+    }
+    const parsed = editing ? { question: value, workflow: null } : applyWorkflowCommands(value, pickedCommandsRef.current);
+    pickedCommandsRef.current = [];
+    if (parsed.workflow) chooseWorkflow(parsed.workflow, { announce: true });
+    // A bare `/command` only switches the workflow.
+    if (!parsed.question) return;
+    onSubmit(parsed.question, {
+      workflow: editing ? 'editing' : (parsed.workflow || preferences.workflow),
+      modelProfile: editing ? 'code' : (model || preferences.model),
     });
-    setText('');
     // Let the reader watch the answer instead of the on-screen keyboard.
-    if (touchKeyboard) textareaRef.current?.blur();
+    if (touchKeyboard) getInput()?.blur();
+  };
+
+  const selectItem = (item, kind) => {
+    if (kind !== 'command') return;
+    pickedCommandsRef.current = [...pickedCommandsRef.current.filter((label) => label !== item.label), item.label];
+    chooseWorkflow(item.id, { announce: true });
   };
 
   const recallLastQuestion = () => {
@@ -210,25 +412,46 @@ const Composer = forwardRef(({ onSubmit, onStop, busy, disabled, disabledReason 
     return true;
   };
 
-  const onKeyDown = (event) => {
-    if (composingRef.current || event.nativeEvent.isComposing) return;
-    if (event.key === 'Escape' && busy) {
-      // Stop the answer; keep Escape from also closing the sources panel.
-      event.preventDefault();
-      event.stopPropagation();
-      onStop?.();
-      return;
-    }
-    if (event.key === 'ArrowUp' && !text && !event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey) {
-      if (recallLastQuestion()) event.preventDefault();
-      return;
-    }
-    if (event.key !== 'Enter' || event.shiftKey) return;
-    const explicit = event.metaKey || event.ctrlKey;
-    if (touchKeyboard && !explicit) return;
-    event.preventDefault();
-    submit();
+  const onKeyDownCapture = (event) => {
+    if (!touchKeyboard || event.target !== getInput()) return;
+    if (event.key !== 'Enter' || event.shiftKey || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (event.nativeEvent.isComposing || rootRef.current?.querySelector('[data-slot="prompt-bar-suggestions"] [role="listbox"]')) return;
+    // On a touch keyboard Enter adds a line: keep it from the Prompt Bar's send.
+    event.stopPropagation();
   };
+
+  const onKeyDown = (event) => {
+    if (event.target !== getInput() || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+    if (event.key === 'Escape') {
+      // The Prompt Bar closed its suggestions: nothing else (the sources panel) closes.
+      if (event.defaultPrevented) {
+        event.stopPropagation();
+        return;
+      }
+      if (busy) {
+        // Stop the answer; keep Escape from also closing the sources panel.
+        event.preventDefault();
+        event.stopPropagation();
+        stop?.();
+      }
+      return;
+    }
+    if (event.key === 'ArrowUp' && !event.defaultPrevented && !text && !event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey) {
+      if (recallLastQuestion()) event.preventDefault();
+    }
+  };
+
+  const labels = useMemo(() => ({
+    prompt: editing ? 'Describe the code change' : 'Ask about this codebase',
+    send: editing ? 'Generate change' : 'Send question',
+    stop: 'Stop generating',
+    model: 'Answer model',
+    mentions: 'Indexed files',
+    commands: 'Workflows',
+    noMatches: (query) => (suggestion?.kind === 'mention' && searching
+      ? `Searching files for “${query}”…`
+      : `No matches for “${query}”.`),
+  }), [editing, suggestion?.kind, searching]);
 
   const waitingReason = disabled
     ? (historyLoading ? 'Loading this conversation…' : (disabledReason || 'Indexing is in progress. You can ask questions as soon as keyword search is ready.'))
@@ -239,87 +462,64 @@ const Composer = forwardRef(({ onSubmit, onStop, busy, disabled, disabledReason 
   else if (editing) placeholder = 'Describe a change, or paste a GitHub issue URL';
 
   return (
-    <div className="@container mx-auto w-full max-w-3xl">
-      <div className={`rounded-2xl border bg-surface shadow-[var(--shadow-soft)] transition-[border-color,box-shadow] focus-within:border-accent focus-within:ring-2 focus-within:ring-accent/25 ${editing ? 'border-accent/40' : 'border-line'} ${disabled ? 'bg-surface-2/60' : ''}`}>
-        {waitingReason && (
-          <p className="flex items-start gap-2 px-4 pt-3 text-[12.5px] leading-snug text-ink-2" role="status">
-            {historyLoading
-              ? <Spinner className="mt-px h-3.5 w-3.5 shrink-0 text-accent" />
-              : <Clock className="mt-px h-3.5 w-3.5 shrink-0 text-ink-3" aria-hidden="true" />}
-            <span>{waitingReason}</span>
-          </p>
-        )}
-        <textarea
-          ref={textareaRef}
-          value={text}
-          rows={1}
-          disabled={disabled}
-          onChange={(event) => setText(event.target.value)}
-          onCompositionStart={() => { composingRef.current = true; }}
-          onCompositionEnd={() => { composingRef.current = false; }}
-          onKeyDown={onKeyDown}
-          enterKeyHint={touchKeyboard ? 'enter' : 'send'}
-          aria-label={editing ? 'Describe the code change' : 'Ask about this codebase'}
-          aria-describedby={hintId}
-          placeholder={placeholder}
-          className="scroll-thin block max-h-60 min-h-[3.25rem] w-full resize-none bg-transparent px-4 pb-1 pt-3.5 text-[14.5px] leading-relaxed text-ink outline-none placeholder:text-ink-3 disabled:cursor-not-allowed"
-        />
-        <div className="flex items-center justify-between gap-2 px-2.5 pb-2.5 pt-1">
-          <div className="flex min-w-0 flex-1 items-center gap-1">
-            <Segmented
-              size="xs"
-              label="Mode"
-              className="shrink-0"
-              value={preferences.mode}
-              onChange={(mode) => {
-                setPreferences((current) => ({ ...current, mode }));
-                textareaRef.current?.focus();
-              }}
-              options={[
-                { value: 'ask', label: 'Ask', icon: MessageSquareText, title: 'Ask questions; answers cite exact files and lines' },
-                { value: 'edit', label: 'Edit & PR', icon: GitPullRequest, title: 'Describe a change; review a validated diff, then open a pull request' },
-              ]}
-            />
-            {editing ? (
-              <span className="hidden min-w-0 truncate px-2 text-[11.5px] text-ink-3 @lg:inline">Writes a validated patch · you review the diff before any PR</span>
-            ) : (
-              <>
-                <div className="hidden min-w-0 items-center gap-0.5 @md:flex">
-                  <PillSelect label="Workflow" value={preferences.workflow} onChange={(workflow) => setPreferences((current) => ({ ...current, workflow }))} options={WORKFLOWS} disabled={busy} />
-                  <PillSelect label="Answer model" value={preferences.model} onChange={(model) => setPreferences((current) => ({ ...current, model }))} options={MODELS} disabled={busy} />
-                </div>
-                <div className="min-w-0 @md:hidden">
-                  <AnswerOptions preferences={preferences} disabled={busy} onChange={(patch) => setPreferences((current) => ({ ...current, ...patch }))} />
-                </div>
-              </>
+    <div ref={rootRef} className="@container mx-auto w-full max-w-3xl">
+      {waitingReason && (
+        <p className="mb-2 flex items-start gap-2 px-1 text-[12.5px] leading-snug text-ink-2" role="status">
+          {historyLoading
+            ? <Spinner className="mt-px h-3.5 w-3.5 shrink-0 text-accent" />
+            : <Clock className="mt-px h-3.5 w-3.5 shrink-0 text-ink-3" aria-hidden="true" />}
+          <span>{waitingReason}</span>
+        </p>
+      )}
+      <PromptBar
+        data-mode={preferences.mode}
+        className={PROMPT_BAR_LAYOUT}
+        value={text}
+        onValueChange={changeText}
+        onSubmit={submit}
+        placeholder={placeholder}
+        disabled={disabled}
+        onStop={busy ? stop : undefined}
+        mentions={mentions}
+        commands={editing ? undefined : WORKFLOW_COMMANDS}
+        onItemSelect={selectItem}
+        models={editing ? undefined : MODELS}
+        model={preferences.model}
+        onModelChange={(model) => setPreferences((current) => ({ ...current, model }))}
+        labels={labels}
+        onSelect={syncSuggestion}
+        onKeyDownCapture={onKeyDownCapture}
+        onKeyDown={onKeyDown}
+        actions={(
+          <>
+            {!editing && (
+              <WorkflowMenu value={preferences.workflow} disabled={disabled} onChange={(workflow) => chooseWorkflow(workflow)} />
             )}
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
+            <span className="ms-auto" />
             {length > WARN_QUESTION_LENGTH && (
-              <span className={`font-mono text-[11px] tabular-nums ${tooLong ? 'font-semibold text-danger' : 'text-ink-3'}`} aria-live="polite">
+              <span className={`px-1 font-mono text-[11px] tabular-nums ${tooLong ? 'font-semibold text-danger' : 'text-ink-3'}`} aria-live="polite">
                 {length.toLocaleString()}/{MAX_QUESTION_LENGTH.toLocaleString()}
               </span>
             )}
-            {busy ? (
-              <button type="button" onClick={onStop} title="Stop generating (Esc)" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-ink text-canvas transition-opacity hover:opacity-85" aria-label="Stop generating">
-                <Square className="h-3 w-3 fill-current" aria-hidden="true" />
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={submit}
-                disabled={!canSend}
-                title={editing ? 'Generate change (Enter)' : 'Send question (Enter)'}
-                className={`flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg bg-accent text-accent-ink transition-colors hover:bg-accent-strong disabled:bg-surface-3 disabled:text-ink-3 ${editing ? 'w-8 @md:w-auto @md:px-3' : 'w-8'}`}
-                aria-label={editing ? 'Generate change' : 'Send question'}
-              >
-                <ArrowUp className="h-4 w-4" aria-hidden="true" />
-                {editing && <span className="hidden text-[12.5px] font-semibold @md:inline">Generate</span>}
-              </button>
-            )}
-          </div>
-        </div>
-      </div>
+            <Segmented
+              size="sm"
+              label="Mode"
+              className="shrink-0 @max-sm:[&_svg]:hidden"
+              value={preferences.mode}
+              onChange={(mode) => {
+                setPreferences((current) => ({ ...current, mode }));
+                getInput()?.focus();
+              }}
+              // Inert with the rest of the dimmed field while the bar is disabled.
+              options={[
+                { value: 'ask', label: 'Ask', icon: MessageSquareText, title: 'Ask questions; answers cite exact files and lines', disabled },
+                { value: 'edit', label: 'Edit & PR', icon: GitPullRequest, title: 'Describe a change; review a validated diff, then open a pull request', disabled },
+              ]}
+            />
+          </>
+        )}
+      />
+      <span role="status" className="sr-only">{announcement}</span>
       <p id={hintId} className={`mt-2 min-h-4 items-center justify-center gap-1 text-center text-[11px] text-ink-3 ${editing || tooLong ? 'flex' : 'hidden sm:flex'}`}>
         {tooLong ? (
           <span className="text-danger">Shorten this to {MAX_QUESTION_LENGTH.toLocaleString()} characters to send it.</span>
@@ -328,12 +528,18 @@ const Composer = forwardRef(({ onSubmit, onStop, busy, disabled, disabledReason 
         ) : editing ? (
           <span>Writes and validates a patch · you review the diff before any pull request</span>
         ) : touchKeyboard ? (
-          <span>Answers cite exact files and lines</span>
+          <>
+            <Kbd>@</Kbd><span>files</span><Separator />
+            <Kbd>/</Kbd><span>workflows</span><Separator />
+            <span>answers cite exact files and lines</span>
+          </>
         ) : (
           <>
-            <Kbd>Enter</Kbd><span>to send</span><span aria-hidden="true" className="px-1">·</span>
-            <Kbd>Shift</Kbd><span>+</span><Kbd>Enter</Kbd><span>new line</span>
-            <span aria-hidden="true" className="px-1">·</span><span>answers cite exact files and lines</span>
+            <Kbd>Enter</Kbd><span>to send</span><Separator />
+            <Kbd>Shift</Kbd><span>+</span><Kbd>Enter</Kbd><span>new line</span><Separator />
+            <Kbd>@</Kbd><span>files</span><Separator />
+            <Kbd>/</Kbd><span>workflows</span>
+            <span className="hidden items-center gap-1 @2xl:inline-flex"><Separator />answers cite exact files and lines</span>
           </>
         )}
       </p>

@@ -4,6 +4,7 @@ import { NavLink } from 'react-router-dom';
 import { formatCount } from '../../lib/format';
 import { overallProgress, phaseLabel, statusSentence } from '../../lib/phase';
 import useStore from '../../store/useStore';
+import ContextMeter, { bytesLabels } from '../ai/ContextMeter';
 import ProgressBar from '../ui/ProgressBar';
 import Spinner from '../ui/Spinner';
 import RepoInput from './RepoInput';
@@ -13,6 +14,64 @@ const dotClass = (repo) => {
   if (repo.status === 'cancelled') return 'bg-ink-3';
   if (repo.is_indexing) return 'bg-warning animate-pulse';
   return 'bg-success';
+};
+
+/** Repositories listed by name in the usage breakdown; the rest share one row. */
+const MAX_USAGE_PARTS = 5;
+
+/**
+ * Per-repository indexed bytes for the usage breakdown, largest first, from
+ * each repository's published selection. Repositories without a published
+ * index (a first index still running, a legacy index) have no figure and are
+ * left out rather than guessed.
+ */
+const usageParts = (repos) => {
+  const sized = repos
+    .map((repo) => ({ label: repo.repo_name, tokens: Number(repo.selection?.selected_bytes) || 0 }))
+    .filter((part) => part.label && part.tokens > 0)
+    .sort((a, b) => b.tokens - a.tokens);
+  if (sized.length <= MAX_USAGE_PARTS + 1) return sized;
+  const rest = sized.slice(MAX_USAGE_PARTS);
+  return [
+    ...sized.slice(0, MAX_USAGE_PARTS),
+    { label: `${rest.length} other repositories`, tokens: rest.reduce((sum, part) => sum + part.tokens, 0) },
+  ];
+};
+
+/**
+ * The workspace's indexed source against the plan quota: a visible label
+ * and figures (still the way to the account page, as the card was) and a
+ * Context Meter whose details show the per-repository breakdown and what
+ * happens at the limit.
+ */
+const UsageMeter = ({ usage, repos, onNavigate }) => {
+  const used = Math.max(0, Number(usage.used_bytes) || 0);
+  const limit = Math.max(0, Number(usage.quota_bytes) || 0);
+  const note = [
+    'At the limit, new repositories and re-indexes keep only the most important files that fit, or stop when nothing fits.',
+    'Deleting a repository frees its space.',
+    usage.usage_estimated ? 'Older indexes are measured from their stored code, so the total is an estimate.' : '',
+  ].filter(Boolean).join(' ');
+  return (
+    <div data-slot="usage-meter" className="mx-3 mb-3 flex items-center gap-1 rounded-xl border border-line bg-surface p-1">
+      <NavLink
+        to="/account"
+        onClick={onNavigate}
+        className="min-w-0 flex-1 rounded-lg px-2 py-1 text-[11.5px] leading-4 transition-colors hover:bg-surface-2"
+      >
+        <span className="block text-ink-3">Indexed source</span>{' '}
+        {/* The meter's own precision, so this line matches its details. */}
+        <span className="block truncate font-medium text-ink-2">{bytesLabels.tokens(bytesLabels.number(used), bytesLabels.number(limit))}</span>
+      </NavLink>
+      <ContextMeter
+        used={used}
+        limit={limit}
+        parts={usageParts(repos)}
+        note={note}
+        labels={bytesLabels}
+      />
+    </div>
+  );
 };
 
 const Sidebar = ({ onNavigate }) => {
@@ -89,15 +148,7 @@ const Sidebar = ({ onNavigate }) => {
           </NavLink>
         ))}
       </nav>
-      {usage && (
-        <NavLink to="/account" onClick={onNavigate} className="mx-3 mb-3 block rounded-xl border border-line bg-surface px-3 py-2.5 transition-colors hover:border-line-strong">
-          <div className="flex items-center justify-between text-[11.5px]">
-            <span className="text-ink-3">Indexed source</span>
-            <span className="font-medium text-ink-2">{usage.used_label} / {usage.quota_label}</span>
-          </div>
-          <ProgressBar value={(usage.used_bytes / Math.max(1, usage.quota_bytes)) * 100} tone={usage.used_bytes / Math.max(1, usage.quota_bytes) > 0.9 ? 'danger' : 'accent'} className="mt-2 !h-1" label="Indexed source quota" />
-        </NavLink>
-      )}
+      {usage && <UsageMeter usage={usage} repos={repos} onNavigate={onNavigate} />}
     </div>
   );
 };

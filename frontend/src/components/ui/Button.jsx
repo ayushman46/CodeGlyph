@@ -18,6 +18,9 @@ const VARIANTS = {
   dark: 'bg-ink text-canvas not-disabled:hover:bg-ink/82 not-disabled:active:bg-ink/74',
   danger: 'bg-danger text-danger-ink not-disabled:hover:bg-danger-strong not-disabled:active:bg-danger-strong',
   'danger-ghost': 'text-danger not-disabled:hover:bg-danger-soft not-disabled:active:bg-danger/15',
+  // Honest UI "link": a quiet icon or text button with no fill until hovered
+  // or pressed. Child icons without a size-* class default to 16px.
+  link: "text-ink not-disabled:hover:bg-surface-2 not-disabled:active:bg-surface-3 aria-expanded:bg-surface-2 data-popup-open:bg-surface-2 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
 };
 
 // Touch screens get a little more height on the small sizes (WCAG 2.5.8 is
@@ -38,6 +41,16 @@ export const buttonClass = (variant = 'secondary', size = 'md', extra = '') => [
   SIZES[size] || SIZES.md,
   extra,
 ].join(' ');
+
+/**
+ * Object form of `buttonClass`, matching the references'
+ * `buttonVariants({ variant: 'link', size: 'icon-sm' })`.
+ *
+ * @param {{ variant?: string, size?: string, className?: string }} [options]
+ */
+export const buttonVariants = ({ variant = 'secondary', size = 'md', className = '' } = {}) => (
+  buttonClass(variant, size, className)
+);
 
 const Button = forwardRef(({
   variant = 'secondary', size = 'md', loading = false, icon: Icon, iconRight: IconRight,

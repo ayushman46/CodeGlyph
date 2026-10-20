@@ -116,3 +116,11 @@ const Menu = ({ trigger, items, align = 'right', label = 'Actions', className = 
 };
 
 export default Menu;
+
+/*
+ * The compound menu (MenuRoot, MenuTrigger, MenuPopup, MenuRadioGroup,
+ * MenuRadioItem, MenuItem, MenuSeparator, MenuGroupLabel) lives in its own
+ * module, so pages that only use the dropdown above (the site header) do not
+ * load it and its motion and popover code.
+ */
+export * from './MenuCompound';

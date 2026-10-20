@@ -1,8 +1,11 @@
-import { ArrowLeft, FileCode2, Folder, X } from 'lucide-react';
+import { ArrowLeft, FileCode2, Folder } from 'lucide-react';
 import { useEffect, useMemo, useRef } from 'react';
 import { basename, formatLines, groupByDirectory, partitionCitations } from '../../lib/citations';
 import useStore from '../../store/useStore';
+import { ArtifactPanel } from '../ai/ArtifactPanel';
 import Badge from '../ui/Badge';
+import Button from '../ui/Button';
+import { mergeRefs } from '../ui/Popover';
 import FileViewer from './FileViewer';
 
 const METHOD_LABELS = {
@@ -72,8 +75,16 @@ const FolderGroups = ({ items, onOpen, activeIndex, muted }) => groupByDirectory
   </section>
 ));
 
-/** Right-hand panel: sources grouped by folder, or one file at the cited lines. */
-const SourcesPanel = ({ repo, onClose }) => {
+/** The list body's scrollbar matches the rest of the app (thin, themed). */
+const LIST_BODY = '[&>[data-slot=artifact-panel-body]]:[scrollbar-width:thin] [&>[data-slot=artifact-panel-body]]:[scrollbar-color:var(--color-line-strong)_transparent]';
+
+/**
+ * Panel beside the conversation: sources grouped by folder, or one file at
+ * the cited lines. Both views are framed as an Artifact Panel (not a
+ * dialog: no focus trap); `autoFocus` moves focus in when the panel opens,
+ * and moving between the list and a file keeps focus in the panel.
+ */
+const SourcesPanel = ({ repo, onClose, autoFocus = false, panelRef }) => {
   const sources = useStore((state) => state.sources);
   const messages = useStore((state) => state.messages);
   const openFile = useStore((state) => state.openFile);
@@ -92,8 +103,14 @@ const SourcesPanel = ({ repo, onClose }) => {
   const snapshot = message?.snapshot || {};
   const commitSha = snapshot.commit_sha || repo?.commit_sha;
   const githubUrl = snapshot.github_url || repo?.github_url;
-  const headingRef = useRef(null);
   const asideRef = useRef(null);
+  const sectionRef = useRef(null);
+  const setPanelRef = useMemo(() => mergeRefs(sectionRef, panelRef), [panelRef]);
+  // Only the panel that appears when the sources panel opens takes focus by
+  // itself; later views follow the rule below.
+  const mounted = useRef(false);
+  useEffect(() => { mounted.current = true; }, []);
+  const focusOnMount = autoFocus && !mounted.current;
 
   const file = sources.file;
   const stack = sources.stack || [];
@@ -124,7 +141,7 @@ const SourcesPanel = ({ repo, onClose }) => {
     if (lastView.current === view) return;
     lastView.current = view;
     const activeElement = document.activeElement;
-    if (!activeElement || activeElement === document.body || asideRef.current?.contains(activeElement)) headingRef.current?.focus();
+    if (!activeElement || activeElement === document.body || asideRef.current?.contains(activeElement)) sectionRef.current?.focus();
   }, [view]);
 
   const open = (citation) => openFile({ path: citation.file_path, start: citation.start_line || null, end: citation.end_line || null });
@@ -134,31 +151,7 @@ const SourcesPanel = ({ repo, onClose }) => {
     : '';
 
   return (
-    <aside ref={asideRef} className="flex h-full min-h-0 flex-col bg-surface" aria-label={file ? `File ${file.path}` : 'Sources'}>
-      <div className="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-line px-3">
-        <div className="flex min-w-0 items-center gap-1.5">
-          {canGoBack && (
-            <button type="button" onClick={backToSources} className="rounded-lg p-1.5 text-ink-3 hover:bg-surface-2 hover:text-ink" aria-label={backLabel} title={backLabel}>
-              <ArrowLeft className="h-4 w-4" aria-hidden="true" />
-            </button>
-          )}
-          <h2 ref={headingRef} tabIndex={-1} className="truncate text-sm font-semibold text-ink outline-none">
-            {file ? (
-              <span className="font-mono text-[13px]" title={file.path}>{basename(file.path)}</span>
-            ) : (
-              <>
-                Sources
-                <span className="ml-1.5 font-normal text-ink-3">
-                  {citations.length} {citations.length === 1 ? 'section' : 'sections'} · {folderCount} {folderCount === 1 ? 'folder' : 'folders'}
-                </span>
-              </>
-            )}
-          </h2>
-        </div>
-        <button type="button" onClick={onClose} className="rounded-lg p-1.5 text-ink-3 hover:bg-surface-2 hover:text-ink" aria-label="Close panel" title="Close (Esc)">
-          <X className="h-4 w-4" aria-hidden="true" />
-        </button>
-      </div>
+    <aside ref={asideRef} className="relative min-h-0 flex-1" aria-label={file ? `File ${file.path}` : 'Sources'}>
       <p className="sr-only" role="status" aria-live="polite">{announcement}</p>
       {file ? (
         <FileViewer
@@ -170,42 +163,62 @@ const SourcesPanel = ({ repo, onClose }) => {
           ranges={fileRanges}
           githubUrl={githubUrl}
           commitSha={commitSha}
+          onClose={onClose}
+          autoFocus={focusOnMount}
+          panelRef={setPanelRef}
+          navigation={canGoBack ? (
+            <Button variant="link" size="icon-sm" onClick={backToSources} aria-label={backLabel} title={backLabel}>
+              <ArrowLeft aria-hidden="true" />
+            </Button>
+          ) : null}
         />
-      ) : citations.length === 0 ? (
-        <div className="p-6 text-sm leading-relaxed text-ink-3">
-          {message ? 'This answer has no source citations.' : 'Ask a question to see the code its answer is based on.'}
-        </div>
       ) : (
-        <div className="scroll-thin min-h-0 flex-1 overflow-y-auto px-2 pb-4">
-          {question && (
-            <p className="mx-3 mt-3 line-clamp-2 border-l-2 border-line-strong pl-2.5 text-[12.5px] leading-snug text-ink-3" title={question}>
-              {question}
-            </p>
-          )}
-          {marked ? (
-            <>
-              <section aria-labelledby="sources-cited" className="mt-3">
-                <h3 id="sources-cited" className="flex items-center gap-2 px-3 pb-1 text-[11px] font-semibold uppercase tracking-wide text-ink-2">
-                  Cited in the answer <span className="font-medium normal-case tracking-normal text-ink-3">{cited.length}</span>
-                </h3>
-                {cited.length
-                  ? <FolderGroups items={cited} onOpen={open} activeIndex={sources.activeIndex} />
-                  : <p className="px-3 py-2 text-[12.5px] text-ink-3">The answer does not cite these sections directly.</p>}
-              </section>
-              {retrieved.length > 0 && (
-                <section aria-labelledby="sources-retrieved" className="mt-4 border-t border-line pt-3">
-                  <h3 id="sources-retrieved" className="flex items-center gap-2 px-3 text-[11px] font-semibold uppercase tracking-wide text-ink-2">
-                    Also retrieved <span className="font-medium normal-case tracking-normal text-ink-3">{retrieved.length}</span>
-                  </h3>
-                  <p className="px-3 pb-1 pt-0.5 text-[11.5px] text-ink-3">Read as evidence but not referenced in the answer.</p>
-                  <FolderGroups items={retrieved} onOpen={open} activeIndex={sources.activeIndex} muted />
-                </section>
-              )}
-            </>
+        <ArtifactPanel
+          ref={setPanelRef}
+          title="Sources"
+          description={citations.length ? `${citations.length} ${citations.length === 1 ? 'section' : 'sections'} · ${folderCount} ${folderCount === 1 ? 'folder' : 'folders'}` : undefined}
+          onClose={onClose}
+          autoFocus={focusOnMount}
+          flush
+          className={LIST_BODY}
+        >
+          {citations.length === 0 ? (
+            <div className="p-6 text-sm leading-relaxed text-ink-3">
+              {message ? 'This answer has no source citations.' : 'Ask a question to see the code its answer is based on.'}
+            </div>
           ) : (
-            <div className="mt-3"><FolderGroups items={cited} onOpen={open} activeIndex={sources.activeIndex} /></div>
+            <div className="px-2 pb-4">
+              {question && (
+                <p className="mx-3 mt-3 line-clamp-2 border-l-2 border-line-strong pl-2.5 text-[12.5px] leading-snug text-ink-3" title={question}>
+                  {question}
+                </p>
+              )}
+              {marked ? (
+                <>
+                  <section aria-labelledby="sources-cited" className="mt-3">
+                    <h3 id="sources-cited" className="flex items-center gap-2 px-3 pb-1 text-[11px] font-semibold uppercase tracking-wide text-ink-2">
+                      Cited in the answer <span className="font-medium normal-case tracking-normal text-ink-3">{cited.length}</span>
+                    </h3>
+                    {cited.length
+                      ? <FolderGroups items={cited} onOpen={open} activeIndex={sources.activeIndex} />
+                      : <p className="px-3 py-2 text-[12.5px] text-ink-3">The answer does not cite these sections directly.</p>}
+                  </section>
+                  {retrieved.length > 0 && (
+                    <section aria-labelledby="sources-retrieved" className="mt-4 border-t border-line pt-3">
+                      <h3 id="sources-retrieved" className="flex items-center gap-2 px-3 text-[11px] font-semibold uppercase tracking-wide text-ink-2">
+                        Also retrieved <span className="font-medium normal-case tracking-normal text-ink-3">{retrieved.length}</span>
+                      </h3>
+                      <p className="px-3 pb-1 pt-0.5 text-[11.5px] text-ink-3">Read as evidence but not referenced in the answer.</p>
+                      <FolderGroups items={retrieved} onOpen={open} activeIndex={sources.activeIndex} muted />
+                    </section>
+                  )}
+                </>
+              ) : (
+                <div className="mt-3"><FolderGroups items={cited} onOpen={open} activeIndex={sources.activeIndex} /></div>
+              )}
+            </div>
           )}
-        </div>
+        </ArtifactPanel>
       )}
     </aside>
   );

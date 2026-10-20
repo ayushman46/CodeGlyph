@@ -1,116 +1,171 @@
-import { ChevronDown, ChevronRight, Download, FilePlus2, FileDiff, GitPullRequest } from 'lucide-react';
-import { useState } from 'react';
-import { basename, compactPath, dirname } from '../../lib/citations';
+import { Download, FileDiff, GitPullRequest } from 'lucide-react';
+import { useEffect, useMemo, useRef } from 'react';
+import { buildToolChips } from '../../lib/ai/toolChips';
 import { downloadText, proposalPatch, slugify } from '../../lib/patch';
+import { issueLabel } from '../../lib/proposal';
+import useArtifacts, {
+  PROPOSAL_PANEL_ID, artifactCardId, proposalArtifactStatus, proposalArtifactSummary,
+} from '../../store/useArtifacts';
 import useStore from '../../store/useStore';
-import Badge from '../ui/Badge';
+import { ArtifactCard } from '../ai/ArtifactPanel';
+import { ToolChips } from '../ai/ToolChips';
 import Button from '../ui/Button';
-import DiffView from './DiffView';
-import { approximatePaths, issueLabel } from '../../lib/proposal';
 import ProposalNotices from './ProposalNotices';
 
-const FileRow = ({ file, open, onToggle, approximate }) => {
-  const created = file.action === 'create';
-  const Icon = created ? FilePlus2 : FileDiff;
-  return (
-    <button type="button" onClick={onToggle} aria-expanded={open} className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left transition-colors hover:bg-surface-2">
-      {open ? <ChevronDown className="h-3.5 w-3.5 shrink-0 text-ink-3" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0 text-ink-3" />}
-      <Icon className={`h-4 w-4 shrink-0 ${created ? 'text-success' : 'text-ink-3'}`} aria-hidden="true" />
-      <span className="min-w-0 flex-1 truncate font-mono text-[12.5px]" title={file.file_path}>
-        <span className="text-ink">{basename(file.file_path)}</span>
-        {dirname(file.file_path) && <span className="ml-1.5 text-[11.5px] text-ink-3">{compactPath(dirname(file.file_path), 36)}</span>}
-      </span>
-      {created && <Badge tone="success">New</Badge>}
-      {approximate && <span title="Reconstructed from the index; refresh from GitHub before pushing."><Badge tone="info">Approximate</Badge></span>}
-      <span className="shrink-0 font-mono text-[11.5px]">
-        <span className="text-success">+{file.additions ?? 0}</span>{' '}
-        <span className="text-danger">−{file.deletions ?? 0}</span>
-      </span>
-    </button>
-  );
+/*
+ * The code-change part of an Edit & PR answer:
+ * - `ProposalToolChips`: the editor's run (its stored `tool_calls`, a failed
+ *   validation as an error call) and one chip per changed file with the diff
+ *   of its real hunks in a popover. Rendered above the answer text.
+ * - `EditProposalCard` (default): the proposal's warnings, then an Artifact
+ *   Card that opens the proposal in the Artifact Panel (useArtifacts), next
+ *   to the review / pull request entry point and the .patch download.
+ */
+
+/**
+ * An Edit & PR answer: live ones carry `workflow`, stored ones only `mode`
+ * (or a proposal id from their code_edit call).
+ *
+ * @param {object} message
+ */
+export const isEditRun = (message) => message?.role === 'assistant' && (
+  message.workflow === 'editing' || message.mode === 'editing' || Boolean(message.edit_suggestion || message.proposal_id)
+);
+
+const hasProposal = (message) => Boolean(message.edit_suggestion || message.proposal_id);
+
+/** The one name of the review / pull request action (beside the card and in the panel). */
+export const REVIEW_LABEL = 'Review & open PR';
+
+/**
+ * The run ended without a proposal: the editor explained why in the answer
+ * ("I couldn't produce a safe patch …").
+ *
+ * @param {object} message
+ */
+const validationFailed = (message) => !message.streaming && message.mode === 'editing' && !hasProposal(message);
+
+const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
+
+/**
+ * The card's note: "2 files · +2 −1", plus "· Refs #7" when the change names
+ * an issue. (Tool Chips above already say "N files changed".)
+ */
+const describeProposal = (proposal) => {
+  if (!proposal) return undefined;
+  const files = proposal.files || [];
+  const stats = proposal.stats || {};
+  const count = Number.isFinite(stats.files) ? stats.files : files.length;
+  const added = stats.additions ?? files.reduce((sum, file) => sum + (file.additions || 0), 0);
+  const removed = stats.deletions ?? files.reduce((sum, file) => sum + (file.deletions || 0), 0);
+  const issue = issueLabel(proposal);
+  return `${plural(count, 'file')} · +${added} −${removed}${issue ? ` · ${issue}` : ''}`;
 };
 
-/** Inline summary of a validated patch with expandable per-file diffs. */
+/** Why a finished run has no change (the card's error note). */
+const errorNote = (message) => {
+  if (message.mode === 'editing') return 'No safe patch was produced.';
+  if (message.mode === 'retrieval_fallback') return 'The model was unavailable, so no change was written.';
+  return undefined;
+};
+
+/**
+ * The editor's tool calls and changed files as Tool Chips; nothing when the
+ * run has neither (a stopped run, or a stored answer from an older server).
+ *
+ * @param {{ message: object, className?: string }} props
+ */
+export const ProposalToolChips = ({ message, className }) => {
+  const proposal = message.edit_suggestion || null;
+  const failure = validationFailed(message) ? message.content : null;
+  const { summary, calls, changes } = useMemo(
+    () => buildToolChips({ toolCalls: message.tool_calls, proposal, failure }),
+    [message.tool_calls, proposal, failure],
+  );
+  if (!calls.length && !changes.length) return null;
+  return <ToolChips summary={summary} calls={calls} changes={changes} className={className} />;
+};
+
+/**
+ * Warnings, the Artifact Card for the proposal, and the review entry point.
+ *
+ * @param {{ message: object }} props
+ */
 const EditProposalCard = ({ message }) => {
   const openReview = useStore((state) => state.openReview);
+  const loadProposal = useStore((state) => state.loadProposal);
   const selectedRepo = useStore((state) => state.selectedRepo);
-  const proposal = message.edit_suggestion;
-  const [openFiles, setOpenFiles] = useState(() => new Set(proposal?.files?.[0] ? [proposal.files[0].file_path] : []));
+  const isOpen = useArtifacts((state) => state.artifact?.kind === 'proposal' && state.artifact.messageId === message.id);
+  const openProposal = useArtifacts((state) => state.openProposal);
+  const closeArtifact = useArtifacts((state) => state.close);
 
-  if (!proposal) {
-    return (
-      <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-line bg-surface px-4 py-3">
-        <div className="flex min-w-0 items-center gap-2.5">
-          <GitPullRequest className="h-4 w-4 shrink-0 text-accent" aria-hidden="true" />
-          <span className="truncate text-sm font-medium text-ink">{message.proposal_title || 'Proposed change'}</span>
-        </div>
-        <Button size="sm" variant="primary" icon={FileDiff} onClick={() => openReview(message.id)}>Open review</Button>
-      </div>
-    );
-  }
+  const proposal = message.edit_suggestion || null;
+  const status = proposalArtifactStatus(message);
+  const { title } = proposalArtifactSummary(message);
+  const cardId = artifactCardId(message.id);
+  const files = proposal?.files || [];
+  const canDownload = files.length > 0 && files.every((file) => file.after != null);
+  const reviewable = status === 'complete';
+  const note = status === 'error' ? errorNote(message) : undefined;
 
-  const files = proposal.files || [];
-  const approximate = approximatePaths(proposal);
-  const stats = proposal.stats || {};
-  const patch = () => proposalPatch(proposal);
-  const canDownload = files.every((file) => file.after != null);
+  // A reply from history carries only its proposal's id. Load the proposal
+  // once the reply comes into view, so its file chips and the card's note
+  // are there without opening the panel (one request per proposal; a failed
+  // load is tried again when the panel opens).
+  const rootRef = useRef(null);
+  const needsProposal = status === 'complete' && !proposal && Boolean(message.proposal_id);
+  useEffect(() => {
+    const node = rootRef.current;
+    if (!needsProposal || !node) return undefined;
+    const load = () => { loadProposal(message.id).catch(() => {}); };
+    if (typeof IntersectionObserver !== 'function') {
+      load();
+      return undefined;
+    }
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      observer.disconnect();
+      load();
+    }, { rootMargin: '200px 0px' });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [needsProposal, message.id, loadProposal]);
 
   return (
-    <div className="mt-4 overflow-hidden rounded-2xl border border-line bg-surface shadow-[var(--shadow-soft)]">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <GitPullRequest className="h-4 w-4 shrink-0 text-accent" aria-hidden="true" />
-            <p className="truncate text-sm font-semibold text-ink">{proposal.title || 'Proposed change'}</p>
-          </div>
-          <p className="mt-0.5 text-[12px] text-ink-3">
-            {files.length} file{files.length === 1 ? '' : 's'} changed ·{' '}
-            <span className="text-success">+{stats.additions ?? 0}</span>{' '}
-            <span className="text-danger">−{stats.deletions ?? 0}</span>
-            {proposal.issue_reference ? ` · ${issueLabel(proposal)}` : ''}
-          </p>
+    <div ref={rootRef} data-slot="proposal" className="mt-4 space-y-3">
+      {proposal && <ProposalNotices proposal={proposal} />}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="min-w-0 max-w-sm flex-1 basis-64">
+          <ArtifactCard
+            id={cardId}
+            title={title}
+            description={describeProposal(proposal)}
+            status={status}
+            isOpen={isOpen}
+            icon={<FileDiff />}
+            labels={note ? { error: note } : undefined}
+            aria-controls={isOpen ? PROPOSAL_PANEL_ID : undefined}
+            // Pressing the card of the open panel closes it (aria-expanded).
+            onClick={() => (isOpen ? closeArtifact() : openProposal(message.id, cardId))}
+          />
         </div>
-        <div className="flex items-center gap-2">
-          {canDownload && (
-            <Button size="sm" variant="ghost" icon={Download} onClick={() => downloadText(`${slugify(selectedRepo)}-${slugify(proposal.title)}.patch`, patch())}>
-              .patch
+        {reviewable && (
+          <div className="flex flex-wrap items-center gap-2">
+            <Button size="sm" variant="primary" icon={GitPullRequest} onClick={() => openReview(message.id)}>
+              {REVIEW_LABEL}
             </Button>
-          )}
-          <Button size="sm" variant="primary" icon={GitPullRequest} onClick={() => openReview(message.id)}>
-            Review &amp; create PR
-          </Button>
-        </div>
-      </div>
-      <ProposalNotices proposal={proposal} className="border-b border-line px-4 py-3" />
-      <div className="divide-y divide-line">
-        {files.map((file) => {
-          const open = openFiles.has(file.file_path);
-          return (
-            <div key={file.file_path}>
-              <FileRow
-                file={file}
-                approximate={approximate.has(file.file_path)}
-                open={open}
-                onToggle={() => setOpenFiles((current) => {
-                  const next = new Set(current);
-                  if (next.has(file.file_path)) next.delete(file.file_path);
-                  else next.add(file.file_path);
-                  return next;
-                })}
-              />
-              {open && (
-                <div className="px-3.5 pb-3.5">
-                  {file.summary && <p className="mb-2 text-[12.5px] text-ink-3">{file.summary}</p>}
-                  {file.after != null ? (
-                    <DiffView before={file.action === 'create' ? '' : file.before} after={file.after} />
-                  ) : (
-                    <p className="rounded-xl border border-line bg-surface-2 p-3 text-[12.5px] text-ink-3">This file is large; open the review to load the full diff.</p>
-                  )}
-                </div>
-              )}
-            </div>
-          );
-        })}
+            {canDownload && (
+              <Button
+                size="sm"
+                variant="ghost"
+                icon={Download}
+                onClick={() => downloadText(`${slugify(selectedRepo)}-${slugify(proposal.title)}.patch`, proposalPatch(proposal))}
+              >
+                .patch
+              </Button>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

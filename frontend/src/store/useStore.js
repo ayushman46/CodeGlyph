@@ -14,6 +14,8 @@ let reposRevision = 0;
 let usageRevision = 0;
 const mutationRevisions = new Map();
 const TICKET_MAX_AGE_MS = 9 * 60 * 1000;
+// Proposal hydrations in flight, by proposal id (one request per proposal).
+const proposalLoads = new Map();
 export const POST_LOGIN_KEY = 'ci-post-login';
 const FILE_CACHE_LIMIT = 40;
 
@@ -38,7 +40,10 @@ const normalizeMessage = (message) => {
     mode: message.mode,
     latency_ms: message.latency_ms,
     created_at: message.created_at,
-    workflow: message.workflow,
+    // Stored replies carry no workflow: an Edit & PR run reads as one by its
+    // mode or its proposal (so Try again asks in the same workflow).
+    workflow: message.workflow
+      || (message.role === 'assistant' && (message.mode === 'editing' || message.edit_suggestion || proposalCall) ? 'editing' : undefined),
     model_profile: message.model_profile,
     evidence_plan: message.evidence_plan,
     snapshot: message.snapshot,
@@ -466,8 +471,6 @@ const useStore = create((set, get) => ({
 
   // ---------------------------------------------------------------- sources
 
-  openSources: (messageId, activeIndex = null) => set({ sources: { open: true, messageId, activeIndex, file: null, stack: [] } }),
-
   // Opening a file while the panel is open remembers the current view, so
   // "Back" returns to the previous file or to the source list.
   openFile: (file, messageId = null) => set((state) => {
@@ -517,6 +520,31 @@ const useStore = create((set, get) => ({
   },
 
   closeReview: () => set({ review: null }),
+
+  /**
+   * Loads a stored reply's proposal (messages from history carry only its
+   * id) onto the message, like openReview does, without opening the review:
+   * the proposal's card note, Tool Chips, Artifact Panel diff and patch then
+   * fill in. Resolves once loaded; rejects with the request's error.
+   *
+   * @param {string} messageId
+   */
+  loadProposal: async (messageId) => {
+    const message = get().messages.find((item) => item.id === messageId);
+    const proposalId = message?.proposal_id;
+    if (!message || message.edit_suggestion || !proposalId) return;
+    if (!proposalLoads.has(proposalId)) {
+      const request = getEditProposal(proposalId).finally(() => proposalLoads.delete(proposalId));
+      proposalLoads.set(proposalId, request);
+    }
+    const response = await proposalLoads.get(proposalId);
+    const { proposal, edit_ticket: ticket } = response.data;
+    set((state) => ({
+      messages: state.messages.map((item) => (item.id === messageId && !item.edit_suggestion
+        ? { ...item, edit_suggestion: proposal, edit_ticket: ticket, ticket_issued_at: Date.now(), proposal_id: proposal.id }
+        : item)),
+    }));
+  },
 
   // ------------------------------------------------------------- account
 

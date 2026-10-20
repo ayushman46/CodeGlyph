@@ -1,20 +1,21 @@
 import {
-  AlertTriangle, Check, CircleCheck, Copy, FileCode2, FolderTree, ImageOff, PencilLine, RotateCcw, Sparkles, CircleStop, WifiOff,
+  AlertTriangle, Check, CircleCheck, FileCode2, ImageOff, PencilLine, RotateCcw, Sparkles, CircleStop, WifiOff,
 } from 'lucide-react';
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { citationsToSources, shouldPaceReply } from '../../lib/ai/streamingText';
 import {
   basename, citationExcerpt, compactPath, formatLines, groupByDirectory, matchCitation, normaliseCitationMarkdown,
   resolveReference, summariseReferences,
 } from '../../lib/citations';
-import { formatDuration } from '../../lib/format';
 import { highlightLines } from '../../lib/prism';
 import useStore from '../../store/useStore';
 import CodeBlock from '../CodeBlock';
-import Spinner from '../ui/Spinner';
-import EditProposalCard from './EditProposalCard';
+import { LoadingState } from '../ai/LoadingState';
+import { StreamingFollowUps, StreamingText, useSmoothStream } from '../ai/StreamingText';
+import EditProposalCard, { ProposalToolChips, isEditRun } from './EditProposalCard';
 
 const STAGE_LABELS = {
   retrieving: 'Searching the indexed code',
@@ -55,19 +56,41 @@ const useElapsed = (startedAt, active) => {
   return startedAt ? Math.max(0, Math.floor((now - startedAt) / 1000)) : 0;
 };
 
-const useCopy = (getText) => {
-  const [copied, setCopied] = useState(false);
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(getText());
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard can be unavailable; the text stays selectable.
+// Streaming Text's caret, drawn by the Markdown at the end of its last line
+// (the `data-slot="markdown"` root hides Streaming Text's own caret, which
+// would otherwise sit on a line of its own under the last block).
+const CARET_CLASSES = ['ms-0.5', 'inline-block', 'h-[1em]', 'w-0.5', 'translate-y-[0.15em]', 'rounded-full', 'bg-ink', 'forced-colors:bg-[CanvasText]'];
+const BLOCK_CONTAINERS = new Set(['root', 'list', 'listItem', 'blockquote', 'table', 'tableRow']);
+const INLINE_CONTAINERS = new Set(['paragraph', 'heading', 'tableCell']);
+
+/** remark plugin: append the caret to the last paragraph, heading or cell. */
+const remarkStreamingCaret = () => (tree) => {
+  let parent = tree;
+  for (;;) {
+    const last = parent.children?.[parent.children.length - 1];
+    if (!last) break;
+    if (INLINE_CONTAINERS.has(last.type)) {
+      parent = last;
+      break;
     }
-  };
-  return [copied, copy];
+    if (!BLOCK_CONTAINERS.has(last.type)) break; // a code block or rule: the caret follows it
+    parent = last;
+  }
+  if (!Array.isArray(parent.children)) return;
+  parent.children.push({
+    type: 'streamingCaret',
+    children: [],
+    data: { hName: 'span', hProperties: { ariaHidden: 'true', dataSlot: 'streaming-text-caret', className: CARET_CLASSES } },
+  });
 };
+
+const REMARK_PLUGINS = [remarkGfm];
+const REMARK_PLUGINS_STREAMING = [remarkGfm, remarkStreamingCaret];
+
+/** A citation's GitHub permalink (pinned commit), kept for modified clicks. */
+const githubHref = (citation) => (
+  typeof citation?.github_url === 'string' && /^https:\/\/github\.com\//.test(citation.github_url) ? citation.github_url : undefined
+);
 
 // ------------------------------------------------------------ chip preview
 
@@ -232,11 +255,7 @@ const StreamProgress = ({ message, onOpenFile }) => {
 
   return (
     <div className="space-y-2.5">
-      <div className="flex items-center gap-2.5 text-[13px] text-ink-2">
-        <Spinner className="h-3.5 w-3.5 shrink-0 text-accent" />
-        <span role="status" aria-live="polite" className="min-w-0">{detail}</span>
-        {elapsed > 0 && <span className="shrink-0 font-mono text-[11.5px] tabular-nums text-ink-3" aria-hidden="true">{elapsed}s</span>}
-      </div>
+      <LoadingState label={detail} startedAt={message.started_at ?? null} />
       <ol className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[11.5px]" aria-label="Progress">
         {steps.map((step, index) => {
           const done = index < current;
@@ -369,43 +388,7 @@ const ReferenceCheck = ({ references }) => {
   );
 };
 
-// ----------------------------------------------------------------- sources
-
-const SourcesRow = ({ citations, onOpenSources, onOpenFile }) => {
-  const groups = groupByDirectory(citations);
-  const cited = citations.filter((citation) => citation.cited_in_answer);
-  const featured = (cited.length ? cited : citations).slice(0, 3);
-  return (
-    <div className="mt-3 flex flex-wrap items-center gap-1.5">
-      <button
-        type="button"
-        onClick={() => onOpenSources(null)}
-        className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-surface px-2.5 py-1 text-[12px] font-medium text-ink-2 transition-colors hover:border-line-strong hover:text-ink"
-        aria-label={`Show all ${citations.length} source${citations.length === 1 ? '' : 's'} in ${groups.length} folder${groups.length === 1 ? '' : 's'}`}
-      >
-        <FolderTree className="h-3.5 w-3.5" aria-hidden="true" />
-        {citations.length} source{citations.length === 1 ? '' : 's'} · {groups.length} folder{groups.length === 1 ? '' : 's'}
-      </button>
-      {featured.map((citation) => {
-        const range = formatLines(citation.start_line, citation.end_line);
-        return (
-          <button
-            key={`${citation.file_path}-${citation.start_line}`}
-            type="button"
-            onClick={() => onOpenFile(citation)}
-            className="inline-flex min-w-0 max-w-[16rem] items-center gap-1 rounded-lg px-2 py-1 font-mono text-[11.5px] text-ink-3 transition-colors hover:bg-surface-2 hover:text-ink"
-            title={`${citation.file_path}${range ? ` · ${range}` : ''}`}
-            aria-label={`Open ${citation.file_path}${range ? ` at ${range}` : ''}`}
-          >
-            <FileCode2 className="h-3 w-3 shrink-0 opacity-70" aria-hidden="true" />
-            <span className="truncate">{basename(citation.file_path)}</span>
-            {range && <span className="shrink-0 opacity-80">{range}</span>}
-          </button>
-        );
-      })}
-    </div>
-  );
-};
+// --------------------------------------------------------------- follow-ups
 
 const IDENTIFIER = /^[A-Za-z_$][\w$]{3,40}$/;
 const TEST_FILE = /(^|[./_-])(test|spec|e2e)s?([./_-]|$)/i;
@@ -425,18 +408,49 @@ const followUps = (message) => {
 
 // ---------------------------------------------------------------- message
 
-const MessageBubble = ({ message, repo, onRegenerate, isLast }) => {
-  const openSources = useStore((state) => state.openSources);
+/**
+ * @param {object} props
+ * @param {object} props.message
+ * @param {object} [props.repo]
+ * @param {(() => void) | null} [props.onRegenerate] Asks the last question again (last reply only).
+ * @param {boolean} [props.isLast]
+ * @param {(question: string, options: object) => void} [props.onAsk] Asks a new question the way
+ *   the composer does (back to the end of the conversation, following the answer).
+ * @param {(revealing: boolean) => void} [props.onRevealChange] Told whether this reply's paced
+ *   text is still being revealed (after the stream ended too), so the conversation stays busy.
+ */
+const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealChange }) => {
   const openFile = useStore((state) => state.openFile);
   const askQuestion = useStore((state) => state.askQuestion);
+  const ask = onAsk || askQuestion;
   const setComposerDraft = useStore((state) => state.setComposerDraft);
   const isQuerying = useStore((state) => state.isQuerying);
   const isUser = message.role === 'user';
+  const editRun = isEditRun(message);
+  // The conversation's length matters only while this reply streams in.
+  const messageCount = useStore((state) => (!isUser && message.streaming ? state.messages.length : 0));
   const citations = message.citations || [];
   const repoName = repo?.repo_name;
-  const [copied, copy] = useCopy(() => message.content || '');
 
-  const markdown = useMemo(() => (isUser ? '' : normaliseCitationMarkdown(message.content)), [isUser, message.content]);
+  // Smooth pacing only for a reply that streams in while this bubble is
+  // mounted (never for history), and only while shouldPaceReply allows it:
+  // a short, code-free reply in a short conversation. Once it says no (the
+  // text grew long or a code block arrived) the reply renders as it arrives
+  // for the rest of its life; inputs only grow, so it never switches back.
+  const pacingOff = useRef(isUser || !message.streaming);
+  if (!pacingOff.current && (
+    editRun || message.mode === 'error'
+    || !shouldPaceReply({ text: message.content || '', messageCount: message.streaming ? messageCount : 0 })
+  )) pacingOff.current = true;
+  const { text: shownText, isSettled } = useSmoothStream(isUser ? '' : (message.content || ''), { enabled: !pacingOff.current });
+  const revealing = !isUser && !isSettled;
+  useEffect(() => {
+    if (!onRevealChange) return undefined;
+    onRevealChange(revealing);
+    return () => onRevealChange(false);
+  }, [onRevealChange, revealing]);
+
+  const markdown = useMemo(() => (isUser ? '' : normaliseCitationMarkdown(shownText)), [isUser, shownText]);
 
   const openReference = useCallback((reference) => {
     const index = matchCitation(citations, reference);
@@ -507,10 +521,28 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }), [citations, message.answer_references, repoName, openReference]);
 
+  // The Sources disclosure: cited sections first, each opening the file
+  // viewer at its lines (a modified or middle click follows the GitHub
+  // permalink instead).
+  const sources = useMemo(() => (isUser ? [] : citationsToSources(citations, {
+    onSelect: (citation) => openCitation(citation),
+    hrefFor: githubHref,
+  })), [isUser, citations, openCitation]);
+
+  const errorLabel = message.interrupted
+    ? `The answer was cut off. ${message.error || 'The connection dropped before the answer finished.'}`
+    : 'Stopped — this answer is incomplete.';
+  const replyLabels = useMemo(() => ({ error: errorLabel }), [errorLabel]);
+
+  const followUpPrompts = useMemo(
+    () => (isUser || !isLast ? [] : followUps(message).map((prompt) => prompt.replace(/`/g, ''))),
+    [isUser, isLast, message],
+  );
+
   if (isUser) {
     return (
-      <div className="group flex flex-col items-end animate-rise">
-        <div className="max-w-[min(42rem,88%)] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-ink px-4 py-2.5 text-[14.5px] leading-relaxed text-canvas">
+      <div data-slot="message" data-from="user" className="group flex flex-col items-end animate-rise">
+        <div data-slot="message-content" className="max-w-[min(42rem,88%)] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-ink px-4 py-2.5 text-[14.5px] leading-relaxed text-canvas">
           {message.content}
         </div>
         <div className="mt-1 flex opacity-100 transition-opacity [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 [@media(hover:hover)]:focus-within:opacity-100">
@@ -532,10 +564,19 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast }) => {
   const hasProposal = Boolean(message.edit_suggestion || message.proposal_id);
   const stoppedEmpty = message.stopped && !message.partial;
   const canRetry = Boolean(isLast && onRegenerate);
-  const suggestions = isLast && !message.streaming && !isError && !message.stopped && !message.interrupted ? followUps(message) : [];
+  // Finished: the stream ended and the paced reveal (if any) caught up.
+  const settled = !message.streaming && isSettled;
+  let replyStatus = 'complete';
+  if (!settled) replyStatus = 'streaming';
+  else if (message.interrupted || (message.stopped && message.partial)) replyStatus = 'error';
+  const showFollowUps = settled && !isError && !message.stopped && !message.interrupted && !isQuerying;
+  // An Edit & PR run keeps its artifact card while it is written and after:
+  // complete with a proposal, error when it ended without one. A request
+  // that failed outright or was stopped empty shows its own notice instead.
+  const showArtifact = editRun && (message.streaming || hasProposal || (!isError && !stoppedEmpty));
 
   return (
-    <div className="group flex gap-3 animate-rise">
+    <div data-slot="message" data-from="assistant" className="flex gap-3 animate-rise">
       <div className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg ${isError ? 'bg-danger-soft text-danger' : 'bg-accent-soft text-accent'}`} aria-hidden="true">
         {isError ? <AlertTriangle className="h-3.5 w-3.5" /> : <Sparkles className="h-3.5 w-3.5" />}
       </div>
@@ -550,6 +591,8 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast }) => {
           </Notice>
         )}
 
+        {editRun && settled && <ProposalToolChips message={message} className="mb-3" />}
+
         {showProgress ? (
           <StreamProgress message={message} onOpenFile={openCitation} />
         ) : isError ? (
@@ -560,7 +603,7 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast }) => {
                 : null}
               {errorTitle(message.error_status)}
             </p>
-            <p className="mt-1 text-[13px] leading-relaxed text-ink-2">{message.error || message.content}</p>
+            <p data-slot="message-content" className="mt-1 text-[13px] leading-relaxed text-ink-2">{message.error || message.content}</p>
             {canRetry && (
               <div className="mt-3 flex flex-wrap gap-2">
                 <RetryButton onClick={onRegenerate} />
@@ -570,59 +613,49 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast }) => {
         ) : stoppedEmpty ? (
           <Notice tone="neutral" icon={CircleStop} title="Stopped before an answer was written" action={canRetry ? <RetryButton onClick={onRegenerate} label="Ask again" /> : null} />
         ) : (
-          <div className="prose-answer">
-            <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={components}>{markdown}</ReactMarkdown>
-            {message.streaming && <span className="ml-0.5 inline-block h-4 w-[7px] translate-y-[3px] animate-blink rounded-[1px] bg-accent" aria-hidden="true" />}
-          </div>
+          // The transcript is already a log, so the reply is not announced
+          // as it grows (announce={false}).
+          // The model-unavailable notice above offers its own Try again.
+          <StreamingText
+            status={replyStatus}
+            copyText={message.content || ''}
+            onRetry={canRetry && message.mode !== 'retrieval_fallback' ? onRegenerate : undefined}
+            sources={sources}
+            sourcesIcon={FileCode2}
+            announce={false}
+            labels={replyLabels}
+          >
+            {/* message-content: only the answer text, for the message rail's
+                previews. The markdown root sits between .prose-answer and the
+                first block, so it takes over the prose's "first child has no
+                top margin" rule. */}
+            <div data-slot="message-content">
+              <div data-slot="markdown" className="[&>:first-child]:mt-0!">
+                <ReactMarkdown
+                  remarkPlugins={replyStatus === 'streaming' ? REMARK_PLUGINS_STREAMING : REMARK_PLUGINS}
+                  skipHtml
+                  components={components}
+                >
+                  {markdown}
+                </ReactMarkdown>
+              </div>
+            </div>
+          </StreamingText>
         )}
 
-        {!message.streaming && message.interrupted && (
-          <Notice tone="danger" title="The answer was cut off" action={canRetry ? <RetryButton onClick={onRegenerate} /> : null}>
-            {message.error || 'The connection dropped before the answer finished.'}
-          </Notice>
-        )}
-        {!message.streaming && message.stopped && message.partial && !message.interrupted && (
-          <Notice tone="neutral" icon={CircleStop} title="Stopped — this answer is incomplete" action={canRetry ? <RetryButton onClick={onRegenerate} label="Regenerate" /> : null} />
-        )}
+        {settled && !isError && <ReferenceCheck references={message.answer_references} />}
 
-        {hasProposal && !message.streaming && <EditProposalCard message={message} />}
+        {showArtifact && <EditProposalCard message={message} />}
 
-        {!message.streaming && !isError && <ReferenceCheck references={message.answer_references} />}
-
-        {citations.length > 0 && !message.streaming && (
-          <SourcesRow citations={citations} onOpenSources={(index) => openSources(message.id, index)} onOpenFile={openCitation} />
-        )}
-
-        {!message.streaming && message.content && !isError && !stoppedEmpty && (
-          <div className="mt-2 flex flex-wrap items-center gap-1 text-[11.5px] text-ink-3 opacity-100 transition-opacity [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 [@media(hover:hover)]:focus-within:opacity-100">
-            <button type="button" onClick={copy} className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 hover:bg-surface-2 hover:text-ink" aria-label={copied ? 'Answer copied' : 'Copy answer'}>
-              {copied ? <Check className="h-3.5 w-3.5" aria-hidden="true" /> : <Copy className="h-3.5 w-3.5" aria-hidden="true" />}
-              <span aria-live="polite">{copied ? 'Copied' : 'Copy'}</span>
-            </button>
-            {canRetry && (
-              <button type="button" onClick={onRegenerate} className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 hover:bg-surface-2 hover:text-ink" aria-label="Ask again">
-                <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" /> Retry
-              </button>
-            )}
-            {message.latency_ms ? <span className="px-1.5" title="Time to complete the answer">{formatDuration(message.latency_ms)}</span> : null}
-            {message.model_profile === 'detailed' && <span className="px-1.5">Detailed model</span>}
-          </div>
-        )}
-
-        {suggestions.length > 0 && !isQuerying && (
-          <div className="mt-3 flex flex-wrap items-center gap-1.5" aria-label="Suggested follow-ups" role="group">
-            {suggestions.map((prompt) => (
-              <button
-                key={prompt}
-                type="button"
-                onClick={() => void askQuestion(prompt.replace(/`/g, ''), { workflow: 'general', modelProfile: message.model_profile === 'detailed' ? 'detailed' : 'fast' })}
-                className="inline-flex max-w-full items-center rounded-2xl border border-line bg-surface px-3 py-1 text-left text-[12.5px] leading-snug text-ink-2 transition-colors hover:border-accent/40 hover:bg-accent-soft hover:text-accent-strong"
-              >
-                {prompt.replace(/`/g, '')}
-              </button>
-            ))}
-          </div>
-        )}
+        <StreamingFollowUps
+          prompts={showFollowUps ? followUpPrompts : []}
+          onSelect={(prompt) => {
+            void ask(prompt, { workflow: 'general', modelProfile: message.model_profile === 'detailed' ? 'detailed' : 'fast' });
+            // The follow-up list unmounts as the question starts; keep keyboard focus in the composer.
+            window.requestAnimationFrame(() => document.querySelector('[data-slot="prompt-bar-input"]')?.focus());
+          }}
+          className="mt-4"
+        />
       </div>
     </div>
   );

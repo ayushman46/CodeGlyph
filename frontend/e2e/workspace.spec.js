@@ -45,9 +45,21 @@ test('an edit proposal shows green and red diffs and opens a pull request', asyn
   await composer.fill('Send confirmation emails in the attendee timezone');
   await composer.press('Enter');
   await expect(page.getByText('2 files changed')).toBeVisible();
-  // The first file's diff is expanded inline in the conversation.
-  await expect(page.getByText('const line5 = toAttendeeTimezone(5);').first()).toBeVisible();
-  await page.getByRole('button', { name: 'Review & create PR' }).click();
+  // The reply's Artifact Card opens the multi-file diff in the Artifact Panel beside the conversation.
+  const card = page.locator('[data-slot="artifact-card"]').last();
+  await card.click();
+  await expect(card).toHaveAttribute('aria-expanded', 'true');
+  const panel = page.locator('#proposal-artifact-panel');
+  await expect(panel).toBeFocused();
+  await expect(panel.getByText('const line5 = toAttendeeTimezone(5);').first()).toBeVisible();
+  await expect(panel.getByText('export const toAttendeeTimezone = (value) => value;').first()).toBeVisible();
+  // The changed-file chip shows the same hunk in a popover named after the file.
+  await page.locator('[data-slot="tool-chips-change"]').first().click();
+  const chipDiff = page.getByRole('dialog', { name: `Changes to ${CITED_PATH}` });
+  await expect(chipDiff.getByText('const line5 = toAttendeeTimezone(5);')).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(chipDiff).toHaveCount(0);
+  await page.locator('[data-slot="proposal"]').getByRole('button', { name: 'Review & open PR' }).click();
   const dialog = page.getByRole('dialog', { name: 'Review changes' });
   await expect(dialog.getByText('Connected as')).toBeVisible();
   await dialog.getByRole('radio', { name: 'Split' }).click();
@@ -69,7 +81,7 @@ test('the PR action requires a GitHub connection', async ({ page }) => {
   const composer = page.getByRole('textbox', { name: 'Describe the code change' });
   await composer.fill('Send confirmation emails in the attendee timezone');
   await composer.press('Enter');
-  await page.getByRole('button', { name: 'Review & create PR' }).click();
+  await page.locator('[data-slot="proposal"]').getByRole('button', { name: 'Review & open PR' }).click();
   const dialog = page.getByRole('dialog', { name: 'Review changes' });
   await expect(dialog.getByRole('button', { name: 'Connect GitHub' })).toBeVisible();
   await expect(dialog.getByRole('button', { name: 'Create pull request' })).toBeDisabled();
@@ -142,7 +154,7 @@ test('editing a CRLF file in the review keeps CRLF line endings in the pushed co
   await streamOnce(page, { answer: 'Ready.', mode: 'editing', citations: [], edit_suggestion: editProposal('p-crlf', 'CRLF change', [file]), edit_ticket: 't' });
   await page.goto('/app/r/cal.com');
   await askForEdit(page);
-  await page.getByRole('button', { name: 'Review & create PR' }).click();
+  await page.locator('[data-slot="proposal"]').getByRole('button', { name: 'Review & open PR' }).click();
   const dialog = page.getByRole('dialog', { name: 'Review changes' });
   await dialog.getByRole('button', { name: 'Edit', exact: true }).click();
   const textarea = dialog.getByRole('textbox', { name: 'Edit packages/lib/crlf.ts' });
@@ -176,14 +188,14 @@ test('a slow refresh of an earlier proposal never leaks into a newer review', as
   await streamOnce(page, { answer: 'First.', mode: 'editing', citations: [], edit_suggestion: editProposal('p-old', 'Old attempt', [lazyFile('OLD_ATTEMPT')]), edit_ticket: 't1' });
   await page.goto('/app/r/cal.com');
   await askForEdit(page, 'first');
-  await page.getByRole('button', { name: 'Review & create PR' }).click();
+  await page.locator('[data-slot="proposal"]').getByRole('button', { name: 'Review & open PR' }).click();
   const dialog = page.getByRole('dialog', { name: 'Review changes' });
   await expect(dialog.getByText('Loading the current file from GitHub')).toBeVisible();
   await dialog.getByRole('button', { name: 'Close review' }).click();
   await page.unroute('**/api/query/stream');
   await streamOnce(page, { answer: 'Second.', mode: 'editing', citations: [], edit_suggestion: editProposal('p-new', 'New attempt', [lazyFile('NEW_ATTEMPT')]), edit_ticket: 't2' });
   await askForEdit(page, 'second');
-  await page.getByRole('button', { name: 'Review & create PR' }).last().click();
+  await page.locator('[data-slot="proposal"]').getByRole('button', { name: 'Review & open PR' }).last().click();
   await expect(dialog.getByText('NEW_ATTEMPT').first()).toBeVisible();
   await page.waitForTimeout(1800);
   await expect(dialog.getByText('OLD_ATTEMPT')).toHaveCount(0);
@@ -196,7 +208,7 @@ test('a slow refresh of an earlier proposal never leaks into a newer review', as
 const openFixtureReview = async (page) => {
   await page.goto('/app/r/cal.com');
   await askForEdit(page, 'Send confirmation emails in the attendee timezone');
-  await page.getByRole('button', { name: 'Review & create PR' }).click();
+  await page.locator('[data-slot="proposal"]').getByRole('button', { name: 'Review & open PR' }).click();
   return page.getByRole('dialog', { name: 'Review changes' });
 };
 
@@ -278,14 +290,16 @@ test('incomplete and approximate proposals are flagged, and unconfirmed issues s
   await expect(page.getByText('Context budget reached before this file')).toBeVisible();
   await expect(page.getByText('Refs #7')).toBeVisible();
   await expect(page.getByText(/Fixes #7/i)).toHaveCount(0);
-  await expect(page.getByText('Approximate', { exact: true })).toBeVisible();
+  // The per-file "Approximate" flag is shown with the diff, in the Artifact Panel.
+  await page.locator('[data-slot="artifact-card"]').last().click();
+  await expect(page.locator('#proposal-artifact-panel').getByText('Approximate', { exact: true })).toBeVisible();
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
   await page.route('**/api/github/file**', async (route) => {
     await gate;
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ path: 'src/a.ts', content: 'const a = 1; // real\n', sha: 'sha-real' }) });
   });
-  await page.getByRole('button', { name: 'Review & create PR' }).click();
+  await page.locator('[data-slot="proposal"]').getByRole('button', { name: 'Review & open PR' }).click();
   const dialog = page.getByRole('dialog', { name: 'Review changes' });
   await expect(dialog.getByText('1 file was reconstructed from the index')).toBeVisible();
   await expect(dialog.getByText('This change may be incomplete')).toBeVisible();
