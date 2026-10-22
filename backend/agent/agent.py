@@ -3,8 +3,8 @@
 import logging
 from typing import AsyncIterator
 
-from agent.nemotron import complete, stream_complete
-from config import get_answer_model_options
+from agent.nemotron import AnswerRestart, LLMProviderError, complete, stream_complete
+from config import get_alternate_chat_model, get_answer_model_options
 
 logger = logging.getLogger(__name__)
 
@@ -123,10 +123,32 @@ async def run_agent_loop(
         question, initial_context, conversation_history, workflow, evidence_plan, repo_map_text,
     )
     model, enable_thinking, max_tokens = get_answer_model_options(model_profile, workflow)
-    answer = await complete(messages, model=model, enable_thinking=enable_thinking, max_tokens=max_tokens)
+    try:
+        answer = await complete(messages, model=model, enable_thinking=enable_thinking, max_tokens=max_tokens)
+    except LLMProviderError as error:
+        alternate = _alternate_model(model_profile, workflow, error)
+        if not alternate:
+            raise
+        logger.warning("Answer model %s failed (%s); trying %s once", model, type(error.__cause__ or error).__name__, alternate)
+        answer = await complete(messages, model=alternate, enable_thinking=enable_thinking, max_tokens=max_tokens,
+                                retry_attempts=1)
     if return_edit:
         return answer, [], None
     return answer, []
+
+
+def _alternate_model(model_profile: str, workflow: str, error: Exception) -> str:
+    """The other configured chat model to try once after ``error``, or "".
+
+    Questions only (edits have their own fallback model). Authentication
+    failures are not retried: every model shares the key.
+    """
+    if workflow == "editing" or model_profile == "code":
+        return ""
+    status = getattr(error.__cause__, "status_code", None)
+    if status == 401:
+        return ""
+    return get_alternate_chat_model(model_profile)
 
 
 async def stream_agent_answer(
@@ -143,5 +165,19 @@ async def stream_agent_answer(
         question, initial_context, conversation_history, workflow, evidence_plan, repo_map_text,
     )
     model, enable_thinking, max_tokens = get_answer_model_options(model_profile, workflow)
-    async for text in stream_complete(messages, model=model, enable_thinking=enable_thinking, max_tokens=max_tokens):
+    yielded = False
+    try:
+        async for text in stream_complete(messages, model=model, enable_thinking=enable_thinking, max_tokens=max_tokens):
+            if text and not isinstance(text, AnswerRestart):
+                yielded = True
+            yield text
+        return
+    except LLMProviderError as error:
+        # An answer the user already reads is never restarted on another model.
+        alternate = "" if yielded else _alternate_model(model_profile, workflow, error)
+        if not alternate:
+            raise
+        logger.warning("Answer model %s failed (%s); trying %s once", model, type(error.__cause__ or error).__name__, alternate)
+    async for text in stream_complete(messages, model=alternate, enable_thinking=enable_thinking, max_tokens=max_tokens,
+                                      retry_attempts=1):
         yield text

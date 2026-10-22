@@ -1,5 +1,7 @@
 import { expect, test } from '@playwright/test';
-import { CITED_PATH, SHA, mockApi } from './fixtures.js';
+import {
+  CITED_PATH, FAILING_PROPOSAL_ID, SHA, failingProposal, failingToolCalls, mockApi, prStatusPassed, proposal as fixtureProposal,
+} from './fixtures.js';
 
 test.use({ baseURL: process.env.E2E_WORKSPACE_URL || 'http://127.0.0.1:4174' });
 
@@ -343,4 +345,163 @@ test('coverage shows the budget breakdown and how many paths are listed; file vi
   await expect(page.getByText('Reconstructed from the index').first()).toBeVisible();
   await expect(page.getByText(/showing the first 2 of 50,000 lines/).first()).toBeVisible();
   await expect(page.getByText(/cited lines are further down/).first()).toBeVisible();
+});
+
+// ------------------------------------------------------------ quality gates (G10)
+
+test('(a) failed syntax checks show the danger box, and pushing needs an explicit acknowledgement', async ({ page }) => {
+  const state = await mockApi(page, { githubConnected: true });
+  await streamOnce(page, {
+    answer: '## Needs attention: syntax errors\n\nThe change is ready, but one file does not parse.', mode: 'editing', citations: [],
+    tool_calls: failingToolCalls, edit_suggestion: failingProposal, edit_ticket: 't',
+  });
+  await page.goto('/app/r/cal.com');
+  await askForEdit(page, 'Validate the delay input');
+  // The run's chips end on the failed check; a warning stays a finished step.
+  await expect(page.locator('[data-slot="tool-chips-trigger"]').last()).toContainText('Syntax check failed · 8 steps');
+  await expect(page.locator('[data-slot="tool-call"][data-status="error"]')).toContainText('Check syntax');
+  await expect(page.locator('[data-slot="tool-call"]', { hasText: 'Check related code' })).toHaveAttribute('data-status', 'done');
+  const card = page.locator('[data-slot="proposal"]').last();
+  const failBox = card.locator('[data-slot="quality-fail"]');
+  await expect(failBox).toContainText('Needs attention: syntax errors');
+  await expect(failBox).toContainText('source/utils/delay.ts:12:1 Unexpected end of file');
+  await expect(card.locator('[data-slot="quality-warn"]')).toContainText('no test was added or updated');
+  await expect(card.locator('[data-slot="quality-review"]')).toContainText('Self-review: The guard matches the request.');
+  await expect(card.locator('[data-slot="quality-autofixed"]')).toContainText('trailing whitespace in source/utils/delay.ts');
+  await expect(card.locator('[data-slot="artifact-card"]')).toContainText('1 file · +3 −1 · syntax errors');
+
+  await card.getByRole('button', { name: 'Review & open PR' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Review changes' });
+  await expect(dialog.locator('[data-slot="quality-summary"]')).toContainText('Checks failed: syntax errors');
+  await expect(dialog.getByRole('navigation', { name: 'Changed files' }).locator('[data-quality="fail"]')).toContainText('Checks failed');
+  // Conventions: the commit message comes from the proposal, and the title hint follows the typed title.
+  await expect(dialog.getByRole('textbox', { name: 'Commit message' })).toHaveValue(failingProposal.commit_message);
+  const hint = dialog.locator('[data-slot="title-hint"]');
+  await expect(hint).toHaveAttribute('data-ok', 'true');
+  const titleInput = dialog.getByRole('textbox', { name: 'Title' });
+  await titleInput.fill('Validate the delay input');
+  await expect(hint).toHaveAttribute('data-ok', 'false');
+  await expect(hint).toContainText('Conventional Commits (commitlint config)');
+  await titleInput.fill(failingProposal.title);
+
+  const create = dialog.getByRole('button', { name: 'Create pull request' });
+  await expect(create).toBeDisabled();
+  await dialog.getByRole('checkbox', { name: 'I understand the checks failed; push anyway' }).check();
+  await expect(create).toBeEnabled();
+  await create.click();
+  await expect(page.getByText('Pull request #123 created')).toBeVisible();
+  expect(state.pushes).toHaveLength(1);
+  expect(state.pushes[0].acknowledge_quality).toBe(true);
+  expect(state.pushes[0].proposal_id).toBe(FAILING_PROPOSAL_ID);
+  expect(state.pushes[0].commit_message).toBe(failingProposal.commit_message);
+  // The body keeps the proposal's own "How to verify" section: no second Testing section.
+  expect(state.pushes[0].pr_body).not.toContain('## Testing');
+  expect(state.pushes[0].pr_body.match(/- \[ \] npm test/g)).toHaveLength(1);
+});
+
+test('(a) a push refused by the push-time syntax check (422) asks for the acknowledgement, then resends', async ({ page }) => {
+  await mockApi(page, { githubConnected: true });
+  const pushes = [];
+  await page.route('**/api/github/push-pr', (route) => {
+    pushes.push(route.request().postDataJSON());
+    if (pushes.length === 1) {
+      return route.fulfill({
+        status: 422, contentType: 'application/json', headers: { 'X-Error-Code': 'quality_failed' },
+        body: JSON.stringify({ detail: { message: '1 file has syntax errors. Nothing was pushed.', files: [{ file_path: CITED_PATH, line: 5, column: 3, message: 'Expected ";" but found "("' }] } }),
+      });
+    }
+    return route.fallback();
+  });
+  const dialog = await openFixtureReview(page);
+  const create = dialog.getByRole('button', { name: 'Create pull request' });
+  // A legacy proposal (no quality) needs no acknowledgement up front.
+  await expect(dialog.getByRole('checkbox')).toHaveCount(0);
+  await create.click();
+  const alert = dialog.getByRole('alert');
+  await expect(alert).toContainText('1 file has syntax errors. Nothing was pushed.');
+  await expect(alert).toContainText(`${CITED_PATH}:5:3 Expected ";" but found "("`);
+  await expect(create).toBeDisabled();
+  await dialog.getByRole('checkbox', { name: 'I understand the checks failed; push anyway' }).check();
+  await create.click();
+  await expect(page.getByText('Pull request #123 created')).toBeVisible();
+  expect(pushes).toHaveLength(2);
+  expect(pushes[0].acknowledge_quality).toBe(false);
+  expect(pushes[1].acknowledge_quality).toBe(true);
+  expect(pushes[1].proposal_id).toBe(fixtureProposal.id);
+  // Nothing was written by the refused push, so the resend is a new operation.
+  expect(pushes[1].idempotency_key).not.toBe(pushes[0].idempotency_key);
+});
+
+test('(b) after the push the CI panel shows the failed check, and Refresh refetches', async ({ page }) => {
+  const state = await mockApi(page, { githubConnected: true });
+  const dialog = await openFixtureReview(page);
+  await dialog.getByRole('button', { name: 'Create pull request' }).click();
+  await expect(page.getByText('Pull request #123 created')).toBeVisible();
+  // After a successful push the same dialog is titled "Pull request ready".
+  const ready = page.getByRole('dialog', { name: 'Pull request ready' });
+  const ci = ready.locator('[data-slot="ci-panel"]');
+  await expect(ci.locator('[data-slot="ci-state"]')).toHaveText('Checks failed');
+  await expect(ci.locator('[data-slot="ci-counts"]')).toHaveText('3 passed · 1 failed');
+  await expect(ci.locator('[data-slot="ci-merge"]')).toContainText('Merging is blocked');
+  await expect(ci.getByRole('link', { name: 'Type check' })).toHaveAttribute('href', /actions\/runs\/1/);
+  await expect(ci.getByRole('listitem').first()).toContainText('Failed');
+  expect(state.prStatusRequests.at(-1)).toEqual({ repo_name: 'cal.com', pr_number: '123' });
+  const requests = state.prStatusRequests.length;
+  state.prStatus = prStatusPassed;
+  await ci.getByRole('button', { name: 'Refresh checks' }).click();
+  await expect(ci.locator('[data-slot="ci-state"]')).toHaveText('Checks passed');
+  await expect(ci.locator('[data-slot="ci-counts"]')).toHaveText('4 passed');
+  expect(state.prStatusRequests.length).toBeGreaterThan(requests);
+  // The chat card remembers the pull request and shows its CI state.
+  await ready.getByRole('button', { name: 'Done' }).click();
+  const row = page.locator('[data-slot="proposal-pr"]').last();
+  await expect(row.getByRole('link', { name: /PR #123/ })).toHaveAttribute('href', 'https://github.com/calcom/cal.com/pull/123');
+  // Fetched once when the card was seen (behind the dialog, so either state).
+  await expect(row.locator('[data-slot="proposal-ci"]')).toHaveText(/^Checks (failed|passed)$/);
+  state.prStatus = { ...prStatusPassed, state: 'pending', summary: '1 check running' };
+  await row.getByRole('button', { name: 'Refresh CI status' }).click();
+  await expect(row.locator('[data-slot="proposal-ci"]')).toHaveText('Checks running');
+});
+
+test('(c) a push re-applied on a newer upstream file says so, with the conventions it followed', async ({ page }) => {
+  await mockApi(page, {
+    githubConnected: true,
+    pushResult: {
+      refreshed_files: [{
+        file_path: CITED_PATH, reviewed_sha: 'abc1234567', latest_sha: 'def7654321',
+        note: 'Re-applied the reviewed change on top of the newer upstream version; every hunk matched exactly once.',
+      }],
+      conventions_applied: [{ id: 'pull_request_template', detail: 'Filled in .github/pull_request_template.md' }],
+      convention_warnings: ['DCO sign-off required; GitHub\'s DCO check may fail.'],
+      quality: { status: 'pass', files: [], acknowledged: false },
+    },
+  });
+  const dialog = await openFixtureReview(page);
+  await dialog.getByRole('button', { name: 'Create pull request' }).click();
+  await expect(page.getByText('Pull request #123 created')).toBeVisible();
+  const outcome = page.getByRole('dialog', { name: 'Pull request ready' }).locator('[data-slot="push-outcome"]');
+  const refreshed = outcome.getByRole('region', { name: 'Re-applied files' });
+  await expect(refreshed).toContainText('Re-applied on top of the newer upstream version');
+  await expect(refreshed).toContainText(CITED_PATH);
+  await expect(refreshed).toContainText('abc1234 → def7654');
+  await expect(outcome).toContainText('Filled in .github/pull_request_template.md');
+  await expect(outcome.locator('[data-slot="convention-warnings"]')).toContainText('DCO sign-off required');
+  await expect(outcome).toContainText('Every pushed file parsed cleanly.');
+});
+
+test('(d) a legacy proposal without quality shows no quality UI and pushes without an acknowledgement', async ({ page }) => {
+  const state = await mockApi(page, { githubConnected: true });
+  const dialog = await openFixtureReview(page);
+  const card = page.locator('[data-slot="proposal"]').last();
+  await expect(card.locator('[data-slot="artifact-card"]')).toContainText('2 files · +2 −1');
+  await expect(card.locator('[data-slot="artifact-card"]')).not.toContainText('checks');
+  await expect(page.locator('[data-slot="proposal-notices"]')).toHaveCount(0);
+  await expect(dialog.locator('[data-slot="quality-summary"]')).toHaveCount(0);
+  await expect(dialog.locator('[data-slot="title-hint"]')).toHaveCount(0);
+  await expect(dialog.getByRole('checkbox')).toHaveCount(0);
+  await expect(dialog.getByRole('textbox', { name: 'Commit message' })).toHaveValue(fixtureProposal.title);
+  await dialog.getByRole('button', { name: 'Create pull request' }).click();
+  await expect(page.getByText('Pull request #123 created')).toBeVisible();
+  expect(state.pushes[0].acknowledge_quality).toBe(false);
+  expect(state.pushes[0].pr_body).toContain('## Testing\n- [ ] yarn test bookings');
 });

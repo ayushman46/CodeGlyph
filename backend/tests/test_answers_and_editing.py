@@ -1026,6 +1026,9 @@ def edit_response(files, *, title="Return False from logout", **extra):
     return "<code_edit>\n" + json.dumps(payload) + "\n</code_edit>"
 
 
+# The "How to verify" section every PR body keeps, built from edit_response's validation.
+VERIFY_SECTION = "\n\n## How to verify\n\n- pytest -q"
+
 LOGOUT_FIX = {
     "file_path": "src/auth.py", "action": "modify", "summary": "Return False on logout",
     "changes": [{"old": "def logout(user):\n    return True", "new": "def logout(user):\n    return False", "reason": "Requested"}],
@@ -1035,6 +1038,11 @@ LOGOUT_FIX = {
 class CodeEditorTests(DatabaseTestCase):
     def setUp(self):
         super().setUp()
+        # These tests script the edit calls only; the self-review call has
+        # its own tests in test_edit_quality*.py.
+        review_off = patch.object(settings, "editing_self_review", False)
+        review_off.start()
+        self.addCleanup(review_off.stop)
         run(seed_repo(self.store))
         self.repo = run(fetch_owned_repository(self.store, USER, REPO_NAME))
         run(seed_files(self.store, {
@@ -1100,9 +1108,10 @@ class CodeEditorTests(DatabaseTestCase):
         )
         self.assertEqual(len(result.model.calls), 1)
         self.assertTrue(result.model.calls[0]["structured_output"])
-        self.assertEqual(self.stages, ["reading", "editing", "validating"])
+        self.assertEqual(self.stages, ["reading", "editing", "validating", "checking"])
         prompt = result.model.calls[0]["messages"][1]["content"]
-        self.assertIn(f"===== FILE: src/auth.py =====\n{AUTH}\n===== END FILE: src/auth.py =====", prompt)
+        # The FILE header carries the file's style profile (G2).
+        self.assertIn(f"===== FILE: src/auth.py (style: 4 spaces, LF) =====\n{AUTH}\n===== END FILE: src/auth.py =====", prompt)
         self.assertNotIn("===== FILE: src/session.py", prompt)
 
         proposal = result.proposal
@@ -1120,7 +1129,11 @@ class CodeEditorTests(DatabaseTestCase):
         self.assertEqual(proposal["validation"], ["pytest -q"])
         self.assertEqual(len(proposal["id"]), 36)
         self.assertEqual(self.fetch_calls[0][:4], ("acme", "widgets", "src/auth.py", "HEAD"))
-        self.assertEqual([call["tool"] for call in result.tool_calls], ["plan_change", "validate_patch"])
+        self.assertEqual([call["tool"] for call in result.tool_calls], [
+            "plan_change", "check_scope", "read_conventions", "check_syntax", "check_style", "check_imports",
+            "check_completeness", "review_patch", "validate_patch",
+        ])
+        self.assertEqual(proposal["files"][0]["syntax"], {"status": "pass", "checker": "ast", "errors": []})
         self.assertIn("**Update `src/auth.py`** (+1 −1)", result.markdown)
 
     def test_planned_change_modifies_two_files_traces_callers_and_creates_one(self):
@@ -1147,11 +1160,11 @@ class CodeEditorTests(DatabaseTestCase):
         self.assertFalse(result.model.calls[0].get("structured_output", False))
         self.assertIn("<edit_plan>", result.model.calls[0]["messages"][0]["content"])
         self.assertTrue(result.model.calls[1]["structured_output"])
-        self.assertEqual(self.stages, ["planning", "tracing", "reading", "editing", "validating"])
+        self.assertEqual(self.stages, ["planning", "tracing", "reading", "editing", "validating", "checking"])
 
         prompt = result.model.calls[1]["messages"][1]["content"]
-        self.assertIn("===== FILE: src/auth.py =====", prompt)
-        self.assertIn("===== FILE: src/session.py =====", prompt)
+        self.assertIn("===== FILE: src/auth.py (style: 4 spaces, LF) =====", prompt)
+        self.assertIn("===== FILE: src/session.py (style: 4 spaces, LF) =====", prompt)
         self.assertIn("New files you may create: tests/test_logout.py", prompt)
         self.assertIn("Planned approach:\nClear the session on logout and cover it with a test.", prompt)
         # Symbol tracing found the real caller through FTS, excluding edited files.
@@ -1175,7 +1188,12 @@ class CodeEditorTests(DatabaseTestCase):
         self.assertIsNone(created["base_blob_sha"])
         self.assertEqual((created["additions"], created["deletions"], created["source"]), (5, 0, "generated"))
         self.assertEqual(proposal["stats"], {"files": 3, "additions": 10, "deletions": 0})
-        self.assertEqual([call["tool"] for call in result.tool_calls], ["plan_change", "trace_symbols", "validate_patch"])
+        # The created file's missing final newline is added by the style gate and reported.
+        self.assertIn({"file_path": "tests/test_logout.py", "rule": "final_newline", "lines": 1}, proposal["quality"]["autofixed"])
+        self.assertEqual([call["tool"] for call in result.tool_calls], [
+            "plan_change", "check_scope", "trace_symbols", "read_conventions", "check_syntax", "check_style",
+            "check_imports", "check_completeness", "review_patch", "validate_patch",
+        ])
         self.assertEqual(result.tool_calls[0]["input"], {"files": ["src/auth.py", "src/session.py"], "new_files": ["tests/test_logout.py"]})
         # The new path was confirmed absent on GitHub before it was accepted.
         self.assertIn(("acme", "widgets", "tests/test_logout.py", "HEAD", 4_000_000), self.fetch_calls)
@@ -1203,7 +1221,7 @@ class CodeEditorTests(DatabaseTestCase):
         self.assertEqual(repair_messages[2], {"role": "assistant", "content": bad})
         self.assertIn("rejected by the exact-match validator", repair_messages[3]["content"])
         self.assertIn("src/auth.py: Hunk 1 was not found in the current file.", repair_messages[3]["content"])
-        self.assertEqual(self.stages, ["reading", "editing", "validating", "repairing", "validating"])
+        self.assertEqual(self.stages, ["reading", "editing", "validating", "repairing", "validating", "checking"])
         self.assertEqual(result.proposal["files"][0]["after"], AUTH.replace("    return True", "    return False"))
 
     def test_second_invalid_patch_becomes_a_helpful_message(self):
@@ -1281,7 +1299,8 @@ class CodeEditorTests(DatabaseTestCase):
         self.assertIn(criteria, result.model.calls[0]["messages"][1]["content"])
         self.assertIn("Labels: bug", result.model.calls[0]["messages"][1]["content"])
         self.assertIn(criteria, result.model.calls[1]["messages"][1]["content"])
-        self.assertEqual(result.proposal["pr_body"], "Fixes #42\n\n## Summary\nLogout now returns False.")
+        # Every body keeps a "How to verify" section built from the validation steps (G6b).
+        self.assertEqual(result.proposal["pr_body"], "Fixes #42\n\n## Summary\nLogout now returns False." + VERIFY_SECTION)
         self.assertEqual(result.proposal["issue_reference"], "42")
         self.assertEqual(result.tool_calls[0]["tool"], "read_github_issue")
 
@@ -1306,7 +1325,7 @@ class CodeEditorTests(DatabaseTestCase):
                 ]
                 result = self.edit(question, [AUTH_CHUNK], responses, issue=None)
                 result.fetch_issue.assert_awaited_once_with(*issue_call, access_token=None)
-                self.assertEqual(result.proposal["pr_body"], expected)
+                self.assertEqual(result.proposal["pr_body"], expected + VERIFY_SECTION)
                 self.assertEqual(result.proposal["issue_reference"], str(issue_call[2]))
 
     def test_issue_number_uses_the_indexed_repository_even_when_unreadable(self):
@@ -1317,7 +1336,7 @@ class CodeEditorTests(DatabaseTestCase):
         result = self.edit("Fix #7 so logout returns False", [AUTH_CHUNK], responses, issue=None)
         result.fetch_issue.assert_awaited_once_with("acme", "widgets", 7, access_token=None)
         self.assertNotIn("Acceptance criteria", result.model.calls[0]["messages"][1]["content"])
-        self.assertEqual(result.proposal["pr_body"], "Fixes #7\n\n## Summary\nDone.")
+        self.assertEqual(result.proposal["pr_body"], "Fixes #7\n\n## Summary\nDone." + VERIFY_SECTION)
         self.assertEqual(result.proposal["title"], "Fix #7")
 
     def test_no_candidate_files_returns_guidance_without_a_proposal(self):
@@ -1426,7 +1445,8 @@ class CodeEditorTests(DatabaseTestCase):
         self.assertIsNotNone(result.proposal, result.markdown)
         self.assertEqual(result.tool_calls[0]["input"]["new_files"], ["tests/test_logout.py"])
         self.assertIn("tracing", self.stages)
-        self.assertEqual(result.tool_calls[1]["input"], {"symbols": ["check"]})
+        traced = next(call for call in result.tool_calls if call["tool"] == "trace_symbols")
+        self.assertEqual(traced["input"], {"symbols": ["check"]})
         # One validation command, not one entry per character.
         self.assertEqual(result.proposal["validation"], ["pytest tests/test_logout.py"])
 
@@ -1436,7 +1456,7 @@ class CodeEditorTests(DatabaseTestCase):
         result = self.edit("Fix src/auth.py so logout returns False", [AUTH_CHUNK], [edit_response(True), edit_response([LOGOUT_FIX])])
         self.assertIsNotNone(result.proposal, result.markdown)
         self.assertIn("could not produce a safe change", result.model.calls[1]["messages"][-1]["content"])
-        self.assertEqual(self.stages, ["reading", "editing", "validating", "repairing", "validating"])
+        self.assertEqual(self.stages, ["reading", "editing", "validating", "repairing", "validating", "checking"])
 
 
 # ---------------------------------------------------------------------------

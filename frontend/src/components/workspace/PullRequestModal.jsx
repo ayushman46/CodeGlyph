@@ -1,6 +1,6 @@
 import {
-  AlertCircle, Check, CheckCircle2, ClipboardCopy, Columns2, Download, ExternalLink, FileDiff, FilePlus2,
-  GitBranch, GitPullRequest, Github, PencilLine, RefreshCw, Rows3, X,
+  AlertCircle, AlertTriangle, Check, CheckCircle2, CircleCheck, CircleX, ClipboardCopy, Columns2, Download, ExternalLink,
+  FileDiff, FilePlus2, GitBranch, GitPullRequest, Github, Info, PencilLine, RefreshCw, Rows3, X,
 } from 'lucide-react';
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -16,36 +16,54 @@ import Button from '../ui/Button';
 import Segmented from '../ui/Segmented';
 import Spinner from '../ui/Spinner';
 import DiffView, { UI_DIFF_OPTIONS } from './DiffView';
-import { approximatePaths, issueLabel } from '../../lib/proposal';
-import ProposalNotices from './ProposalNotices';
+import {
+  PR_BODY_LIMIT, approximatePaths, buildPrBody, commitMessageFor, fileQuality, findingText, issueLabel, proposalIdFor,
+  qualityFailure, qualitySummary, rememberPullRequest, titleConventionHint,
+} from '../../lib/proposal';
+import ProposalNotices, { PullRequestChecks, QualitySummary } from './ProposalNotices';
 
 const randomSuffix = () => Math.random().toString(36).slice(2, 7);
 const uid = () => (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${randomSuffix()}`);
 
-const buildBody = (proposal) => {
-  const body = String(proposal?.pr_body || '').trim() || `## Summary\n\n${proposal?.summary || 'Reviewed change.'}`;
-  const validation = (proposal?.validation || []).filter(Boolean);
-  const checklist = validation.length && !/##\s*testing/i.test(body)
-    ? `\n\n## Testing\n${validation.map((step) => `- [ ] ${step}`).join('\n')}`
-    : '';
-  return `${body}${checklist}\n\n---\n_Generated with Codebase Intel and reviewed before pushing._`.slice(0, 5000);
+// A file's quality gates in the file list: icon, tone and spoken label.
+const FILE_QUALITY = {
+  fail: { icon: CircleX, className: 'text-danger', label: 'Checks failed' },
+  warn: { icon: AlertTriangle, className: 'text-warning', label: 'Warnings' },
+  pass: { icon: CircleCheck, className: 'text-success', label: 'Checks passed' },
 };
 
-const FileListItem = ({ file, active, stats, dirty, approximate, onSelect }) => {
+const CONVENTION_LABELS = {
+  pull_request_template: 'Pull request template',
+  conventional_commits: 'Conventional Commits',
+  closing_keyword: 'Closing keyword',
+  commit_subject_from_title: 'Commit subject',
+};
+
+const FileListItem = ({ file, active, stats, dirty, approximate, quality, onSelect }) => {
   const created = file.action === 'create';
   const Icon = created ? FilePlus2 : FileDiff;
   const name = file.file_path.split('/').pop();
   const directory = file.file_path.slice(0, -name.length).replace(/\/$/, '');
+  const marker = FILE_QUALITY[quality];
   return (
     <button
       type="button"
       onClick={onSelect}
       aria-current={active ? 'true' : undefined}
+      data-quality={quality || undefined}
       className={`flex w-full items-start gap-2.5 rounded-xl px-2.5 py-2 text-left transition-colors ${active ? 'bg-accent-soft' : 'hover:bg-surface-2'}`}
     >
       <Icon className={`mt-0.5 h-4 w-4 shrink-0 ${created ? 'text-success' : active ? 'text-accent' : 'text-ink-3'}`} aria-hidden="true" />
       <span className="min-w-0 flex-1" title={file.file_path}>
-        <span className={`block truncate font-mono text-[12.5px] ${active ? 'font-semibold text-ink' : 'text-ink-2'}`}>{name}</span>
+        <span className={`flex min-w-0 items-center gap-1 font-mono text-[12.5px] ${active ? 'font-semibold text-ink' : 'text-ink-2'}`}>
+          <span className="truncate">{name}</span>
+          {marker && (
+            <span className={`shrink-0 ${marker.className}`} title={marker.label}>
+              <marker.icon className="h-3.5 w-3.5" aria-hidden="true" />
+              <span className="sr-only">{marker.label}</span>
+            </span>
+          )}
+        </span>
         {/* Keep the trailing folders, which tell same-named files apart. */}
         {directory && <span className={`block truncate font-mono text-[10.5px] ${active ? 'text-ink-2' : 'text-ink-3'}`}>{compactPath(directory, 30)}</span>}
       </span>
@@ -78,6 +96,90 @@ const useFileStats = (files, contentByPath) => {
 };
 
 /**
+ * What the server did beyond the push: files re-applied on top of a newer
+ * upstream version, the repository conventions the pull request follows
+ * (and those it may not), and the push-time syntax check.
+ */
+const PushOutcome = ({ result }) => {
+  const refreshed = (Array.isArray(result?.refreshed_files) ? result.refreshed_files : []).filter((item) => item?.file_path);
+  const applied = (Array.isArray(result?.conventions_applied) ? result.conventions_applied : []).filter((item) => item?.id || item?.detail);
+  const warnings = (Array.isArray(result?.convention_warnings) ? result.convention_warnings : []).filter((item) => typeof item === 'string' && item.trim());
+  const pushQuality = result?.quality && typeof result.quality === 'object' ? result.quality : null;
+  const failedFiles = (Array.isArray(pushQuality?.files) ? pushQuality.files : []).filter((file) => file?.status === 'fail');
+  if (!refreshed.length && !applied.length && !warnings.length && !pushQuality) return null;
+  const box = 'rounded-2xl border px-4 py-3 text-left text-[12.5px] leading-relaxed text-ink-2';
+  return (
+    <div className="space-y-3" data-slot="push-outcome">
+      {refreshed.length > 0 && (
+        <section className={`${box} border-info/30 bg-info-soft`} aria-label="Re-applied files">
+          <p className="m-0 flex items-center gap-2 font-semibold text-ink">
+            <Info className="h-4 w-4 shrink-0 text-info" aria-hidden="true" />
+            Re-applied on top of the newer upstream version
+          </p>
+          <ul className="mt-1 space-y-1">
+            {refreshed.map((item) => (
+              <li key={item.file_path} className="break-words">
+                <span className="font-mono text-[12px] text-ink">{item.file_path}</span>
+                {item.reviewed_sha && item.latest_sha ? <span className="font-mono text-[11px] text-ink-3"> {String(item.reviewed_sha).slice(0, 7)} → {String(item.latest_sha).slice(0, 7)}</span> : null}
+                {item.note ? <span className="block">{item.note}</span> : null}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+      {(applied.length > 0 || warnings.length > 0) && (
+        <section className={`${box} ${warnings.length ? 'border-warning/40 bg-warning-soft' : 'border-line bg-surface'}`} aria-label="Repository conventions">
+          <p className="m-0 font-semibold text-ink">Repository conventions</p>
+          {applied.length > 0 && (
+            <ul className="mt-1 space-y-0.5">
+              {applied.map((item) => (
+                <li key={`${item.id}:${item.detail}`} className="flex items-start gap-1.5">
+                  <CircleCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-success" aria-hidden="true" />
+                  <span>{item.detail || CONVENTION_LABELS[item.id] || item.id}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {warnings.length > 0 && (
+            <ul className="mt-1 space-y-0.5" data-slot="convention-warnings">
+              {warnings.map((warning) => (
+                <li key={warning} className="flex items-start gap-1.5">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
+                  <span>{warning}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
+      {pushQuality && pushQuality.status === 'fail' && (
+        <section className={`${box} border-danger/30 bg-danger-soft`} aria-label="Push-time checks">
+          <p className="m-0 flex items-center gap-2 font-semibold text-danger">
+            <CircleX className="h-4 w-4 shrink-0" aria-hidden="true" />
+            Pushed with syntax errors{pushQuality.acknowledged ? ', as you confirmed' : ''}
+          </p>
+          <ul className="mt-1 space-y-0.5">
+            {failedFiles.flatMap((file) => (Array.isArray(file.errors) && file.errors.length ? file.errors : [{}]).map((item, index) => (
+              // eslint-disable-next-line react/no-array-index-key
+              <li key={`${file.file_path}:${index}`} className="break-words font-mono text-[11.5px]">
+                {findingText({ file_path: file.file_path, line: item.line, column: item.column, message: item.message })}
+              </li>
+            )))}
+          </ul>
+          <p className="m-0 mt-1">CI will likely fail until these are fixed on the branch.</p>
+        </section>
+      )}
+      {pushQuality && pushQuality.status !== 'fail' && (
+        <p className="m-0 flex items-center justify-center gap-1.5 text-[12px] text-ink-3">
+          {pushQuality.status === 'pass' ? <CircleCheck className="h-3.5 w-3.5 text-success" aria-hidden="true" /> : <AlertTriangle className="h-3.5 w-3.5 text-warning" aria-hidden="true" />}
+          {pushQuality.status === 'pass' ? 'Every pushed file parsed cleanly.' : 'Pushed files parsed, with warnings.'}
+        </p>
+      )}
+    </div>
+  );
+};
+
+/**
  * Full-screen review: every proposed file as a diff (unified/split) or
  * editable text, a prefilled PR form, GitHub connection, and push.
  *
@@ -105,9 +207,14 @@ const PullRequestReview = ({ review }) => {
   const [editing, setEditing] = useState(false);
   const [ticket, setTicket] = useState(() => review?.ticket || '');
   const [title, setTitle] = useState(() => (proposal?.title || 'Codebase Intel change').slice(0, 300));
-  const [body, setBody] = useState(() => (proposal ? buildBody(proposal) : ''));
+  const [body, setBody] = useState(() => (proposal ? buildPrBody(proposal) : ''));
   const [branch, setBranch] = useState(() => `codebase-intel/${slugify(proposal?.title, 'change').slice(0, 40)}-${randomSuffix()}`);
-  const [commitMessage, setCommitMessage] = useState(() => (proposal?.title || 'Apply reviewed changes').slice(0, 500));
+  const [commitMessage, setCommitMessage] = useState(() => commitMessageFor(proposal));
+  // Failed quality checks need an explicit "push anyway". `serverQuality`
+  // is the push-time check's refusal (422 quality_failed) for the content
+  // that was pushed; editing a file lifts it (the server checks again).
+  const [acknowledged, setAcknowledged] = useState(false);
+  const [serverQuality, setServerQuality] = useState(null);
   const [loadingFiles, setLoadingFiles] = useState(false);
   const [fileErrors, setFileErrors] = useState({});
   const [error, setError] = useState('');
@@ -142,6 +249,12 @@ const PullRequestReview = ({ review }) => {
 
   const busy = submitting || connecting;
   const approximate = useMemo(() => approximatePaths(proposal), [proposal]);
+  const quality = useMemo(() => qualitySummary(proposal), [proposal]);
+  const qualityByPath = useMemo(
+    () => Object.fromEntries((proposal?.files || []).map((file) => [file.file_path, fileQuality(proposal, file.file_path)])),
+    [proposal],
+  );
+  const titleHint = titleConventionHint(title, proposal?.conventions);
   const refreshedPaths = useMemo(() => new Set(files.filter((file) => file.refreshed).map((file) => file.file_path)), [files]);
 
   useEffect(() => {
@@ -308,6 +421,13 @@ const PullRequestReview = ({ review }) => {
   const selected = files.find((file) => file.file_path === selectedPath) || files[0];
   const selectedContent = selected ? contentByPath[selected.file_path] : null;
   const dirtyPaths = new Set(files.filter((file) => file.after != null && contentByPath[file.file_path] != null && contentByPath[file.file_path] !== file.after).map((file) => file.file_path));
+  // The proposal's failed checks stand until every file they name was edited
+  // here (a failure without a file always stands); the server's push-time
+  // refusal stands until any file changes.
+  const failingPaths = files.filter((file) => qualityByPath[file.file_path] === 'fail').map((file) => file.file_path);
+  const proposalFailed = quality.status === 'fail' && (!failingPaths.length || failingPaths.some((path) => !dirtyPaths.has(path)));
+  const serverFailed = Boolean(serverQuality) && serverQuality.content === contentByPath;
+  const needsAcknowledgement = proposalFailed || serverFailed;
 
   const patchText = () => proposalPatch({ files }, contentByPath);
 
@@ -336,6 +456,7 @@ const PullRequestReview = ({ review }) => {
       problems.push('Branch names must start with codebase-intel/ and use letters, numbers, dots, dashes or slashes.');
     }
     if (!title.trim()) problems.push('Add a pull request title.');
+    if (needsAcknowledgement && !acknowledged) problems.push('Confirm that you want to push although the checks failed.');
     files.forEach((file) => {
       const content = contentByPath[file.file_path];
       // The real reason (e.g. a hunk that no longer matches) comes first.
@@ -364,6 +485,9 @@ const PullRequestReview = ({ review }) => {
         pr_body: body.trim(),
         idempotency_key: idempotencyKey.current,
         edit_ticket: activeTicket,
+        // The stored proposal gives the server the repository's conventions.
+        proposal_id: proposalIdFor(proposal),
+        acknowledge_quality: needsAcknowledgement && acknowledged,
       });
       let response;
       try {
@@ -372,10 +496,20 @@ const PullRequestReview = ({ review }) => {
         if (!classifyGithubError(pushError).retryWithFreshTicket) throw pushError;
         response = await pushGithubPR(payload(await freshTicket({ force: true })));
       }
+      // Remembered even if the review closed meanwhile: the PR exists on GitHub.
+      rememberPullRequest(proposal?.id, { ...response.data, repo_name: repoName });
+      if (!aliveRef.current) return;
       setResult(response.data);
     } catch (pushError) {
+      const refused = qualityFailure(pushError);
       const failure = pushError?.response ? classifyGithubError(pushError) : null;
-      if (!failure) {
+      if (refused) {
+        // Nothing was written to GitHub; the next push starts a new operation.
+        idempotencyKey.current = uid();
+        setServerQuality({ ...refused, content: contentByPath });
+        setAcknowledged(false);
+        setError(refused.message);
+      } else if (!failure) {
         setError(errorMessage(pushError, 'GitHub could not create the pull request.'));
       } else {
         // 401 is the only status meaning the token itself is gone.
@@ -395,6 +529,8 @@ const PullRequestReview = ({ review }) => {
       setSubmitting(false);
     }
   };
+
+  const qualityFindings = serverFailed ? serverQuality.files : [];
 
   const content = (
     <div ref={dialogRef} tabIndex={-1} className="fixed inset-0 z-[85] flex flex-col bg-canvas animate-fade-in outline-none" role="dialog" aria-modal="true" aria-labelledby="pr-review-title">
@@ -421,19 +557,27 @@ const PullRequestReview = ({ review }) => {
           <div className="max-w-md rounded-2xl border border-danger/30 bg-danger-soft p-5 text-sm text-danger">{review.error}</div>
         </div>
       ) : result ? (
-        <div className="flex flex-1 items-center justify-center p-6">
-          <div className="w-full max-w-lg animate-rise rounded-3xl border border-line bg-surface p-8 text-center shadow-[var(--shadow-lift)]">
-            <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-success-soft text-success"><CheckCircle2 className="h-7 w-7" /></div>
-            <h3 ref={resultHeadingRef} tabIndex={-1} className="mt-5 text-xl font-semibold tracking-tight text-ink outline-none">
-              Pull request #{result.pr_number} {result.already_existed ? 'already open' : 'created'}
-            </h3>
-            <p className="mt-2 text-sm leading-relaxed text-ink-3">
-              Committed to <span className="font-mono text-ink-2">{result.branch_name}</span>
-              {result.is_fork ? <> in your fork <span className="font-mono text-ink-2">{result.target_repo}</span></> : null}.
-            </p>
-            <div className="mt-7 flex flex-wrap justify-center gap-2.5">
-              <Button variant="primary" size="lg" href={result.pr_url} target="_blank" rel="noreferrer" iconRight={ExternalLink}>View on GitHub</Button>
-              <Button variant="secondary" size="lg" onClick={closeReview}>Done</Button>
+        <div className="scroll-thin flex flex-1 overflow-y-auto p-6">
+          <div className="m-auto w-full max-w-lg space-y-4">
+            <div className="animate-rise rounded-3xl border border-line bg-surface p-8 text-center shadow-[var(--shadow-lift)]">
+              <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-success-soft text-success"><CheckCircle2 className="h-7 w-7" /></div>
+              <h3 ref={resultHeadingRef} tabIndex={-1} className="mt-5 text-xl font-semibold tracking-tight text-ink outline-none">
+                Pull request #{result.pr_number} {result.already_existed ? 'already open' : 'created'}
+              </h3>
+              <p className="mt-2 text-sm leading-relaxed text-ink-3">
+                Committed to <span className="font-mono text-ink-2">{result.branch_name}</span>
+                {result.is_fork ? <> in your fork <span className="font-mono text-ink-2">{result.target_repo}</span></> : null}.
+              </p>
+              <div className="mt-7 flex flex-wrap justify-center gap-2.5">
+                <Button variant="primary" size="lg" href={result.pr_url} target="_blank" rel="noreferrer" iconRight={ExternalLink}>View on GitHub</Button>
+                <Button variant="secondary" size="lg" onClick={closeReview}>Done</Button>
+              </div>
+            </div>
+            <div className="animate-rise space-y-4">
+              <PushOutcome result={result} />
+              {Number.isInteger(result.pr_number) && result.pr_number > 0 && (
+                <PullRequestChecks repoName={repoName} prNumber={result.pr_number} poll />
+              )}
             </div>
           </div>
         </div>
@@ -447,7 +591,7 @@ const PullRequestReview = ({ review }) => {
             </div>
             <div className="scroll-thin min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 pb-3">
               {files.map((file) => (
-                <FileListItem key={file.file_path} file={file} approximate={approximate.has(file.file_path) && !file.refreshed} active={file.file_path === selected?.file_path} stats={statsByPath[file.file_path] || { additions: 0, deletions: 0 }} dirty={dirtyPaths.has(file.file_path)} onSelect={() => setSelectedPath(file.file_path)} />
+                <FileListItem key={file.file_path} file={file} approximate={approximate.has(file.file_path) && !file.refreshed} quality={qualityByPath[file.file_path]} active={file.file_path === selected?.file_path} stats={statsByPath[file.file_path] || { additions: 0, deletions: 0 }} dirty={dirtyPaths.has(file.file_path)} onSelect={() => setSelectedPath(file.file_path)} />
               ))}
             </div>
             <div className="space-y-1.5 border-t border-line p-3">
@@ -467,11 +611,17 @@ const PullRequestReview = ({ review }) => {
                   onChange={(event) => setSelectedPath(event.target.value)}
                   aria-label="Select file"
                 >
-                  {files.map((file) => <option key={file.file_path} value={file.file_path}>{file.file_path}</option>)}
+                  {files.map((file) => (
+                    <option key={file.file_path} value={file.file_path}>
+                      {file.file_path}{FILE_QUALITY[qualityByPath[file.file_path]] && qualityByPath[file.file_path] !== 'pass' ? ` (${FILE_QUALITY[qualityByPath[file.file_path]].label.toLowerCase()})` : ''}
+                    </option>
+                  ))}
                 </select>
                 <span className="hidden truncate font-mono text-[12.5px] font-medium text-ink lg:block">{selected?.file_path}</span>
                 {selected?.action === 'create' && <Badge tone="success">New file</Badge>}
                 {selected?.refreshed && <Badge tone="info">Re-applied to latest</Badge>}
+                {qualityByPath[selected?.file_path] === 'fail' && <Badge tone="danger" icon={CircleX}>Checks failed</Badge>}
+                {qualityByPath[selected?.file_path] === 'warn' && <Badge tone="warning" icon={AlertTriangle}>Warnings</Badge>}
               </div>
               <div className="flex items-center gap-2">
                 {!editing && (
@@ -533,6 +683,7 @@ const PullRequestReview = ({ review }) => {
               only gets its own scroller next to the diff. */}
           <aside className="flex flex-col border-t border-line bg-surface lg:col-start-2 lg:max-h-[46vh] lg:min-h-0 xl:col-start-3 xl:max-h-none xl:border-l xl:border-t-0" aria-label="Pull request details">
             <div className="scroll-thin space-y-4 p-4 lg:min-h-0 lg:flex-1 lg:overflow-y-auto">
+              <QualitySummary proposal={proposal} />
               <div className="rounded-xl border border-line bg-surface-2/60 p-3">
                 <div className="flex items-center gap-2.5">
                   <Github className="h-4 w-4 shrink-0 text-ink" aria-hidden="true" />
@@ -556,11 +707,17 @@ const PullRequestReview = ({ review }) => {
 
               <label className="block">
                 <span className="mb-1 block text-[12px] font-medium text-ink-2">Title</span>
-                <input value={title} maxLength={300} onChange={(event) => setTitle(event.target.value)} className="h-9 w-full rounded-lg border border-line bg-surface px-3 text-[13px] text-ink outline-none focus:border-accent" />
+                <input value={title} maxLength={300} onChange={(event) => setTitle(event.target.value)} aria-describedby={titleHint ? 'pr-title-hint' : undefined} className="h-9 w-full rounded-lg border border-line bg-surface px-3 text-[13px] text-ink outline-none focus:border-accent" />
+                {titleHint && (
+                  <span id="pr-title-hint" data-slot="title-hint" data-ok={titleHint.ok ? 'true' : 'false'} className={`mt-1 flex items-start gap-1.5 text-[11.5px] leading-snug ${titleHint.ok ? 'text-success' : 'text-warning'}`}>
+                    {titleHint.ok ? <CircleCheck className="mt-px h-3.5 w-3.5 shrink-0" aria-hidden="true" /> : <AlertTriangle className="mt-px h-3.5 w-3.5 shrink-0" aria-hidden="true" />}
+                    <span>{titleHint.message}</span>
+                  </span>
+                )}
               </label>
               <label className="block">
                 <span className="mb-1 block text-[12px] font-medium text-ink-2">Description</span>
-                <textarea value={body} maxLength={5000} onChange={(event) => setBody(event.target.value)} rows={9} className="scroll-thin w-full resize-y rounded-lg border border-line bg-surface px-3 py-2 font-mono text-[12px] leading-relaxed text-ink outline-none focus:border-accent" />
+                <textarea value={body} maxLength={PR_BODY_LIMIT} onChange={(event) => setBody(event.target.value)} rows={9} className="scroll-thin w-full resize-y rounded-lg border border-line bg-surface px-3 py-2 font-mono text-[12px] leading-relaxed text-ink outline-none focus:border-accent" />
               </label>
               <label className="block">
                 <span className="mb-1 flex items-center gap-1.5 text-[12px] font-medium text-ink-2"><GitBranch className="h-3.5 w-3.5" /> Branch</span>
@@ -568,13 +725,22 @@ const PullRequestReview = ({ review }) => {
               </label>
               <label className="block">
                 <span className="mb-1 block text-[12px] font-medium text-ink-2">Commit message</span>
-                <input value={commitMessage} maxLength={500} onChange={(event) => setCommitMessage(event.target.value)} className="h-9 w-full rounded-lg border border-line bg-surface px-3 text-[13px] text-ink outline-none focus:border-accent" />
+                {/* A textarea keeps the body of a multi-line message (an input drops newlines). */}
+                <textarea value={commitMessage} maxLength={500} onChange={(event) => setCommitMessage(event.target.value)} rows={commitMessage.includes('\n') ? 4 : 2} className="scroll-thin w-full resize-y rounded-lg border border-line bg-surface px-3 py-2 text-[13px] leading-relaxed text-ink outline-none focus:border-accent" />
               </label>
               {error && (
                 <div ref={alertRef} role="alert" className="flex items-start gap-2 rounded-xl border border-danger/30 bg-danger-soft p-3 text-[12.5px] leading-relaxed text-danger">
                   <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
                   <div className="min-w-0">
                     <span>{error}</span>
+                    {qualityFindings.length > 0 && (
+                      <ul className="mt-1 space-y-0.5" data-slot="push-quality-files">
+                        {qualityFindings.map((finding, index) => (
+                          // eslint-disable-next-line react/no-array-index-key
+                          <li key={index} className="break-words font-mono text-[11.5px]">{findingText(finding)}</li>
+                        ))}
+                      </ul>
+                    )}
                     {errorAction === 'new_branch' && (
                       <button type="button" onClick={useNewBranch} className="mt-1.5 block font-semibold underline">Use a new branch name</button>
                     )}
@@ -586,13 +752,19 @@ const PullRequestReview = ({ review }) => {
               )}
             </div>
             <div className="space-y-2 border-t border-line p-4">
+              {needsAcknowledgement && (
+                <label className="flex items-start gap-2 rounded-xl border border-danger/30 bg-danger-soft px-3 py-2 text-[12.5px] leading-snug text-ink" data-slot="acknowledge-quality">
+                  <input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} className="mt-0.5 h-4 w-4 shrink-0 accent-danger" />
+                  <span>I understand the checks failed; push anyway</span>
+                </label>
+              )}
               <Button
                 variant="primary"
                 size="lg"
                 icon={GitPullRequest}
                 className="w-full"
                 loading={submitting}
-                disabled={!github.connected || loadingFiles || !files.length || waitSeconds > 0}
+                disabled={!github.connected || loadingFiles || !files.length || waitSeconds > 0 || (needsAcknowledgement && !acknowledged)}
                 onClick={push}
               >
                 {submitting ? 'Creating pull request…' : waitSeconds > 0 ? `Try again in ${waitSeconds}s` : 'Create pull request'}

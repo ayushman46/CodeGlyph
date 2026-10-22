@@ -86,9 +86,9 @@ services:
       - key: DETAILED_NEMOTRON_MODEL
         value: nvidia/nemotron-3-ultra-550b-a55b
       - key: CODE_EDITING_MODEL
-        value: nvidia/nemotron-3.5-super-vl-120b-a12b
+        value: nvidia/nemotron-3-ultra-550b-a55b
       - key: CODE_EDITING_FALLBACK_MODEL
-        value: nvidia/nemotron-3.5-lightning-30b-a3b
+        value: nvidia/nemotron-3.5-super-vl-120b-a12b
       - key: EMBEDDING_MODEL
         value: nvidia/nemotron-3-embed-1b
       - key: EMBEDDING_DIMENSION
@@ -136,11 +136,18 @@ services:
       - key: EDITING_RETRIEVAL_TOP_K
         value: "32"
       - key: EDITING_CONTEXT_CHARACTERS
-        value: "120000"
+        value: "240000"
       - key: EDITING_MAX_FILES
         value: "8"
       - key: CODE_EDITING_ANSWER_MAX_TOKENS
-        value: "8192"
+        value: "16384"
+      # Editing calls only (a ceiling; each call's timeout is sized to its output budget).
+      - key: CODE_EDITING_TIMEOUT_SECONDS
+        value: "300"
+      - key: EDITING_DEADLINE_SECONDS
+        value: "300"
+      - key: EDITING_REVIEW_TIMEOUT_SECONDS
+        value: "45"
       - key: NVIDIA_TIMEOUT_SECONDS
         value: "150"
       - key: INDEX_TRANSLATIONS

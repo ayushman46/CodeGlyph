@@ -20,7 +20,7 @@ from starlette.background import BackgroundTask
 from agent.agent import run_agent_loop, stream_agent_answer
 from agent.code_edit import create_edit_ticket, edit_file_paths
 from agent.editor import EditRequest, run_code_edit
-from agent.nemotron import LLMProviderError
+from agent.nemotron import AnswerRestart, LLMProviderError
 from api.auth import get_current_user
 from api.repository_state import fetch_owned_repository
 from config import ModelConfigurationError, get_editing_ticket_secret, query_request_limiter, settings
@@ -903,6 +903,12 @@ async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool) -
                         async for text in stream_agent_answer(
                             question, context, history, effective_model_profile, workflow, evidence_plan, repo_map_text,
                         ):
+                            if isinstance(text, AnswerRestart):
+                                # The text shown so far was model reasoning
+                                # (a stray closing tag followed it).
+                                parts.clear()
+                                yield "reset", {}
+                                continue
                             parts.append(text)
                             yield "token", {"text": text}
                         answer = "".join(parts)

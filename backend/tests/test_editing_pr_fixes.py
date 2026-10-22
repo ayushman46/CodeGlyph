@@ -500,6 +500,10 @@ class ReconstructionTests(unittest.TestCase):
 class EditorFixTests(base.DatabaseTestCase):
     def setUp(self):
         super().setUp()
+        # Edit calls only; the self-review call is tested in test_edit_quality*.py.
+        review_off = patch.object(settings, "editing_self_review", False)
+        review_off.start()
+        self.addCleanup(review_off.stop)
         run(base.seed_repo(self.store))
         self.repo = run(fetch_owned_repository(self.store, USER, REPO_NAME))
         self.raw: dict = {}
@@ -546,7 +550,7 @@ class EditorFixTests(base.DatabaseTestCase):
             base.edit_response([base.LOGOUT_FIX], title=None, pr_body="## Summary\nDone."),
         ]
         result = self.edit("Make logout return False as discussed in issue 12", [base.AUTH_CHUNK], responses, issue=None)
-        self.assertEqual(result.proposal["pr_body"], "Refs #12\n\n## Summary\nDone.")
+        self.assertEqual(result.proposal["pr_body"], "Refs #12\n\n## Summary\nDone." + base.VERIFY_SECTION)
         self.assertFalse(result.proposal["issue_confirmed"])
         self.assertEqual(result.proposal["title"], "Update src/auth.py")
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -13,7 +14,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agent.code_edit import EditingAuthorizationError, git_blob_sha, verify_edit_ticket
 from api.auth import get_current_user
@@ -27,6 +28,8 @@ from github.github_client import (
     GitHubNotFoundError,
     GitHubPermissionError,
     GitHubRateLimitError,
+    GitHubStaleConflictError,
+    check_syntax_items,
     create_branch_and_commit,
     create_branch_and_commit_files,
     exchange_code_for_token,
@@ -34,8 +37,12 @@ from github.github_client import (
     fork_repo,
     get_authenticated_user,
     get_authorization_url,
+    get_blob_text,
     get_file_at_ref,
+    get_pull_request_status,
     get_repo_details,
+    is_object_sha,
+    max_pr_files,
     open_pull_request,
     validate_branch_name,
     validate_file_path,
@@ -44,6 +51,15 @@ from github.token_crypto import TokenCryptoError, decrypt_token, encrypt_token
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["github"])
+
+PR_BODY_MAX_CHARS = 20_000
+# Conventional Commits subject (same pattern the editor and commitlint use).
+_CONVENTIONAL_SUBJECT = re.compile(r"^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?!?: \S")
+# GitHub's closing keywords: "Fixes #12", "Closes: #3", "resolves owner/repo#7".
+_CLOSING_KEYWORD = re.compile(
+    r"(?<![\w-])(close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+((?:[\w.-]+/[\w.-]+)?#\d+)\b", re.IGNORECASE,
+)
+_MARKDOWN_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 
 
 class PushFileRequest(BaseModel):
@@ -61,15 +77,25 @@ class PushPRRequest(BaseModel):
     # shape for issue fixes that require an atomic multi-file commit.
     file_path: str = Field(default="", max_length=500)
     new_content: str = Field(default="")
-    files: list[PushFileRequest] = Field(default_factory=list, max_length=8)
+    files: list[PushFileRequest] = Field(default_factory=list, max_length=max_pr_files())
     branch_name: str = Field(default="", max_length=100)
     commit_message: str = Field(default="", max_length=500)
     pr_title: str = Field(default="", max_length=300)
-    pr_body: str = Field(default="", max_length=5000)
+    pr_body: str = Field(default="", max_length=PR_BODY_MAX_CHARS)
     base_sha: str = Field(default="", max_length=64)
     file_sha: str = Field(default="", max_length=64)
     idempotency_key: str = Field(default="", max_length=100)
     edit_ticket: str = Field(default="", min_length=1, max_length=2000)
+    # The stored proposal this push comes from: its repository conventions
+    # (PR template, commit style, DCO) are checked against the final PR.
+    proposal_id: str = Field(default="", max_length=36, pattern=r"^(?:[0-9a-fA-F-]{36})?$")
+    # Push even though the push-time syntax check failed (the user saw it).
+    acknowledge_quality: bool = False
+
+    @field_validator("proposal_id", mode="before")
+    @classmethod
+    def _optional_proposal_id(cls, value: Any) -> Any:
+        return "" if value is None else value
 
 
 class CompleteGithubRequest(BaseModel):
@@ -98,6 +124,8 @@ def _github_http_error(error: GitHubAPIError) -> HTTPException:
         return HTTPException(status_code=403, detail=str(error), headers={"X-Error-Code": "github_permission"})
     if isinstance(error, GitHubForkNotReadyError):
         return HTTPException(status_code=503, detail=str(error), headers={"Retry-After": "30", "X-Error-Code": "github_fork_not_ready"})
+    if isinstance(error, GitHubStaleConflictError):
+        return HTTPException(status_code=409, detail=str(error), headers={"X-Error-Code": "stale_conflict"})
     if isinstance(error, GitHubConflictError):
         return HTTPException(status_code=409, detail=str(error))
     if isinstance(error, GitHubNotFoundError):
@@ -137,6 +165,140 @@ def _payload_files(payload: PushPRRequest) -> list[dict[str, str]]:
     if total_bytes > max(1, settings.max_github_change_bytes):
         raise HTTPException(status_code=413, detail="The proposed changes are too large to review in the browser.")
     return files
+
+
+# ------------------------------------------------------- push-time quality
+
+
+async def _push_quality(token: str, owner: str, repo: str, files: list[dict[str, str]]) -> dict[str, Any]:
+    """Syntax-check every pushed file before anything is written to GitHub.
+
+    A modified file that fails is re-checked against its reviewed revision
+    (read by blob SHA) so a file that already failed to parse before the
+    change, with no new errors, only warns. Returns the response's
+    ``quality`` block without ``acknowledged``.
+    """
+    results = await check_syntax_items([{"file_path": item["file_path"], "after": item["new_content"]} for item in files])
+    baseline = []
+    for item in files:
+        if results[item["file_path"]]["status"] != "fail" or item["action"] != "modify" or not is_object_sha(item["expected_file_sha"]):
+            continue
+        try:
+            before = await get_blob_text(token, owner, repo, item["expected_file_sha"], settings.github_editor_max_bytes)
+        except (GitHubAuthRequiredError, GitHubRateLimitError):
+            raise
+        except GitHubAPIError as error:
+            logger.info("Reviewed revision of %s unavailable for the syntax baseline: %s", item["file_path"], type(error).__name__)
+            continue
+        baseline.append({"file_path": item["file_path"], "after": item["new_content"], "before": before})
+    if baseline:
+        results.update(await check_syntax_items(baseline))
+    checked = [{"file_path": item["file_path"], **results[item["file_path"]]} for item in files]
+    statuses = {entry["status"] for entry in checked}
+    return {"status": "fail" if "fail" in statuses else "warn" if "warn" in statuses else "pass", "files": checked}
+
+
+def _quality_failed_error(quality: dict[str, Any]) -> HTTPException:
+    failing = [entry for entry in quality["files"] if entry["status"] == "fail"]
+    locations = []
+    for entry in failing:
+        errors = entry.get("errors") or [{"line": None, "column": None, "message": entry.get("detail") or "Syntax error"}]
+        for error in errors:
+            locations.append({"file_path": entry["file_path"], "line": error.get("line"), "column": error.get("column"), "message": error.get("message")})
+    count = len(failing)
+    message = (
+        f"{count} file{'s' if count != 1 else ''} {'have' if count != 1 else 'has'} syntax errors, so nothing was pushed. "
+        "Fix the change, or confirm that you want to push it anyway."
+    )
+    return HTTPException(
+        status_code=422,
+        detail={"message": message, "files": locations[:50]},
+        headers={"X-Error-Code": "quality_failed"},
+    )
+
+
+# ------------------------------------------------- repository conventions
+
+
+async def _stored_proposal(store, proposal_id: str, user_id: str, repo_id: str) -> dict[str, Any]:
+    """The user's stored proposal for this repository, or {} (best effort)."""
+    if not proposal_id:
+        return {}
+    try:
+        row = await store.fetch_one(
+            "SELECT payload_json FROM edit_proposals WHERE id = ? AND user_id = ? AND repo_id = ?",
+            [proposal_id, user_id, repo_id],
+        )
+        proposal = json.loads(row["payload_json"]) if row else {}
+    except Exception:
+        logger.warning("Could not load the stored proposal for its conventions", exc_info=True)
+        return {}
+    return proposal if isinstance(proposal, dict) else {}
+
+
+def _headings(markdown: str) -> dict[str, str]:
+    """Markdown headings outside code fences: {normalised key: heading text}."""
+    found: dict[str, str] = {}
+    in_fence = False
+    for line in (markdown or "").splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+            continue
+        match = None if in_fence else _MARKDOWN_HEADING.match(line)
+        if match:
+            text = re.sub(r"\s+", " ", match.group(1)).strip()
+            if text:
+                found.setdefault(text.lower(), text)
+    return found
+
+
+def _commit_style_reason(conventions: dict[str, Any]) -> str:
+    source = str(conventions.get("commit_style_source") or "").strip()
+    recent = re.search(r"(\d+)\s+of\s+(?:the\s+last\s+)?(\d+)", source)
+    if recent and "commit" in source.lower():
+        return f"which {recent.group(1)} of the last {recent.group(2)} commits use"
+    return f"which this repository uses ({source})" if source else "which this repository uses"
+
+
+def _pr_conventions(
+    conventions: dict[str, Any], *, title: str, body: str, commit_message: str, generated_body: str,
+) -> tuple[str, list[dict[str, str]], list[str]]:
+    """Check the final PR against the repository's conventions.
+
+    Returns ``(commit_message, conventions_applied, convention_warnings)``.
+    The title and body the user approved are never rewritten. Only the
+    commit subject may change: when the repository uses Conventional Commits,
+    the commit message does not and the title does, the title becomes the
+    commit subject (commitlint checks commits, not just the PR title).
+    """
+    applied: list[dict[str, str]] = []
+    warnings: list[str] = []
+    template = str(conventions.get("pr_template_path") or "").strip()
+    if template:
+        expected = _headings(generated_body)
+        present = _headings(body)
+        missing = [text for key, text in expected.items() if key not in present]
+        if expected and not missing:
+            applied.append({"id": "pull_request_template", "detail": f"The description keeps the sections of {template}."})
+        elif expected:
+            shown = ", ".join(f'"{heading}"' for heading in missing[:3]) + (" and more" if len(missing) > 3 else "")
+            warnings.append(f"The description no longer has the {shown} section{'s' if len(missing) != 1 else ''} of the repository's pull request template ({template}).")
+    if conventions.get("commit_style") == "conventional":
+        if _CONVENTIONAL_SUBJECT.match(title):
+            source = str(conventions.get("commit_style_source") or "").strip()
+            applied.append({"id": "conventional_commits", "detail": "The title follows Conventional Commits" + (f" ({source})." if source else ".")})
+            subject, _, rest = commit_message.partition("\n")
+            if not _CONVENTIONAL_SUBJECT.match(subject.strip()):
+                commit_message = title.strip() + (("\n" + rest) if rest.strip() else "")
+                applied.append({"id": "commit_subject_from_title", "detail": "The commit subject uses the PR title so commit checks see a Conventional Commits message."})
+        else:
+            warnings.append(f"Title does not follow Conventional Commits, {_commit_style_reason(conventions)}; a title check may fail.")
+    closing = _CLOSING_KEYWORD.search(body or "")
+    if closing:
+        applied.append({"id": "closing_keyword", "detail": f"The description says \"{closing.group(1)} {closing.group(2)}\", so merging closes that issue."})
+    if conventions.get("dco_required") and "signed-off-by:" not in commit_message.lower():
+        warnings.append("DCO sign-off required; GitHub's DCO check may fail because the commit has no Signed-off-by line.")
+    return commit_message, applied, warnings
 
 
 def _safe_redirect(value: str) -> str:
@@ -517,8 +679,10 @@ async def push_pr(payload: PushPRRequest, current_user=Depends(get_current_user)
             ensure_ascii=False,
         )
         content_hash = hashlib.sha256(canonical_contents.encode("utf-8")).hexdigest()
-        operation_id = hashlib.sha256(f"{current_user.id}:{request_key}".encode("utf-8")).hexdigest()
-        operation = await store.fetch_one("SELECT repo_name, file_path, content_hash, status, result_json FROM github_change_operations WHERE operation_id = ?", [operation_id])
+        # ``operation_id`` is set only once this request owns the operation,
+        # so the failure handlers below never mark another request's push.
+        operation_key = hashlib.sha256(f"{current_user.id}:{request_key}".encode("utf-8")).hexdigest()
+        operation = await store.fetch_one("SELECT repo_name, file_path, content_hash, status, result_json FROM github_change_operations WHERE operation_id = ?", [operation_key])
         progress: dict[str, Any] = {}
         if operation:
             if operation.get("repo_name") != payload.repo_name or operation.get("file_path") != file_key or operation.get("content_hash") != content_hash:
@@ -539,18 +703,43 @@ async def push_pr(payload: PushPRRequest, current_user=Depends(get_current_user)
                     progress = previous["progress"]
             except (TypeError, ValueError):
                 progress = {}
+        base_owner, base_repo = _parse_github_url(str(repo_row["github_url"]))
+        # Push-time syntax check, before anything is claimed or written: a
+        # failing file needs the user's explicit acknowledgement.
+        quality = await _push_quality(token, base_owner, base_repo, files)
+        if quality["status"] == "fail" and not payload.acknowledge_quality:
+            raise _quality_failed_error(quality)
+        quality["acknowledged"] = bool(payload.acknowledge_quality and quality["status"] == "fail")
+        if quality["acknowledged"]:
+            logger.info("Pushing a change with failing syntax checks after the user acknowledged them")
+        default_title = payload.pr_title or (f"Update {files[0]['file_path']}" if len(files) == 1 else f"Update {len(files)} files")
+        default_body = payload.pr_body or (
+            (f"Reviewed changes to `{files[0]['file_path']}`" if len(files) == 1 else f"Reviewed changes to {len(files)} files")
+            + " created by Codebase Intelligence."
+        )
+        if len(files) == 1:
+            default_commit = f"{'Update' if files[0]['action'] == 'modify' else 'Add'} {files[0]['file_path']}"
+        else:
+            default_commit = f"Update {len(files)} files"
+        proposal = await _stored_proposal(store, payload.proposal_id, current_user.id, str(repo_row["id"]))
+        conventions = proposal.get("conventions") if isinstance(proposal.get("conventions"), dict) else {}
+        commit_message, conventions_applied, convention_warnings = _pr_conventions(
+            conventions, title=default_title, body=default_body,
+            commit_message=payload.commit_message or default_commit, generated_body=str(proposal.get("pr_body") or ""),
+        )
+        if operation:
             claimed = await store.execute(
                 "UPDATE github_change_operations SET status = 'processing', updated_at = ? "
                 "WHERE operation_id = ? AND status = 'failed'",
-                [_timestamp(), operation_id],
+                [_timestamp(), operation_key],
             )
             if not claimed.rows_affected:
                 raise HTTPException(status_code=409, detail="This change is already being pushed. Wait for the existing pull request.")
         else:
-            inserted = await store.execute("INSERT OR IGNORE INTO github_change_operations (operation_id, user_id, repo_name, file_path, content_hash, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'processing', ?, ?)", [operation_id, current_user.id, payload.repo_name, file_key, content_hash, _timestamp(), _timestamp()])
+            inserted = await store.execute("INSERT OR IGNORE INTO github_change_operations (operation_id, user_id, repo_name, file_path, content_hash, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'processing', ?, ?)", [operation_key, current_user.id, payload.repo_name, file_key, content_hash, _timestamp(), _timestamp()])
             if not inserted.rows_affected:
                 raise HTTPException(status_code=409, detail="This change is already being pushed. Wait for the existing pull request.")
-        base_owner, base_repo = _parse_github_url(str(repo_row["github_url"]))
+        operation_id = operation_key
         details = await get_repo_details(token, base_owner, base_repo)
         upstream_branch = str(details.get("default_branch") or "main")
         has_push = bool((details.get("permissions") or {}).get("push") or (details.get("permissions") or {}).get("admin"))
@@ -581,7 +770,7 @@ async def push_pr(payload: PushPRRequest, current_user=Depends(get_current_user)
             committed = await create_branch_and_commit(
                 token, target_owner, target_repo, upstream_branch, target_branch,
                 item["file_path"], item["new_content"],
-                payload.commit_message or f"Update {item['file_path']}",
+                commit_message,
                 expected_file_sha=item["expected_file_sha"],
                 **commit_options,
             )
@@ -593,10 +782,17 @@ async def push_pr(payload: PushPRRequest, current_user=Depends(get_current_user)
             committed = await create_branch_and_commit_files(
                 token, target_owner, target_repo, upstream_branch, target_branch,
                 files,
-                payload.commit_message or (f"Add {files[0]['file_path']}" if len(files) == 1 else f"Update {len(files)} files"),
+                commit_message,
                 **commit_options,
             )
-        progress = {"branch_name": committed["branch_name"], "commit_sha": committed.get("commit_sha"), "target_repo": f"{target_owner}/{target_repo}"}
+        # A resumed commit was refreshed (or not) by the earlier attempt.
+        refreshed_files = committed.get("refreshed_files")
+        if not isinstance(refreshed_files, list):
+            refreshed_files = progress.get("refreshed_files") if isinstance(progress.get("refreshed_files"), list) else []
+        progress = {
+            "branch_name": committed["branch_name"], "commit_sha": committed.get("commit_sha"),
+            "target_repo": f"{target_owner}/{target_repo}", "refreshed_files": refreshed_files,
+        }
         try:
             await store.execute(
                 "UPDATE github_change_operations SET result_json = ?, updated_at = ? WHERE operation_id = ? AND status = 'processing'",
@@ -604,13 +800,15 @@ async def push_pr(payload: PushPRRequest, current_user=Depends(get_current_user)
             )
         except Exception:
             logger.warning("Could not record GitHub push progress", exc_info=True)
-        default_title = payload.pr_title or (f"Update {files[0]['file_path']}" if len(files) == 1 else f"Update {len(files)} files")
-        default_body = payload.pr_body or (
-            (f"Reviewed changes to `{files[0]['file_path']}`" if len(files) == 1 else f"Reviewed changes to {len(files)} files")
-            + " created by Codebase Intelligence."
-        )
         pr = await open_pull_request(token, base_owner, base_repo, pr_head, upstream_branch, default_title, default_body)
-        result = {"success": True, **pr, "branch_name": committed["branch_name"], "target_repo": f"{target_owner}/{target_repo}", "is_fork": not has_push}
+        result = {
+            "success": True, **pr, "branch_name": committed["branch_name"], "target_repo": f"{target_owner}/{target_repo}",
+            "is_fork": not has_push,
+            "refreshed_files": refreshed_files,
+            "conventions_applied": conventions_applied,
+            "convention_warnings": convention_warnings,
+            "quality": quality,
+        }
         try:
             await store.execute("UPDATE github_change_operations SET status = 'completed', result_json = ?, updated_at = ? WHERE operation_id = ?", [json.dumps(result, separators=(",", ":")), _timestamp(), operation_id])
         except Exception:
@@ -639,3 +837,44 @@ async def push_pr(payload: PushPRRequest, current_user=Depends(get_current_user)
                 logger.warning("Could not mark GitHub change operation failed", exc_info=True)
         logger.exception("GitHub branch or PR creation failed")
         raise HTTPException(status_code=502, detail="GitHub could not create the branch and pull request. Please try again.") from error
+
+
+@router.get("/github/pr-status")
+async def pull_request_status(
+    repo_name: str = Query(min_length=1, max_length=200),
+    pr_number: int = Query(ge=1, le=1_000_000_000),
+    current_user=Depends(get_current_user),
+):
+    """CI checks and merge readiness of a pull request opened for this repository."""
+    try:
+        store = get_turso_store()
+        await _ensure_github_table(store)
+        token, _ = await _load_token(store, current_user.id)
+        repo = await store.fetch_one("SELECT github_url FROM repos WHERE user_id = ? AND repo_name = ?", [current_user.id, repo_name])
+        if not repo:
+            raise HTTPException(status_code=404, detail="Repository not found.")
+        owner, name = _parse_github_url(str(repo["github_url"]))
+        try:
+            return await get_pull_request_status(token, owner, name, pr_number)
+        except GitHubNotFoundError as error:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Pull request #{pr_number} was not found in {owner}/{name}, or it is not visible to your GitHub account.",
+                headers={"X-Error-Code": "github_pr_not_found"},
+            ) from error
+    except HTTPException:
+        raise
+    except (GitHubAuthRequiredError, GitHubRateLimitError, GitHubPermissionError) as error:
+        raise _github_http_error(error) from error
+    except GitHubAPIError as error:
+        logger.warning("GitHub pull request status failed: %s", error)
+        raise HTTPException(status_code=502, detail=f"{error} Try again in a moment.") from error
+    except TokenCryptoError as error:
+        raise HTTPException(status_code=503, detail="GitHub token storage is not configured on the server.") from error
+    except DatabaseConfigurationError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except Exception as error:
+        logger.exception("Could not read the pull request status")
+        raise HTTPException(status_code=502, detail="Could not read the pull request status from GitHub. Try again.") from error

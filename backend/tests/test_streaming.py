@@ -42,8 +42,14 @@ PLANNING_TEXT = (
 
 
 def run_filter(chunks):
+    """Feed ``chunks`` like stream_complete() does: a restart discards what was shown so far."""
     content_filter = StreamingContentFilter()
-    outputs = [content_filter.feed(chunk) for chunk in chunks]
+    outputs = []
+    for chunk in chunks:
+        output = content_filter.feed(chunk)
+        if content_filter.take_restart():
+            outputs = []
+        outputs.append(output)
     return outputs, content_filter.finish()
 
 
@@ -458,7 +464,9 @@ PLANNING_OPENERS = [
 ]
 WORDS = [
     "alpha", "beta", "cache", "router", "x < y", "a<b", "<", "<t", "<thi", "<ANALYS", "<reasoni",
-    "</", "</thin", "</think>", "<b>", "</b>", "think", "->", "é", "→", "`code`", "1.", "-",
+    # A closing tag in running text is ordinary text; one that ends a line
+    # ends reasoning (covered by the stray-tag tests below).
+    "</", "</thin", "</think> tag", "<b>", "</b>", "think", "->", "é", "→", "`code`", "1.", "-",
 ]
 SEPARATORS = [" ", " ", " ", "\n", "\n\n", "\t", "  "]
 OPEN_TAGS = ["<think>", "<Think>", "<analysis>", "<REASONING>", "<reasoning>"]

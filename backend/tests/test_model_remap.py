@@ -24,6 +24,17 @@ class RetiredModelRemapTests(unittest.TestCase):
         with patch.object(settings, "nemotron_model", "nvidia/some-working-model"):
             self.assertEqual(get_answer_model_options("fast")[0], "nvidia/some-working-model")
 
+    def test_editing_defaults_are_ultra_with_super_vl_as_fallback(self):
+        defaults = config.Settings.model_fields
+        self.assertEqual(defaults["code_editing_model"].default, "nvidia/nemotron-3-ultra-550b-a55b")
+        self.assertEqual(defaults["code_editing_fallback_model"].default, "nvidia/nemotron-3.5-super-vl-120b-a12b")
+
+    def test_a_retired_fallback_id_is_remapped_too(self):
+        with patch.object(settings, "code_editing_fallback_model", RETIRED):
+            self.assertEqual(config.get_code_editing_fallback_model(), RETIRED_CHAT_MODELS[RETIRED])
+        with patch.object(settings, "code_editing_fallback_model", ""):
+            self.assertEqual(config.get_code_editing_fallback_model(), "")
+
     def test_defaults_no_longer_name_the_retired_model(self):
         defaults = config.Settings.model_fields
         for field in ("nemotron_model", "detailed_nemotron_model", "code_editing_model", "code_editing_fallback_model"):

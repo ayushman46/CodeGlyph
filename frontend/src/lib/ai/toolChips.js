@@ -22,6 +22,7 @@ import { diffLines, splitLines, toHunks, toRows } from '../diff.js';
  *   icon?: import('react').ReactNode,
  *   output?: ToolLine[],
  *   outputIsCode?: boolean,
+ *   outcome?: 'warn' | 'skipped',
  * }} ToolCall
  * @typedef {{ path: string, added: number, removed: number, lines?: ToolLine[] }} FileChange
  */
@@ -216,7 +217,36 @@ export const TOOL_LABELS = Object.freeze({
   validate_patch: 'Validate patch',
   read_file: 'Read file',
   read_files: 'Read files',
+  check_scope: 'Check scope',
+  read_conventions: 'Read conventions',
+  check_syntax: 'Check syntax',
+  check_style: 'Check style',
+  check_imports: 'Check imports',
+  check_completeness: 'Check related code',
+  review_patch: 'Self-review',
 });
+
+/**
+ * What failed, for the run's summary line ("Syntax check failed · 9
+ * steps"); other tools use their label.
+ */
+export const FAILURE_LABELS = Object.freeze({
+  validate_patch: 'Validation',
+  check_scope: 'Scope check',
+  read_conventions: 'Reading conventions',
+  check_syntax: 'Syntax check',
+  check_style: 'Style check',
+  check_imports: 'Import check',
+  check_completeness: 'Related code check',
+  review_patch: 'Self-review',
+});
+
+/**
+ * A stored call's outcome (`status`; missing means ok). Only `fail` turns
+ * the chip into an error; `warn` and `skipped` stay done and are marked by
+ * `outcome` so the view can show a quieter sign.
+ */
+const CALL_STATUSES = new Set(['ok', 'warn', 'fail', 'skipped']);
 
 /** "read_files" -> "Read files". */
 export const humanizeToolName = (tool) => {
@@ -263,8 +293,44 @@ const describeCall = (tool, input, summary) => {
     case 'rename_codemod':
       return { detail: asText(input.file) || undefined, detailIsCode: true, output: proseLines([summary]) };
     case 'validate_patch':
+    case 'check_syntax':
+    case 'check_style':
+    case 'check_imports':
+    case 'check_completeness':
       // "3 file(s), +15 −15, every hunk matched exactly once; not changed: a, b"
+      // "readme.md:264 still says `limit`: `2`; test/normalize.ts imports a changed module"
       return { ...filesDetail(textList(input.files)), output: proseLines(summary.split(/;\s+/)) };
+    case 'check_scope': {
+      // {files: 13, limit: 8, mechanical: 5, symbols: {fooHelper: 12}, parts?: [{title, files, prompt}]}
+      const count = isFiniteCount(input.files) ? input.files : null;
+      const limit = isFiniteCount(input.limit) ? input.limit : null;
+      const symbols = input.symbols && typeof input.symbols === 'object' && !Array.isArray(input.symbols)
+        ? Object.entries(input.symbols).filter(([name, uses]) => name && isFiniteCount(uses))
+        : [];
+      const parts = (Array.isArray(input.parts) ? input.parts : []).filter((part) => part && typeof part === 'object');
+      return {
+        detail: count == null ? undefined : `${plural(count, 'file')}${limit == null ? '' : ` · limit ${limit}`}`,
+        output: proseLines([
+          summary,
+          ...symbols.map(([name, uses]) => `${name}: used in ${plural(uses, 'file')}`),
+          ...parts.map((part, index) => {
+            const files = textList(part.files);
+            const title = asText(part.title).trim() || `Part ${index + 1}`;
+            return `${index + 1}. ${title}${files.length ? ` (${plural(files.length, 'file')})` : ''}`;
+          }),
+        ]),
+      };
+    }
+    case 'read_conventions': {
+      const sources = textList(input.sources);
+      return { ...filesDetail(sources), output: proseLines([summary, ...(sources.length > 1 ? sources : [])]) };
+    }
+    case 'review_patch': {
+      const issues = isFiniteCount(input.issues) ? input.issues : null;
+      const fixed = isFiniteCount(input.fixed) ? input.fixed : null;
+      const detail = issues ? `${fixed ?? 0} of ${plural(issues, 'issue')} fixed` : filesDetail(textList(input.files)).detail;
+      return { detail, output: proseLines(summary.split(/;\s+/)) };
+    }
     default: {
       const detail = firstInputValue(input);
       return { detail: detail || undefined, detailIsCode: Boolean(detail) && !/\s/.test(detail), output: proseLines([summary]) };
@@ -273,12 +339,14 @@ const describeCall = (tool, input, summary) => {
 };
 
 /**
- * The backend's `tool_calls` (`{ tool, input, result_summary }`) as Tool
- * Chips calls, in order. The `code_edit` entry (a pointer to the proposal)
- * and malformed entries are skipped. Every stored call is finished, so
- * status is `done`; a summary becomes the call's expandable output.
+ * The backend's `tool_calls` (`{ tool, input, result_summary, status? }`)
+ * as Tool Chips calls, in order. The `code_edit` entry (a pointer to the
+ * proposal) and malformed entries are skipped. Every stored call is
+ * finished: `status: 'fail'` becomes an `error` chip, anything else `done`
+ * (`warn` / `skipped` also set `outcome`, and their summary is the first
+ * output line); a summary becomes the call's expandable output.
  *
- * @param {Array<{ tool?: string, input?: object, result_summary?: string }>} toolCalls
+ * @param {Array<{ tool?: string, input?: object, result_summary?: string, status?: string }>} toolCalls
  * @returns {ToolCall[]}
  */
 export const toolCallsToCalls = (toolCalls) => {
@@ -288,9 +356,15 @@ export const toolCallsToCalls = (toolCalls) => {
     if (call.tool === 'code_edit') return;
     const input = call.input && typeof call.input === 'object' ? call.input : {};
     const summary = asText(call.result_summary).trim();
+    const outcome = CALL_STATUSES.has(call.status) ? call.status : 'ok';
     const { detail, detailIsCode, output } = describeCall(call.tool, input, summary);
     /** @type {ToolCall} */
-    const mapped = { id: `${index}:${call.tool}`, label: TOOL_LABELS[call.tool] || humanizeToolName(call.tool), status: 'done' };
+    const mapped = {
+      id: `${index}:${call.tool}`,
+      label: TOOL_LABELS[call.tool] || humanizeToolName(call.tool),
+      status: outcome === 'fail' ? 'error' : 'done',
+    };
+    if (outcome === 'warn' || outcome === 'skipped') mapped.outcome = outcome;
     if (detail) {
       mapped.detail = detail;
       if (detailIsCode) mapped.detailIsCode = true;
@@ -310,6 +384,8 @@ export const STAGE_LABELS = Object.freeze({
   editing: 'Writing the patch',
   validating: 'Validating the patch',
   repairing: 'Repairing hunks',
+  checking: 'Checking syntax, style and imports',
+  reviewing: 'Reviewing the change against the request',
   generating: 'Writing the answer',
 });
 
@@ -366,7 +442,9 @@ export const summarizeToolRun = ({ calls = [], changes = [] } = {}) => {
   }
   const failed = list.find((call) => call.status === 'error');
   if (failed) {
-    const what = /validat/i.test(`${failed.id} ${failed.label}`) ? 'Validation' : failed.label;
+    // ids are "<index>:<tool>" (stored calls) or "failure:<tool>".
+    const tool = asText(failed.id).split(':').slice(1).join(':');
+    const what = FAILURE_LABELS[tool] || (/validat/i.test(`${failed.id} ${failed.label}`) ? 'Validation' : failed.label);
     return `${what} failed${stepsPart}`;
   }
   const parts = [];
@@ -393,7 +471,9 @@ export const buildToolChips = ({ toolCalls, proposal, stage, failure, diff } = {
   const calls = toolCallsToCalls(toolCalls);
   const running = stageToToolCall(stage);
   if (running) calls.push(running);
-  else if (failure) calls.push(failureToToolCall(failure));
+  // A run stopped by a failed step (e.g. a scope check that split the
+  // change) already ends on that step; the answer text explains the rest.
+  else if (failure && !calls.some((call) => call.status === 'error')) calls.push(failureToToolCall(failure));
   const changes = proposalToToolChanges(proposal, diff);
   return { summary: summarizeToolRun({ calls, changes }), calls, changes };
 };

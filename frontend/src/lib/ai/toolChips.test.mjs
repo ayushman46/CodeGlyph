@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  DIFF_GAP, buildToolChips, countToolLines, defaultToolChipsLabels, failureToToolCall, fileToToolChange,
+  DIFF_GAP, STAGE_LABELS, TOOL_LABELS, buildToolChips, countToolLines, defaultToolChipsLabels, failureToToolCall, fileToToolChange,
   humanizeToolName, hunksToToolLines, proposalToToolChanges, stageToToolCall, summarizeToolRun, toolCallsToCalls,
 } from './toolChips.js';
 
@@ -262,4 +262,109 @@ test('mappers never mutate their inputs', () => {
   buildToolChips({ toolCalls: calls, proposal });
   assert.deepEqual(calls, RENAME_TOOL_CALLS);
   assert.deepEqual(proposal, frozenProposal);
+});
+
+// ------------------------------------------------------------ quality gates (G10)
+
+// The quality steps of an edit run, in pipeline order (SPEC 5.2).
+const QUALITY_TOOL_CALLS = [
+  { tool: 'check_scope', input: { files: 13, limit: 8, mechanical: 5, symbols: { fooHelper: 12 } }, result_summary: '13 files: 8 edited by the model, 5 by the rename codemod' },
+  { tool: 'read_conventions', input: { sources: ['.github/pull_request_template.md', 'AGENTS.md'] }, result_summary: 'PR template; Conventional Commits (commitlint); tabs, single quotes' },
+  { tool: 'check_syntax', input: { files: ['source/a.ts', 'source/b.ts'] }, result_summary: 'source/a.ts:30:1 Unexpected end of file', status: 'fail' },
+  { tool: 'check_style', input: { files: ['test/is.ts'] }, result_summary: 'Fixed final newline in test/is.ts; 1 warning', status: 'warn' },
+  { tool: 'check_imports', input: { files: ['test/is.ts'] }, result_summary: 'All relative imports resolve; added .js to 1 import', status: 'ok' },
+  { tool: 'check_completeness', input: { files: ['source/utils/normalize.ts'] }, result_summary: 'readme.md:264 still says `limit`: `2`; test/normalize.ts imports a changed module and was not changed', status: 'warn' },
+  { tool: 'review_patch', input: { files: ['test/is.ts'], issues: 3, fixed: 2 }, result_summary: 'Fixed 2 of 3 issues: wrong Infinity assertion (test/is.ts:43); import path' },
+  { tool: 'validate_patch', input: { files: ['source/a.ts'] }, result_summary: '1 file(s), +1 −1, every hunk matched exactly once' },
+  { tool: 'code_edit', input: { proposal_id: 'p' }, result_summary: 'x' },
+];
+
+test('the quality tools have their labels, and only a failed check becomes an error chip', () => {
+  assert.equal(TOOL_LABELS.check_scope, 'Check scope');
+  assert.equal(TOOL_LABELS.read_conventions, 'Read conventions');
+  assert.equal(TOOL_LABELS.check_syntax, 'Check syntax');
+  assert.equal(TOOL_LABELS.check_style, 'Check style');
+  assert.equal(TOOL_LABELS.check_imports, 'Check imports');
+  assert.equal(TOOL_LABELS.check_completeness, 'Check related code');
+  assert.equal(TOOL_LABELS.review_patch, 'Self-review');
+  const calls = toolCallsToCalls(QUALITY_TOOL_CALLS);
+  assert.deepEqual(calls.map((call) => [call.label, call.status, call.outcome]), [
+    ['Check scope', 'done', undefined],
+    ['Read conventions', 'done', undefined],
+    ['Check syntax', 'error', undefined],
+    ['Check style', 'done', 'warn'],
+    ['Check imports', 'done', undefined],
+    ['Check related code', 'done', 'warn'],
+    ['Self-review', 'done', undefined],
+    ['Validate patch', 'done', undefined],
+  ]);
+  // A missing status is ok (older answers).
+  assert.equal(calls[0].outcome, undefined);
+  assert.equal(toolCallsToCalls([{ tool: 'check_syntax', input: {}, result_summary: 'ok', status: 'bogus' }])[0].status, 'done');
+  assert.equal(toolCallsToCalls([{ tool: 'review_patch', input: {}, result_summary: 'Skipped: the model was unavailable', status: 'skipped' }])[0].outcome, 'skipped');
+});
+
+test('the quality tools describe their input and keep the summary as the first output line', () => {
+  const [scope, conventions, syntax, style, imports, completeness, review] = toolCallsToCalls(QUALITY_TOOL_CALLS);
+  assert.equal(scope.detail, '13 files · limit 8');
+  assert.deepEqual(scope.output.map((line) => line.text), ['13 files: 8 edited by the model, 5 by the rename codemod', 'fooHelper: used in 12 files']);
+  assert.equal(conventions.detail, '2 files');
+  assert.deepEqual(conventions.output.map((line) => line.text), [
+    'PR template; Conventional Commits (commitlint); tabs, single quotes', '.github/pull_request_template.md', 'AGENTS.md',
+  ]);
+  assert.equal(syntax.detail, '2 files');
+  assert.equal(syntax.output[0].text, 'source/a.ts:30:1 Unexpected end of file');
+  assert.equal(style.detail, 'test/is.ts');
+  assert.equal(style.detailIsCode, true);
+  assert.deepEqual(style.output.map((line) => line.text), ['Fixed final newline in test/is.ts', '1 warning']);
+  assert.equal(imports.output[0].text, 'All relative imports resolve');
+  assert.deepEqual(completeness.output.map((line) => line.text), [
+    'readme.md:264 still says `limit`: `2`', 'test/normalize.ts imports a changed module and was not changed',
+  ]);
+  assert.equal(review.detail, '2 of 3 issues fixed');
+  assert.equal(review.output[0].text, 'Fixed 2 of 3 issues: wrong Infinity assertion (test/is.ts:43)');
+
+  const skipped = toolCallsToCalls([{ tool: 'review_patch', input: { files: ['a.ts'], issues: 0, fixed: 0 }, result_summary: 'Skipped: the model was unavailable', status: 'skipped' }])[0];
+  assert.equal(skipped.detail, 'a.ts');
+  assert.equal(skipped.output[0].text, 'Skipped: the model was unavailable');
+
+  const split = toolCallsToCalls([{
+    tool: 'check_scope',
+    input: {
+      files: 30, limit: 8, mechanical: 0, symbols: { fooHelper: 30 },
+      parts: [
+        { title: 'Definitions and exports', files: ['src/lib/foo.ts', 'src/lib/index.ts'], prompt: 'Rename …' },
+        { title: 'src/app', files: ['src/app/a.ts'], prompt: 'Rename …' },
+        { files: [] },
+      ],
+    },
+    result_summary: 'Too large: 30 files (limit 8); split into 3 parts',
+    status: 'fail',
+  }])[0];
+  assert.equal(split.status, 'error');
+  assert.deepEqual(split.output.map((line) => line.text), [
+    'Too large: 30 files (limit 8); split into 3 parts', 'fooHelper: used in 30 files',
+    '1. Definitions and exports (2 files)', '2. src/app (1 file)', '3. Part 3',
+  ]);
+});
+
+test('a failed check names itself in the run summary', () => {
+  const calls = toolCallsToCalls(QUALITY_TOOL_CALLS);
+  assert.equal(summarizeToolRun({ calls, changes: [{}] }), 'Syntax check failed · 8 steps');
+  const imports = toolCallsToCalls([{ tool: 'check_imports', input: {}, result_summary: "test/is.ts:2 '../x' does not resolve", status: 'fail' }]);
+  assert.equal(summarizeToolRun({ calls: imports }), 'Import check failed');
+  // Warnings and skipped steps do not fail the run.
+  const warned = toolCallsToCalls(QUALITY_TOOL_CALLS.map((call) => ({ ...call, status: call.status === 'fail' ? 'warn' : call.status })));
+  assert.equal(summarizeToolRun({ calls: warned, changes: [{}, {}] }), '8 steps · 2 files changed');
+  // A stored failed step ends the run: the no-proposal failure is not added again.
+  const stopped = buildToolChips({ toolCalls: [QUALITY_TOOL_CALLS[0], { ...QUALITY_TOOL_CALLS[0], status: 'fail' }], failure: 'This change is too large.' });
+  assert.equal(stopped.calls.length, 2);
+  assert.equal(stopped.summary, 'Scope check failed · 2 steps');
+});
+
+test('the checking and reviewing stages have running labels', () => {
+  assert.equal(STAGE_LABELS.checking, 'Checking syntax, style and imports');
+  assert.equal(STAGE_LABELS.reviewing, 'Reviewing the change against the request');
+  assert.equal(stageToToolCall({ stage: 'checking' }).label, 'Checking syntax, style and imports');
+  assert.equal(stageToToolCall({ stage: 'reviewing', detail: 'Reviewing the change against the request' }).status, 'running');
 });

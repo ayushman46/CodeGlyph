@@ -504,6 +504,14 @@ const useStore = create((set, get) => ({
                 update({ first_token_at: Date.now() });
                 flush();
               } else if (!flushTimer) flushTimer = setTimeout(flush, 40);
+            } else if (event === 'reset') {
+              // The text streamed so far was model reasoning; the answer follows.
+              if (flushTimer) {
+                clearTimeout(flushTimer);
+                flushTimer = null;
+              }
+              pending = '';
+              update({ content: '' });
             } else if (event === 'done') finish(data);
             else if (event === 'error') throw new ApiError(data.detail || 'The answer could not be completed.', data.status || 500);
           },

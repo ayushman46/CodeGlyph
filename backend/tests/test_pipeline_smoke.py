@@ -167,12 +167,17 @@ class BackendSmokeTests(unittest.TestCase):
 
     def test_answer_model_profiles_are_allow_listed(self):
         from api.query_router import QueryRequest
-        from config import get_answer_model_options
+        from config import Settings, get_answer_model_options, settings
         from pydantic import ValidationError
-        self.assertEqual(get_answer_model_options("fast")[0], "nvidia/nemotron-3.5-super-vl-120b-a12b")
-        self.assertEqual(get_answer_model_options("detailed")[0], "nvidia/nemotron-3-ultra-550b-a55b")
-        self.assertEqual(get_answer_model_options("fast", "editing")[0], "nvidia/nemotron-3.5-super-vl-120b-a12b")
-        self.assertEqual(get_answer_model_options("code")[0], "nvidia/nemotron-3.5-super-vl-120b-a12b")
+        # The defaults, whatever a developer's .env pins.
+        defaults = {name: Settings.model_fields[name].default
+                    for name in ("nemotron_model", "detailed_nemotron_model", "code_editing_model", "code_editing_fallback_model")}
+        with patch.multiple(settings, **defaults):
+            self.assertEqual(get_answer_model_options("fast")[0], "nvidia/nemotron-3.5-super-vl-120b-a12b")
+            self.assertEqual(get_answer_model_options("detailed")[0], "nvidia/nemotron-3-ultra-550b-a55b")
+            self.assertEqual(get_answer_model_options("fast", "editing")[0], "nvidia/nemotron-3-ultra-550b-a55b")
+            self.assertEqual(get_answer_model_options("code")[0], "nvidia/nemotron-3-ultra-550b-a55b")
+            self.assertEqual(settings.code_editing_fallback_model, "nvidia/nemotron-3.5-super-vl-120b-a12b")
         with self.assertRaises(ValidationError):
             QueryRequest(repo_name="demo", question="Where is login?", model_profile="untrusted/model")
         with self.assertRaises(ValidationError):

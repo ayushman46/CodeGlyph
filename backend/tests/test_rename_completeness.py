@@ -78,6 +78,10 @@ class ExactHunkTests(unittest.TestCase):
 class RenameCompletenessTests(base.DatabaseTestCase):
     def setUp(self):
         super().setUp()
+        # Edit calls only; the self-review call is tested in test_edit_quality*.py.
+        review_off = patch.object(base.settings, "editing_self_review", False)
+        review_off.start()
+        self.addCleanup(review_off.stop)
         run(base.seed_repo(self.store))
         self.repo = run(fetch_owned_repository(self.store, USER, REPO_NAME))
         files = {"src/lib/email.ts": DEFINITION, "src/a.ts": USER_A, "src/b.ts": USER_B}
@@ -120,22 +124,30 @@ class RenameCompletenessTests(base.DatabaseTestCase):
         self.assertFalse(result.proposal["incomplete"])
         self.assertEqual(result.proposal["unchanged_files"], [])
 
-    def test_definition_only_rename_is_repaired_with_the_importers(self):
-        # Not phrased as "rename X to Y", so the importers are only found by
-        # the post-validation check; the repair round must receive them.
+    def test_definition_only_rename_is_completed_by_the_codemod(self):
+        # Not phrased as "rename X to Y": the patch renames the exported
+        # definition, so every importer is renamed by the exact codemod, with
+        # no second model call.
         definition_only = base.edit_response([RENAME_DEFINITION])
-        complete = base.edit_response([RENAME_DEFINITION, RENAME_A, RENAME_B])
-        result = self.edit("In src/lib/email.ts call the helper getBaseEmail instead of extractBaseEmail", [definition_only, complete])
-        repair = result.model.calls[1]["messages"][-1]["content"]
-        self.assertIn("still reference it", repair)
-        self.assertIn("===== FILE: src/a.ts", repair)
-        self.assertIn("===== FILE: src/b.ts", repair)
-        self.assertEqual(len(result.proposal["files"]), 3)
+        result = self.edit("In src/lib/email.ts call the helper getBaseEmail instead of extractBaseEmail", [definition_only])
+        self.assertEqual(len(result.model.calls), 1)
+        by_path = {item["file_path"]: item for item in result.proposal["files"]}
+        self.assertEqual(sorted(by_path), ["src/a.ts", "src/b.ts", "src/lib/email.ts"])
+        for item in by_path.values():
+            self.assertNotIn("extractBaseEmail", item["after"])
+            self.assertEqual(apply_hunks(item["before"], item["changes"]), item["after"])
+        self.assertTrue(by_path["src/a.ts"]["mechanical"])
         self.assertFalse(result.proposal["incomplete"])
+        trace = next(call for call in result.tool_calls if call["tool"] == "trace_symbols" and call["input"].get("inferred"))
+        self.assertEqual(trace["input"]["symbols"], ["extractBaseEmail"])
+        self.assertIn("updated 2 other files", trace["result_summary"])
 
     def test_importers_left_unchanged_are_reported_not_hidden(self):
         definition_only = base.edit_response([RENAME_DEFINITION])
-        result = self.edit("In src/lib/email.ts call the helper getBaseEmail instead of extractBaseEmail", [definition_only, definition_only])
+        # The codemod may change only one file here, so the importers stay as they are.
+        with patch.object(base.settings, "editing_max_mechanical_files", 1):
+            result = self.edit("In src/lib/email.ts call the helper getBaseEmail instead of extractBaseEmail",
+                               [definition_only, definition_only])
         self.assertTrue(result.proposal["incomplete"])
         reported = {item["file_path"]: item["reason"] for item in result.proposal["unchanged_files"]}
         self.assertEqual(sorted(reported), ["src/a.ts", "src/b.ts"])

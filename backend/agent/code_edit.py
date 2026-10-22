@@ -17,6 +17,7 @@ import hmac
 import json
 import re
 import time
+import zlib
 from collections import Counter
 from pathlib import PurePosixPath
 from typing import Any
@@ -30,7 +31,19 @@ class EditingAuthorizationError(ValueError):
     """Raised when a file or PR request lacks a valid editing-mode ticket."""
 
 
-_CODE_EDIT_TAG = re.compile(r"<code_edit>\s*(.*?)\s*</code_edit>", re.IGNORECASE | re.DOTALL)
+class ModelOutputParseError(CodeEditValidationError):
+    """The model's reply held no usable JSON object.
+
+    ``json_error`` is the decoder's own message with its position (for
+    example "Expecting ',' delimiter at line 12 column 57"), so a repair
+    request can name exactly what was wrong.
+    """
+
+    def __init__(self, message: str, *, json_error: str = ""):
+        super().__init__(message)
+        self.json_error = json_error
+
+
 _CONTEXT_FILE = re.compile(r"(?m)^File:\s*([^\s]+)\s+\(L\d+-L\d+\)")
 _MAX_CHANGES = 20
 _MAX_FILES = 8
@@ -51,27 +64,178 @@ def _normalise_path(value: str) -> str:
     return str(path)
 
 
+# ---------------------------------------------------------------------------
+# Lenient model-output parsing
+#
+# Models write literal TAB characters inside JSON strings (tab-indented
+# repositories), invalid escapes such as \` or \d, and trailing commas.
+# Strict decoding rejected those replies, and scanning on for "any object"
+# then accepted an inner object (one file entry) as if it were the whole
+# reply. Here the raw control characters are accepted (strict=False), the
+# two other faults are repaired losslessly, and only an object that holds the
+# required key is ever returned.
+# ---------------------------------------------------------------------------
+
+_VALID_JSON_ESCAPES = frozenset('"\\/bfnrtu')
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_JSON_SPECIALS = re.compile(r'[\\",]')
+
+
+def repair_json_text(text: str) -> str:
+    """Return ``text`` with invalid string escapes and trailing commas repaired.
+
+    Inside strings an invalid escape keeps its backslash literally (``\\```
+    becomes ``\\\\```), which is lossless: the decoded string still contains
+    the backslash the model wrote. Outside strings a comma directly before
+    ``]`` or ``}`` is dropped. Raw control characters are left for
+    ``JSONDecoder(strict=False)``. Only quote, backslash and comma characters
+    are visited, so long replies stay cheap.
+    """
+    source = str(text or "")
+    out: list[str] = []
+    cursor = 0
+    in_string = False
+    position = 0
+    length = len(source)
+    while True:
+        match = _JSON_SPECIALS.search(source, position)
+        if match is None:
+            break
+        index = match.start()
+        character = source[index]
+        if in_string:
+            if character == '"':
+                in_string = False
+                position = index + 1
+                continue
+            if character == "\\":
+                following = source[index + 1] if index + 1 < length else ""
+                if following == "u":
+                    digits = source[index + 2:index + 6]
+                    if len(digits) == 4 and all(digit in _HEX_DIGITS for digit in digits):
+                        position = index + 6
+                        continue
+                elif following and following in _VALID_JSON_ESCAPES:
+                    position = index + 2
+                    continue
+                out.append(source[cursor:index])
+                out.append("\\\\")
+                cursor = index + 1
+                position = index + 1
+                continue
+            position = index + 1  # a comma inside a string
+            continue
+        if character == '"':
+            in_string = True
+            position = index + 1
+            continue
+        if character == ",":
+            following = index + 1
+            while following < length and source[following] in " \t\r\n":
+                following += 1
+            if following < length and source[following] in "]}":
+                out.append(source[cursor:index])
+                cursor = index + 1
+        position = index + 1
+    out.append(source[cursor:])
+    return "".join(out)
+
+
+def _tagged_blocks(text: str, tag: str) -> list[str]:
+    """Contents of every ``<tag>`` block, last first; an unclosed final block counts."""
+    name = re.escape(tag)
+    blocks = [match.group(1) for match in re.finditer(rf"<{name}>\s*(.*?)\s*</{name}>", text, re.IGNORECASE | re.DOTALL)]
+    openings = list(re.finditer(rf"<{name}>", text, re.IGNORECASE))
+    closings = len(re.findall(rf"</{name}>", text, re.IGNORECASE))
+    if openings and len(openings) > closings:
+        # A reply cut off inside its last block still holds the object start.
+        blocks.append(text[openings[-1].end():])
+    return list(reversed(blocks))
+
+
+def _first_object_with(text: str, keys: tuple[str, ...], decoder: json.JSONDecoder
+                       ) -> tuple[dict | None, json.JSONDecodeError | None, bool]:
+    """Return (object, first decode error, saw any object) scanning each ``{``."""
+    first_error: json.JSONDecodeError | None = None
+    saw_object = False
+    offset = text.find("{")
+    while offset != -1:
+        try:
+            value, _ = decoder.raw_decode(text, offset)
+        except json.JSONDecodeError as error:
+            if first_error is None:
+                first_error = error
+        else:
+            if isinstance(value, dict):
+                saw_object = True
+                if any(key in value for key in keys):
+                    return value, first_error, True
+        offset = text.find("{", offset + 1)
+    return None, first_error, saw_object
+
+
+def parse_model_object(raw: str, tag: str, required_key: str | tuple[str, ...]) -> dict[str, Any]:
+    """Return the first JSON object in a model reply that contains ``required_key``.
+
+    The ``<tag>`` block is scanned first (the last one wins, since a model may
+    draft before answering), then the whole reply. Each text is decoded as
+    written with ``strict=False`` and, failing that, after
+    ``repair_json_text``. An object without the required key (an inner file
+    entry, say) is never accepted. Raises ``ModelOutputParseError`` naming the
+    exact JSON error and its position.
+    """
+    keys = (required_key,) if isinstance(required_key, str) else tuple(required_key)
+    text = str(raw or "")
+    decoder = json.JSONDecoder(strict=False)
+    candidates = [*_tagged_blocks(text, tag), text]
+    first_error: json.JSONDecodeError | None = None
+    saw_object = False
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        start = candidate.find("{")
+        if start == -1:
+            continue
+        variants = [candidate]
+        repaired = candidate[:start] + repair_json_text(candidate[start:])
+        if repaired != candidate:
+            variants.append(repaired)
+        candidate_error: json.JSONDecodeError | None = None
+        for variant in variants:
+            value, error, found_object = _first_object_with(variant, keys, decoder)
+            if value is not None:
+                return value
+            saw_object = saw_object or found_object
+            # The repaired text's error is what is really wrong with it.
+            if error is not None:
+                candidate_error = error
+        # The first candidate (the tagged block when there is one) decides
+        # which error the repair request names.
+        if first_error is None:
+            first_error = candidate_error
+    key_text = " or ".join(f'"{key}"' for key in keys)
+    if first_error is not None:
+        detail = f"{first_error.msg} at line {first_error.lineno} column {first_error.colno}"
+        raise ModelOutputParseError(f"The model's JSON was invalid: {detail}.", json_error=detail)
+    if saw_object:
+        detail = f"the reply has no JSON object with a {key_text} key"
+        raise ModelOutputParseError(f"The model's JSON was incomplete: {detail}.", json_error=detail)
+    detail = "the reply contains no JSON object"
+    raise ModelOutputParseError(f"The model did not return JSON: {detail}.", json_error=detail)
+
+
 def _extract_object(raw: str) -> dict[str, Any]:
     """Extract one JSON object without trusting surrounding model prose."""
-    candidate = str(raw or "").strip()
-    tagged = _CODE_EDIT_TAG.search(candidate)
-    if tagged:
-        candidate = tagged.group(1).strip()
-
-    decoder = json.JSONDecoder()
     # Models occasionally wrap the object in a Markdown fence or one sentence
-    # of explanation. Try each opening brace, but only accept an object that
-    # subsequently passes the strict schema checks below.
-    for offset, character in enumerate(candidate):
-        if character != "{":
-            continue
-        try:
-            value, _ = decoder.raw_decode(candidate[offset:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
-    raise CodeEditValidationError("The model did not return a valid structured code edit.")
+    # of explanation. Only an object holding the multi-file "files" list or
+    # the legacy one-file "changes" list is accepted, and it must still pass
+    # the strict schema checks below.
+    try:
+        return parse_model_object(raw, "code_edit", ("files", "changes"))
+    except ModelOutputParseError as error:
+        raise CodeEditValidationError("The model did not return a valid structured code edit.") from error
 
 
 def parse_code_edit(
@@ -296,25 +460,49 @@ def create_edit_ticket(secret: str, *, user_id: str, repo_name: str, file_path: 
         "e": int(time.time()) + max(60, int(ttl_seconds)),
         "n": hashlib.sha256(f"{user_id}:{repo_name}:{file_path}:{time.time_ns()}".encode()).hexdigest()[:16],
     }
-    body = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
-    signature = hmac.new(key, body.encode(), hashlib.sha256).hexdigest()
-    return f"v1.{body}.{signature}"
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    body = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    if len(body) <= _TICKET_PLAIN_LIMIT:
+        signature = hmac.new(key, body.encode(), hashlib.sha256).hexdigest()
+        return f"v1.{body}.{signature}"
+    # A proposal of up to 24 files (a large rename) would not fit the
+    # 2,000-character ticket fields as plain base64; repository paths share
+    # long prefixes, so the compressed form does. The version is signed too.
+    body = base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode().rstrip("=")
+    signature = hmac.new(key, f"v2.{body}".encode(), hashlib.sha256).hexdigest()
+    return f"v2.{body}.{signature}"
+
+
+# Plain (v1) tickets up to this body length; longer ones are compressed (v2).
+_TICKET_PLAIN_LIMIT = 1_500
+_TICKET_MAX_PAYLOAD_BYTES = 64 * 1024
+
+
+def _ticket_payload(version: str, body: str) -> Any:
+    padded = body + "=" * (-len(body) % 4)
+    data = base64.urlsafe_b64decode(padded.encode())
+    if version == "v2":
+        inflater = zlib.decompressobj()
+        data = inflater.decompress(data, _TICKET_MAX_PAYLOAD_BYTES)
+        if inflater.unconsumed_tail:
+            raise ValueError("ticket payload too large")
+    return json.loads(data.decode())
 
 
 def verify_edit_ticket(secret: str, ticket: str, *, user_id: str, repo_name: str, file_path: str) -> dict[str, Any]:
     """Verify signature, expiry, and exact scope using constant-time comparison."""
     key = _ticket_key(secret)
     parts = str(ticket or "").split(".")
-    if len(parts) != 3 or parts[0] != "v1":
+    if len(parts) != 3 or parts[0] not in {"v1", "v2"}:
         raise EditingAuthorizationError("Open this change from Code editing mode before continuing.")
-    body, signature = parts[1], parts[2]
-    expected = hmac.new(key, body.encode(), hashlib.sha256).hexdigest()
+    version, body, signature = parts
+    signed = body if version == "v1" else f"v2.{body}"
+    expected = hmac.new(key, signed.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(signature, expected):
         raise EditingAuthorizationError("The editing session is invalid. Start the review again.")
     try:
-        padded = body + "=" * (-len(body) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
-    except (ValueError, TypeError, json.JSONDecodeError) as error:
+        payload = _ticket_payload(version, body)
+    except (ValueError, TypeError, json.JSONDecodeError, zlib.error) as error:
         raise EditingAuthorizationError("The editing session is invalid. Start the review again.") from error
     try:
         if not isinstance(payload, dict) or "e" not in payload:
@@ -606,6 +794,107 @@ def apply_hunks(content: str, changes: list[dict[str, Any]]) -> str:
         cursor = original_start
     pieces.append(content[:cursor])
     return "".join(reversed(pieces))
+
+
+def exact_hunks(before: str, after: str, *, context: int = 2, max_context: int = 8) -> list[dict] | None:
+    """Minimal hunks that turn ``before`` into ``after``, each matching exactly once.
+
+    Hunks are written against the LF view (as apply_hunks matches) and are
+    verified by applying them; None when no verified hunk set exists.
+    """
+    lf_before, lf_after = before.replace("\r\n", "\n"), after.replace("\r\n", "\n")
+    a, b = lf_before.split("\n"), lf_after.split("\n")
+    matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    hunks: list[dict] = []
+    for group in matcher.get_grouped_opcodes(context):
+        i1, i2 = group[0][1], group[-1][2]
+        j1, j2 = group[0][3], group[-1][4]
+        start, end, extra = i1, i2, 0
+        while True:
+            old = "\n".join(a[start:end])
+            if old and lf_before.count(old) == 1:
+                break
+            if extra >= max_context or (start == 0 and end == len(a)):
+                return None
+            extra += 1
+            start, end = max(0, i1 - extra), min(len(a), i2 + extra)
+        new = "\n".join(a[start:i1] + b[j1:j2] + a[i2:end])
+        hunks.append({"old": old, "new": new})
+    if not hunks:
+        return None
+    try:
+        return hunks if apply_hunks(before, hunks) == after else None
+    except CodeEditValidationError:
+        return None
+
+
+def unescape_hunks(content: str, changes: list[dict]) -> list[dict]:
+    """Undo a JSON escaping slip in hunks that do not match as written.
+
+    Models sometimes write a backtick inside a JSON string as ``\\``` (an
+    invalid escape that lenient parsing keeps literally), so ``- \\`limit\\```
+    never matches ``- `limit``` in a Markdown file. A hunk is rewritten only
+    when its text is absent as written and the unescaped text matches
+    exactly once, so a real ``\\``` (a JS template literal) is never touched.
+    """
+    view = content.replace("\r\n", "\n")
+    fixed: list[dict] = []
+    for change in changes:
+        old = change.get("old") if isinstance(change, dict) else None
+        new = change.get("new") if isinstance(change, dict) else None
+        if isinstance(old, str) and isinstance(new, str) and "\\`" in old:
+            plain_old = old.replace("\\`", "`").replace("\r\n", "\n")
+            if old.replace("\r\n", "\n") not in view and view.count(plain_old) == 1:
+                fixed.append({**change, "old": old.replace("\\`", "`"), "new": new.replace("\\`", "`")})
+                continue
+        fixed.append(change)
+    return fixed
+
+
+def hunks_for(before: str, after: str) -> list[dict]:
+    """Verified hunks for ``before`` -> ``after``; one whole-file hunk as fallback.
+
+    The review UI re-applies hunks, so ``apply_hunks(before, result) == after``
+    must hold for every proposal. Callers check that invariant with
+    ``apply_hunks`` and use its result as the final text.
+    """
+    if before == after:
+        return []
+    hunks = exact_hunks(before, after)
+    if hunks is not None:
+        return hunks
+    return [{"old": before.replace("\r\n", "\n"), "new": after.replace("\r\n", "\n")}]
+
+
+def reapply_change(base: str, edited: str, latest: str) -> str | None:
+    """Re-apply the reviewed change (``base`` -> ``edited``) on top of ``latest``.
+
+    Pure: the change is expressed as exact hunks against ``base`` and applied
+    to ``latest``. Returns None when any hunk does not match ``latest``
+    exactly once (the upstream edit touched the same lines), so a stale
+    review is never merged by guesswork. Line endings follow ``latest``.
+    """
+    if not all(isinstance(value, str) for value in (base, edited, latest)):
+        return None
+    if base == edited:
+        return latest
+    if base == latest:
+        return edited
+    hunks = exact_hunks(base, edited)
+    if hunks is None:
+        return None
+    # Strict: apply_hunks falls back to whitespace-tolerant matching when a
+    # hunk's exact text is absent, but a stale review is only re-applied when
+    # every hunk occurs exactly once, byte for byte, in the latest version.
+    lf_latest = latest.replace("\r\n", "\n")
+    for hunk in hunks:
+        old = str(hunk.get("old") or "").replace("\r\n", "\n")
+        if not old or _occurrence_count(lf_latest, old) != 1:
+            return None
+    try:
+        return apply_hunks(latest, hunks)
+    except CodeEditValidationError:
+        return None
 
 
 def _diff_lines(text: str) -> list[str]:
