@@ -1,16 +1,21 @@
-import { Download, FileDiff, GitPullRequest } from 'lucide-react';
-import { useEffect, useMemo, useRef } from 'react';
+import {
+  AlertTriangle, CircleSlash, Download, ExternalLink, FileDiff, GitPullRequest, RefreshCw,
+} from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { buildToolChips } from '../../lib/ai/toolChips';
 import { downloadText, proposalPatch, slugify } from '../../lib/patch';
-import { issueLabel } from '../../lib/proposal';
+import {
+  ciStateLabel, ciStateTone, issueLabel, pullRequestFor, qualityNote, qualitySummary, safeGithubUrl, subscribePullRequests,
+} from '../../lib/proposal';
 import useArtifacts, {
   PROPOSAL_PANEL_ID, artifactCardId, proposalArtifactStatus, proposalArtifactSummary,
 } from '../../store/useArtifacts';
 import useStore from '../../store/useStore';
 import { ArtifactCard } from '../ai/ArtifactPanel';
 import { ToolChips } from '../ai/ToolChips';
+import Badge from '../ui/Badge';
 import Button from '../ui/Button';
-import ProposalNotices from './ProposalNotices';
+import ProposalNotices, { usePullRequestStatus } from './ProposalNotices';
 
 /*
  * The code-change part of an Edit & PR answer:
@@ -49,9 +54,11 @@ const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
 
 /**
  * The card's note: "2 files · +2 −1", plus "· Refs #7" when the change names
- * an issue. (Tool Chips above already say "N files changed".)
+ * an issue, plus the quality gates ("· checks passed", "· 2 warnings",
+ * "· syntax errors") when the proposal has them. (Tool Chips above already
+ * say "N files changed".)
  */
-const describeProposal = (proposal) => {
+export const describeProposal = (proposal) => {
   if (!proposal) return undefined;
   const files = proposal.files || [];
   const stats = proposal.stats || {};
@@ -59,7 +66,14 @@ const describeProposal = (proposal) => {
   const added = stats.additions ?? files.reduce((sum, file) => sum + (file.additions || 0), 0);
   const removed = stats.deletions ?? files.reduce((sum, file) => sum + (file.deletions || 0), 0);
   const issue = issueLabel(proposal);
-  return `${plural(count, 'file')} · +${added} −${removed}${issue ? ` · ${issue}` : ''}`;
+  const quality = qualityNote(qualitySummary(proposal));
+  return `${plural(count, 'file')} · +${added} −${removed}${issue ? ` · ${issue}` : ''}${quality ? ` · ${quality}` : ''}`;
+};
+
+// A check that warned or was skipped stays a finished step, with a quieter sign.
+const OUTCOME_ICONS = {
+  warn: <AlertTriangle className="text-warning" />,
+  skipped: <CircleSlash />,
 };
 
 /** Why a finished run has no change (the card's error note). */
@@ -78,12 +92,43 @@ const errorNote = (message) => {
 export const ProposalToolChips = ({ message, className }) => {
   const proposal = message.edit_suggestion || null;
   const failure = validationFailed(message) ? message.content : null;
-  const { summary, calls, changes } = useMemo(
-    () => buildToolChips({ toolCalls: message.tool_calls, proposal, failure }),
-    [message.tool_calls, proposal, failure],
-  );
+  const { summary, calls, changes } = useMemo(() => {
+    const run = buildToolChips({ toolCalls: message.tool_calls, proposal, failure });
+    return { ...run, calls: run.calls.map((call) => (OUTCOME_ICONS[call.outcome] ? { ...call, icon: OUTCOME_ICONS[call.outcome] } : call)) };
+  }, [message.tool_calls, proposal, failure]);
   if (!calls.length && !changes.length) return null;
   return <ToolChips summary={summary} calls={calls} changes={changes} className={className} />;
+};
+
+/**
+ * The pull request opened from this proposal (remembered in this browser):
+ * its number, linked, and a CI badge loaded once the card is seen, with a
+ * refresh button.
+ *
+ * @param {{ entry: object, repoName: string, visible: boolean }} props
+ */
+const PullRequestRow = ({ entry, repoName, visible }) => {
+  const { data, error, loading, refresh } = usePullRequestStatus({ repoName, prNumber: entry.pr_number, enabled: visible });
+  const label = data ? ciStateLabel(data.state) : error ? 'CI status unavailable' : 'Loading CI status';
+  const url = safeGithubUrl(entry.pr_url);
+  if (!url) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-[12.5px]" data-slot="proposal-pr">
+      <a href={url} target="_blank" rel="noreferrer noopener" className="inline-flex items-center gap-1 font-medium text-accent hover:underline">
+        <GitPullRequest className="h-3.5 w-3.5" aria-hidden="true" />
+        {entry.pr_number ? `PR #${entry.pr_number}` : 'Pull request'}
+        <ExternalLink className="h-3 w-3" aria-hidden="true" />
+      </a>
+      {(visible || data || error) && (
+        <span title={error ? error.message : data?.summary || undefined}>
+          <Badge tone={data ? ciStateTone(data.state) : 'neutral'} dot data-slot="proposal-ci">{label}</Badge>
+        </span>
+      )}
+      <Button size="icon-sm" variant="ghost" aria-label="Refresh CI status" loading={loading} disabled={!visible} onClick={() => { void refresh(); }}>
+        {!loading && <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />}
+      </Button>
+    </div>
+  );
 };
 
 /**
@@ -107,6 +152,8 @@ const EditProposalCard = ({ message }) => {
   const canDownload = files.length > 0 && files.every((file) => file.after != null);
   const reviewable = status === 'complete';
   const note = status === 'error' ? errorNote(message) : undefined;
+  const proposalId = proposal?.id || message.proposal_id || '';
+  const pullRequest = useSyncExternalStore(subscribePullRequests, () => pullRequestFor(proposalId));
 
   // A reply from history carries only its proposal's id. Load the proposal
   // once the reply comes into view, so its file chips and the card's note
@@ -130,6 +177,24 @@ const EditProposalCard = ({ message }) => {
     observer.observe(node);
     return () => observer.disconnect();
   }, [needsProposal, message.id, loadProposal]);
+
+  // The pull request's CI status is fetched once the card is seen.
+  const [seen, setSeen] = useState(false);
+  useEffect(() => {
+    const node = rootRef.current;
+    if (!pullRequest || seen || !node) return undefined;
+    if (typeof IntersectionObserver !== 'function') {
+      setSeen(true);
+      return undefined;
+    }
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      observer.disconnect();
+      setSeen(true);
+    }, { rootMargin: '200px 0px' });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [pullRequest, seen]);
 
   return (
     <div ref={rootRef} data-slot="proposal" className="mt-4 space-y-3">
@@ -167,6 +232,7 @@ const EditProposalCard = ({ message }) => {
           </div>
         )}
       </div>
+      {pullRequest && <PullRequestRow entry={pullRequest} repoName={pullRequest.repo_name || selectedRepo} visible={seen} />}
     </div>
   );
 };

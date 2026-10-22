@@ -1,8 +1,10 @@
 """Small NVIDIA NIM client boundary used by all model-backed query work."""
 
 import asyncio
+import logging
 import re
 import threading
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -11,12 +13,48 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpe
 
 from config import ModelConfigurationError, nvidia_rate_limiter, require_nvidia_api_key, settings
 
+logger = logging.getLogger(__name__)
+
 
 class LLMProviderError(RuntimeError):
     """A safe, user-facing failure from the configured model provider."""
 
 
+class LLMOutputTruncatedError(LLMProviderError):
+    """A structured reply hit ``max_tokens`` (finish_reason "length").
+
+    The JSON is cut off, so retrying the same request cannot help; the
+    editor answers with a plan to split the change instead.
+    """
+
+
+class _EmptyCompletion(LLMProviderError):
+    """A model returned no answer content; another model may still answer."""
+
+
 _THINKING_BLOCK = re.compile(r"<(?:think|analysis|reasoning)>.*?</(?:think|analysis|reasoning)>", re.IGNORECASE | re.DOTALL)
+# A closing tag without its opening tag: chat templates that open the
+# reasoning block in the prompt leave only "...reasoning</think>\n\nanswer" in
+# the reply, and one model printed a draft answer, a stray </think> and the
+# answer again. Such a tag ends a line (a newline or the end of the reply
+# follows it) and is not inside code; a tag in running text or in a code span
+# (an answer explaining these tags) is ordinary text.
+_STRAY_CLOSE_TAG = re.compile(r"</(?:think|analysis|reasoning)>", re.IGNORECASE)
+_LINE_END_AFTER_TAG = re.compile(r"[ \t]*(?:\r?\n|$)")
+
+
+def _inside_code(before: str) -> bool:
+    """Whether text ending with ``before`` is inside a fenced block or an inline code span."""
+    if before.count("```") % 2:
+        return True
+    line = before[before.rfind("\n") + 1:]
+    return line.count("`") % 2 == 1
+
+
+def _ends_reasoning(text: str, match: re.Match) -> bool:
+    return bool(_LINE_END_AFTER_TAG.match(text, match.end())) and not _inside_code(text[: match.start()])
+
+
 _CODE_EDIT_BLOCK = re.compile(r"<code_edit>\s*.*?</code_edit>", re.IGNORECASE | re.DOTALL)
 _FINAL_LABEL = re.compile(
     r"(?ims)^\s*(?:final(?:\s+(?:answer|response))?|assistant\s+response)\s*:\s*(.+)\Z"
@@ -67,8 +105,33 @@ def final_code_edit_block(content: str) -> str | None:
     and the last remaining block (written after any reasoning) is the final
     answer.
     """
+    return final_tagged_block(content, "code_edit")
+
+
+def strip_reasoning(content: str) -> str:
+    """Remove reasoning from model text: closed blocks, and text ended by an unpaired closing tag.
+
+    The reply is split at closing tags that end reasoning (see
+    ``_ends_reasoning``) and the last part with text is the answer, so
+    "draft</think>\n\nanswer" gives "answer" and "answer</think>" gives
+    "answer".
+    """
     visible = _THINKING_BLOCK.sub("", str(content or ""))
-    blocks = _CODE_EDIT_BLOCK.findall(visible)
+    ends = [match for match in _STRAY_CLOSE_TAG.finditer(visible) if _ends_reasoning(visible, match)]
+    if not ends:
+        return visible
+    bounds = [0, *[point for match in ends for point in (match.start(), match.end())], len(visible)]
+    segments = [visible[bounds[index]:bounds[index + 1]] for index in range(0, len(bounds), 2)]
+    return next((segment for segment in reversed(segments) if segment.strip()), "")
+
+
+def final_tagged_block(content: str, tag: str) -> str | None:
+    """Return the last ``<tag>...</tag>`` block outside reasoning, or None."""
+    visible = _THINKING_BLOCK.sub("", str(content or ""))
+    pattern = _CODE_EDIT_BLOCK if tag == "code_edit" else re.compile(
+        rf"<{re.escape(tag)}>\s*.*?</{re.escape(tag)}>", re.IGNORECASE | re.DOTALL
+    )
+    blocks = pattern.findall(visible)
     return blocks[-1].strip() if blocks else None
 
 
@@ -79,7 +142,7 @@ def user_facing_content(content: str) -> str:
     when thinking is disabled. It is not an answer and must never be saved to
     a user's conversation history.
     """
-    return _user_facing_answer(_THINKING_BLOCK.sub("", content))
+    return _user_facing_answer(strip_reasoning(content))
 
 
 def _user_facing_answer(visible: str) -> str:
@@ -114,9 +177,33 @@ def retry_delay(error: Exception, attempt: int) -> float:
     return min(30.0, settings.embedding_retry_base_seconds * (2 ** attempt))
 
 
+def _log_provider_failure(model_name: str, attempt: int, attempts: int, error: Exception) -> None:
+    """Log why an NVIDIA call failed: model, attempt, error class and HTTP status only.
+
+    Prompts, replies and keys are never logged, and neither is the provider's
+    message text (it can echo request content).
+    """
+    status = getattr(error, "status_code", None)
+    request_id = None
+    response = getattr(error, "response", None)
+    if response is not None:
+        try:
+            request_id = response.headers.get("nvcf-reqid") or response.headers.get("x-request-id")
+        except Exception:
+            request_id = None
+    cause = error.__cause__
+    logger.warning(
+        "NVIDIA call failed: model=%s attempt=%d/%d error=%s%s%s%s",
+        model_name, attempt + 1, attempts, type(error).__name__,
+        f" http_status={status}" if status is not None else "",
+        f" cause={type(cause).__name__}" if cause is not None else "",
+        f" request_id={request_id}" if request_id else "",
+    )
+
+
 def _can_try_fallback(error: Exception) -> bool:
-    """Allow a configured fallback for outages and retired model IDs only."""
-    if is_transient_provider_error(error):
+    """Allow a configured fallback for outages, empty replies and retired model IDs only."""
+    if isinstance(error, _EmptyCompletion) or is_transient_provider_error(error):
         return True
     return isinstance(error, APIStatusError) and error.status_code in {404, 410}
 
@@ -129,14 +216,25 @@ async def complete(
     max_tokens: int | None = None,
     fallback_models: list[str] | None = None,
     retry_attempts: int | None = None,
-    structured_output: bool = False,
+    structured_output: bool | str = False,
+    timeout: float | None = None,
+    deadline: float | None = None,
 ) -> str:
     """Return final answer content while intentionally discarding private reasoning.
 
     ``fallback_models`` is intentionally opt-in. The normal answer path keeps
     one deterministic model, while code editing can fail over to another
     allow-listed NVIDIA catalog model when a free endpoint is busy, retired, or
-    temporarily unavailable.
+    temporarily unavailable, or when it returns no content at all.
+
+    ``structured_output`` (True for ``<code_edit>``, or another tag name)
+    returns the last tagged block outside reasoning; without one, the visible
+    reply is returned for the caller's parser to judge. A structured reply
+    that stops at ``max_tokens`` raises ``LLMOutputTruncatedError``.
+    ``timeout`` overrides the provider timeout for this call only.
+    ``deadline`` (a ``time.monotonic()`` value) bounds every attempt,
+    fallback models included: an attempt gets at most the time left, and no
+    attempt starts with less than 5 s left.
     """
     api_key = require_nvidia_api_key()
     # Validate configuration before entering the retry loop, then reuse the
@@ -147,18 +245,29 @@ async def complete(
     last_error: Exception | None = None
     model_names = list(dict.fromkeys([model or settings.nemotron_model, *(fallback_models or [])]))
     attempts = max(1, int(retry_attempts or settings.answer_retry_attempts))
+    tag = "code_edit" if structured_output is True else (str(structured_output) if structured_output else "")
+    token_limit = max_tokens or settings.answer_max_tokens
     try:
         for model_index, model_name in enumerate(model_names):
             for attempt in range(attempts):
+                call_timeout = timeout
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining < 5:
+                        if last_error is None:
+                            last_error = APITimeoutError(request=httpx.Request("POST", settings.nvidia_base_url))
+                        logger.warning("NVIDIA call skipped: model=%s, the edit deadline has passed", model_name)
+                        break
+                    call_timeout = min(float(timeout), remaining) if timeout else remaining
                 try:
                     await nvidia_rate_limiter.acquire()
-                    response = await client.chat.completions.create(
-                        model=model_name,
-                        messages=messages,
-                        temperature=0.1,
-                        top_p=0.95,
-                        max_tokens=max_tokens or settings.answer_max_tokens,
-                        extra_body={
+                    request: dict[str, Any] = {
+                        "model": model_name,
+                        "messages": messages,
+                        "temperature": 0.1,
+                        "top_p": 0.95,
+                        "max_tokens": token_limit,
+                        "extra_body": {
                             "chat_template_kwargs": {
                                 "enable_thinking": (
                                     settings.nvidia_enable_thinking if enable_thinking is None else enable_thinking
@@ -166,27 +275,54 @@ async def complete(
                                 "force_nonempty_content": True,
                             },
                         },
-                    )
+                    }
+                    if call_timeout:
+                        request["timeout"] = float(call_timeout)
+                    response = await client.chat.completions.create(**request)
                     if not response.choices:
-                        raise LLMProviderError("NVIDIA returned an empty completion.")
-                    content = response.choices[0].message.content
+                        raise _EmptyCompletion("NVIDIA returned an empty completion.")
+                    choice = response.choices[0]
+                    content = choice.message.content
+                    if tag and getattr(choice, "finish_reason", None) == "length":
+                        logger.warning("NVIDIA reply truncated: model=%s max_tokens=%d", model_name, token_limit)
+                        raise LLMOutputTruncatedError(
+                            f"The reply reached the {token_limit:,}-token output limit before it was complete."
+                        )
                     if not isinstance(content, str) or not content.strip():
-                        raise LLMProviderError("NVIDIA returned a completion without answer content.")
-                    if structured_output:
-                        structured = final_code_edit_block(content)
+                        raise _EmptyCompletion("NVIDIA returned a completion without answer content.")
+                    if tag:
+                        structured = final_tagged_block(content, tag)
                         if structured:
                             # Code editing consumes only the machine-readable
                             # patch. Any model reasoning or wrapper prose is
                             # discarded before exact-source validation.
                             return structured
+                        visible = strip_reasoning(content).strip()
+                        if not visible:
+                            raise _EmptyCompletion("NVIDIA returned a completion without answer content.")
+                        # No tagged block: the caller's parser reports exactly
+                        # what is missing, which a repair request can name.
+                        return visible
                     return user_facing_content(content)
+                except _EmptyCompletion as error:
+                    # An empty reply is transient for this model: try the
+                    # next configured model instead of failing the request.
+                    _log_provider_failure(model_name, attempt, attempts, error)
+                    last_error = error
+                    break
                 except LLMProviderError:
                     raise
                 except Exception as error:
+                    _log_provider_failure(model_name, attempt, attempts, error)
                     last_error = error
                     # A retired or invalid model will never recover by
                     # retrying. Switch to the configured fallback immediately.
                     if isinstance(error, APIStatusError) and error.status_code in {404, 410}:
+                        break
+                    # A call that already used its whole (long, explicit)
+                    # timeout would only time out again: go to the fallback
+                    # instead of waiting for it several more times.
+                    if (timeout or deadline is not None) and isinstance(error, APITimeoutError):
                         break
                     if not _can_try_fallback(error) or attempt == attempts - 1:
                         break
@@ -196,6 +332,8 @@ async def complete(
             if model_index < len(model_names) - 1 and not _can_try_fallback(last_error or Exception()):
                 break
 
+        if isinstance(last_error, _EmptyCompletion):
+            raise LLMProviderError(str(last_error)) from last_error
         if isinstance(last_error, APITimeoutError):
             raise LLMProviderError("NVIDIA timed out while generating the answer after retries.") from last_error
         if isinstance(last_error, APIConnectionError):
@@ -228,6 +366,20 @@ def _partial_tag_pattern(tags: tuple[str, ...]) -> re.Pattern[str]:
 
 _PARTIAL_OPEN_TAG = _partial_tag_pattern(_REASONING_OPEN_TAGS)
 _PARTIAL_CLOSE_TAG = _partial_tag_pattern(_REASONING_CLOSE_TAGS)
+_PARTIAL_ANY_TAG = _partial_tag_pattern(_REASONING_OPEN_TAGS + _REASONING_CLOSE_TAGS)
+_REASONING_ANY_TAG = re.compile("|".join(map(re.escape, _REASONING_OPEN_TAGS + _REASONING_CLOSE_TAGS)), re.IGNORECASE)
+
+
+class AnswerRestart(str):
+    """Yielded by stream_complete() when text already shown turned out to be reasoning.
+
+    A closing reasoning tag without its opening tag means everything before
+    it was reasoning (a draft answer, in one model's case). Consumers discard
+    what they showed so far; the real answer follows.
+    """
+
+
+ANSWER_RESTART = AnswerRestart("")
 _LONGEST_PARTIAL_TAG = max(map(len, _REASONING_OPEN_TAGS + _REASONING_CLOSE_TAGS)) - 1
 
 # The opening of an answer is held back until it is long enough to recognise
@@ -366,6 +518,16 @@ class StreamingContentFilter:
         self._held_whitespace = ""
         self._released_text = False
         self._finished = False
+        # Text released since the last restart, the text a stray closing tag
+        # discarded, and whether the consumer must discard what it showed.
+        self._shown = ""
+        self._discarded = ""
+        self._restarted = False
+
+    def take_restart(self) -> bool:
+        """True once after a stray closing tag discarded text that was already shown."""
+        restarted, self._restarted = self._restarted, False
+        return restarted
 
     def feed(self, text: str) -> str:
         """Return the part of the answer that is safe to show now."""
@@ -386,7 +548,11 @@ class StreamingContentFilter:
         self._finished = True
         # A partial opening tag at the very end was ordinary text. Anything
         # still inside a reasoning block was never closed and stays private.
+        # A closing tag that ends the reply ends reasoning: it is dropped, and
+        # the text before it stays the answer (like strip_reasoning()).
         visible = "" if self._inside_reasoning else self._raw_tail
+        if _STRAY_CLOSE_TAG.match(visible) and not visible[_STRAY_CLOSE_TAG.match(visible).end():].strip():
+            visible = ""
         self._raw_tail = ""
         if self._mode == _STREAMING:
             released = self._release(visible)
@@ -396,6 +562,10 @@ class StreamingContentFilter:
         # rules complete() applies, including "Final answer:" extraction.
         text = self._visible + visible
         self._visible = ""
+        if not text.strip() and self._discarded.strip():
+            # A stray closing tag ended the reply: like strip_reasoning(), the
+            # text before it is the answer when nothing follows it.
+            text = self._discarded
         if not text.strip():
             return ""
         return _user_facing_answer(text)
@@ -420,17 +590,50 @@ class StreamingContentFilter:
                 data = data[closing.end():]
                 self._inside_reasoning = False
             else:
-                opening = _REASONING_OPEN_TAG.search(data)
-                if opening is None:
-                    held = _partial_tag_length(data, _PARTIAL_OPEN_TAG)
+                tag = _REASONING_ANY_TAG.search(data)
+                if tag is None:
+                    held = _partial_tag_length(data, _PARTIAL_ANY_TAG)
                     visible.append(data[: len(data) - held])
                     self._raw_tail = data[len(data) - held:]
                     return "".join(visible)
-                visible.append(data[: opening.start()])
-                data = data[opening.end():]
-                self._inside_reasoning = True
+                visible.append(data[: tag.start()])
+                if tag.group(0).startswith("</"):
+                    rest = data[tag.end():]
+                    following = rest.lstrip(" \t")
+                    before = self._shown + self._held_whitespace + self._visible + "".join(visible)
+                    if _inside_code(before):
+                        visible.append(tag.group(0))
+                    elif not following:
+                        # Whether it ends a line is known only once more text
+                        # (or the end of the reply) arrives.
+                        self._raw_tail = data[tag.start():]
+                        return "".join(visible)
+                    elif following[0] in "\r\n":
+                        # A closing tag without its opening tag that ends a
+                        # line: everything before it, shown or held, was
+                        # reasoning.
+                        self._discard_visible("".join(visible))
+                        visible = []
+                    else:
+                        visible.append(tag.group(0))
+                    data = rest
+                else:
+                    data = data[tag.end():]
+                    self._inside_reasoning = True
         self._raw_tail = ""
         return "".join(visible)
+
+    def _discard_visible(self, pending: str) -> None:
+        """Forget the answer so far after a stray closing tag and start over."""
+        self._discarded = self._shown + self._held_whitespace + self._visible + pending
+        if self._shown:
+            self._restarted = True
+        self._shown = ""
+        self._visible = ""
+        self._answer_start = None
+        self._held_whitespace = ""
+        self._released_text = False
+        self._mode = _HOLDING
 
     def _decide_prefix(self) -> str:
         """Choose between streaming and capturing once the answer opening is known."""
@@ -477,6 +680,7 @@ class StreamingContentFilter:
         self._held_whitespace = text[len(body):]
         if body:
             self._released_text = True
+            self._shown += body
         return body
 
 
@@ -609,6 +813,10 @@ async def stream_complete(
             try:
                 async for chunk in stream:
                     safe_text = content_filter.feed(_chunk_content(chunk))
+                    if content_filter.take_restart():
+                        # Text already shown was reasoning (a stray closing
+                        # tag followed it): the consumer discards it.
+                        yield ANSWER_RESTART
                     if safe_text:
                         yielded = True
                         yield safe_text
@@ -626,6 +834,7 @@ async def stream_complete(
         except LLMProviderError:
             raise
         except Exception as error:
+            _log_provider_failure(model_name, attempt, attempts, _as_sdk_error(error, stream))
             if yielded:
                 raise LLMProviderError("The answer stream was interrupted.") from error
             last_error = _as_sdk_error(error, stream)

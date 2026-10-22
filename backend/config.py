@@ -14,15 +14,13 @@ class Settings(BaseSettings):
     # active parameters than Ultra while retaining long-context coding support.
     nemotron_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b"
     detailed_nemotron_model: str = "nvidia/nemotron-3-ultra-550b-a55b"
-    # Dedicated code-review model. Qwen2.5-Coder is served through the same
-    # OpenAI-compatible NVIDIA endpoint and is trained specifically for code
-    # generation, reasoning, and fixing. Keep a second free catalog model as
-    # a provider-side fallback when the primary endpoint is unavailable.
-    # Use models confirmed available to the configured NVIDIA account. The
-    # Super model is trained for coding and long-context agentic work; the
-    # Lightning model is a smaller fallback when the primary is busy.
-    code_editing_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b"
-    code_editing_fallback_model: str = "nvidia/nemotron-3.5-lightning-30b-a3b"
+    # Code editing (plan, patch, self-review). Measured on live ky edits:
+    # Ultra produced and applied 4/4 edits with 3/4 accepted, Super VL 2/4
+    # accepted, and Lightning scored worst and often returned empty content,
+    # so Super VL is the fallback when the Ultra endpoint is unavailable.
+    # Ultra emits about 67 tokens/s on the hosted endpoint (Super VL ~100).
+    code_editing_model: str = "nvidia/nemotron-3-ultra-550b-a55b"
+    code_editing_fallback_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b"
     embedding_model: str = "nvidia/nemotron-3-embed-1b"
     embedding_dimension: int = 2048
     # Multi-file edits can generate several thousand tokens in one request.
@@ -45,10 +43,47 @@ class Settings(BaseSettings):
     code_editing_enable_thinking: bool = False
     # Multi-file patches are JSON with exact search/replace hunks. A small
     # output budget truncates the JSON and makes every non-trivial edit fail
-    # validation, so the editor gets a generous ceiling.
-    code_editing_answer_max_tokens: int = 8_192
+    # validation, so the editor gets a generous ceiling. The hosted endpoint
+    # was measured emitting 23.9k tokens in one completion; 16k covers eight
+    # modified files plus a created test file.
+    code_editing_answer_max_tokens: int = 16_384
     code_editing_plan_max_tokens: int = 1_500
     code_editing_retry_attempts: int = 3
+    # Editing calls only, and only the ceiling: each patch call gets an
+    # output budget sized to the files it may change (at least 4,096
+    # tokens) and a timeout sized to that budget at a conservative
+    # 40 tokens/s plus 30 s, so a doomed generation for one small file
+    # stops after about two minutes instead of five.
+    code_editing_timeout_seconds: float = 300.0
+    # Wall-clock budget for one whole edit (plan, patch, repair). A repair
+    # round is not started when less than 30 s of it is left, and every
+    # model call (fallback model included) ends by this deadline.
+    editing_deadline_seconds: float = 300.0
+    # One verification-first review call after the deterministic quality
+    # gates. Its fixes are applied only when they address a numbered
+    # automatic finding or quote the wrong code, and they are re-checked.
+    editing_self_review: bool = True
+    # One file, one hunk of at most this many changed lines, and every
+    # deterministic check passing: the review is skipped (0 never skips).
+    editing_review_trivial_lines: int = 8
+    editing_review_max_tokens: int = 4_096
+    # Measured review latencies on live ky edits: Super VL 4.8-32.7 s (n=9,
+    # median 9.3 s; the two runs that reached the old 90 s limit returned
+    # nothing), Ultra 12.8-26.5 s (n=5). 45 s covers every completed review
+    # with margin and halves the worst-case wait.
+    editing_review_timeout_seconds: float = 45.0
+    # The review is skipped when the edit itself already took this long.
+    editing_review_deadline_seconds: float = 240.0
+    # A rename's usages beyond the model-written files are updated by the
+    # exact rename codemod; at most this many files in total.
+    editing_max_mechanical_files: int = 20
+    # Files one pull request may change (20 mechanical + 3 new + 1).
+    github_max_pr_files: int = 24
+    # Per-file syntax check ceiling (memory on the 512 MB instance).
+    syntax_check_max_bytes: int = 1_000_000
+    # Native esbuild binary for exact JS/TS/CSS parsing; empty auto-detects
+    # frontend/node_modules/@esbuild/<os>-<arch>/bin/esbuild. "off" disables.
+    esbuild_path: str = ""
     # Interactive answers fail fast enough to keep the chat responsive. Long
     # embedding jobs retain their separate retry budget below.
     answer_retry_attempts: int = 2
@@ -182,7 +217,9 @@ class Settings(BaseSettings):
     # Editing requests need more source than ordinary answers. The retrieval
     # layer keeps this bounded and prioritises complete target files; the
     # larger budget prevents a valid hunk from being cut at a chunk boundary.
-    editing_context_characters: int = 120_000
+    # About 60k tokens: a 93k-token prompt was measured answering in 7.2 s
+    # and finding a needle in the middle, so more large files are shown whole.
+    editing_context_characters: int = 240_000
     retrieval_top_k: int = 8
     editing_retrieval_top_k: int = 32
     # At most this many complete files are handed to the code model. Related
@@ -291,7 +328,8 @@ def get_answer_model_options(profile: str, workflow: str = "general") -> tuple[s
             "mistralai/codestral-22b-instruct-v0.1",
             "deepseek-ai/deepseek-coder-6.7b-instruct",
         }
-        code_model = settings.code_editing_model if settings.code_editing_model not in unavailable_ids else "nvidia/nemotron-3.5-super-vl-120b-a12b"
+        code_model = (settings.code_editing_model if settings.code_editing_model not in unavailable_ids
+                      else Settings.model_fields["code_editing_model"].default)
         return (
             _current_chat_model(code_model),
             settings.code_editing_enable_thinking,
@@ -304,6 +342,23 @@ def get_answer_model_options(profile: str, workflow: str = "general") -> tuple[s
             settings.detailed_answer_max_tokens,
         )
     return _current_chat_model(settings.nemotron_model), settings.nvidia_enable_thinking, settings.answer_max_tokens
+
+
+def get_code_editing_fallback_model() -> str:
+    """The editing fallback model (retired IDs remapped), or "" when none is configured."""
+    fallback = (settings.code_editing_fallback_model or "").strip()
+    return _current_chat_model(fallback) if fallback else ""
+
+
+def get_alternate_chat_model(profile: str) -> str:
+    """The other configured chat model for a question (fast <-> detailed), or "" when it is the same.
+
+    A question whose model fails is tried once on the other configured chat
+    model before the evidence-only answer is returned.
+    """
+    primary = get_answer_model_options(profile)[0]
+    other = get_answer_model_options("fast" if profile == "detailed" else "detailed")[0]
+    return other if other and other != primary else ""
 
 
 class RateLimiter:

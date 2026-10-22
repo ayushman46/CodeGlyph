@@ -193,5 +193,9 @@ export const getGithubFile = (repoName, filePath, editTicket = '', config = {}) 
   });
 };
 export const pushGithubPR = (payload) => api.post('/github/push-pr', payload, { timeout: 180000 });
+/** CI checks and merge readiness of a pull request opened from a proposal. */
+export const getPullRequestStatus = (repoName, prNumber, config = {}) => api.get(
+  '/github/pr-status', { params: { repo_name: repoName, pr_number: prNumber }, ...config },
+);
 
 export default api;
