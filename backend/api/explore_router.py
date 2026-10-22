@@ -5,10 +5,10 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from agent.code_edit import CodeEditValidationError, normalise_repository_path
 from agent.editor import language_for, reconstruct_indexed_file
@@ -809,11 +809,41 @@ async def repository_search(
         _handle(error, "search the code")
 
 
+# A file at a commit SHA never changes, so its GitHub text is cached in
+# memory: opening the same file again (a citation, then "open file", then a
+# preview) no longer waits on raw.githubusercontent.com each time. Bounded by
+# total size so a 512 MB instance stays safe.
+_RAW_FILE_CACHE: OrderedDict[tuple[str, str, str, str], str] = OrderedDict()
+_RAW_FILE_CACHE_MAX_BYTES = 16 * 1024 * 1024
+_raw_file_cache_bytes = 0
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def _cached_raw_file(key: tuple[str, str, str, str]) -> str | None:
+    text = _RAW_FILE_CACHE.get(key)
+    if text is not None:
+        _RAW_FILE_CACHE.move_to_end(key)
+    return text
+
+
+def _cache_raw_file(key: tuple[str, str, str, str], text: str) -> None:
+    global _raw_file_cache_bytes
+    size = len(text)
+    if size > _RAW_FILE_CACHE_MAX_BYTES // 4 or key in _RAW_FILE_CACHE:
+        return
+    _RAW_FILE_CACHE[key] = text
+    _raw_file_cache_bytes += size
+    while _raw_file_cache_bytes > _RAW_FILE_CACHE_MAX_BYTES and _RAW_FILE_CACHE:
+        _old_key, old_text = _RAW_FILE_CACHE.popitem(last=False)
+        _raw_file_cache_bytes -= len(old_text)
+
+
 @router.get("/repos/{repo_name}/file")
 async def repository_file(
     repo_name: str,
     path: str = Query(min_length=1, max_length=500),
     current_user=Depends(get_current_user),
+    response: Response = None,
 ):
     """Return one indexed file at the indexed commit (GitHub raw, else the index)."""
     try:
@@ -855,12 +885,20 @@ async def repository_file(
         truncated = False
         total_lines: int | None = None
         exact = True
-        if owner and name:
+        pinned = bool(_COMMIT_SHA.fullmatch(ref))
+        cache_key = (owner, name, ref, clean_path)
+        if owner and name and pinned:
+            cached = _cached_raw_file(cache_key)
+            if cached is not None:
+                content, source = cached, "github"
+        if owner and name and content is None:
             try:
                 data = await fetch_raw_file(owner, name, clean_path, ref=ref, max_bytes=_FILE_VIEW_MAX_BYTES)
                 if data is not None:
                     content = data.decode("utf-8", errors="replace")
                     source = "github"
+                    if pinned:
+                        _cache_raw_file(cache_key, content)
             except GitHubAPIError as error:
                 logger.info("Raw file view fell back to the index for %s: %s", clean_path, error)
             except Exception:
@@ -872,6 +910,9 @@ async def repository_file(
             total_lines = view["total_lines"] or None
             exact = view["exact"]
         line_count = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
+        if pinned and source == "github" and response is not None:
+            # Same commit, same bytes: the browser may reuse it for this user.
+            response.headers["Cache-Control"] = "private, max-age=3600"
         return {
             "path": clean_path,
             "content": content,

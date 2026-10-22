@@ -1221,18 +1221,62 @@ async def query_repo_stream(req: QueryRequest, current_user=Depends(get_current_
     )
 
 
+def _history_citations(citations) -> list:
+    """Citations for a stored answer without the cited code itself.
+
+    The code text is ~95% of a stored answer (about 35 KB each) and the UI
+    only needs it for a hover preview, which already fetches the file when a
+    citation carries no excerpt. Everything else the UI shows is kept.
+    """
+    if not isinstance(citations, list):
+        return []
+    return [
+        {key: value for key, value in citation.items() if key != "content"}
+        if isinstance(citation, dict) else citation
+        for citation in citations
+    ]
+
+
+def _history_cursor(message: dict) -> str:
+    return f"{message.get('created_at') or ''}|{message.get('id') or ''}"
+
+
 @router.get("/conversations/{repo_name}")
-async def get_conversation(repo_name: str, limit: int = Query(default=100, ge=1, le=200), current_user=Depends(get_current_user)):
+async def get_conversation(
+    repo_name: str,
+    limit: int = Query(default=100, ge=1, le=200),
+    before: str | None = Query(default=None, max_length=200),
+    current_user=Depends(get_current_user),
+):
+    """Newest `limit` messages, oldest first; `before` pages back through older ones.
+
+    `before` is the `next_before` cursor of the previous page. The response
+    says whether older messages exist so the client can load them on demand.
+    """
     try:
         await assert_turso_schema()
         store = get_turso_store()
         repo = await get_owned_repo(store, repo_name, current_user.id)
-        messages = await store.fetch_all(
+        where, params = "repo_id = ? AND user_id = ?", [repo["id"], current_user.id]
+        if before:
+            created_at, _, message_id = before.partition("|")
+            where += " AND (created_at < ? OR (created_at = ? AND id < ?))"
+            params += [created_at, created_at, message_id]
+        rows = await store.fetch_all(
             "SELECT id, role, content, citations, tool_calls, mode, latency_ms, created_at "
-            "FROM chat_messages WHERE repo_id = ? AND user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
-            [repo["id"], current_user.id, limit],
+            f"FROM chat_messages WHERE {where} ORDER BY created_at DESC, id DESC LIMIT ?",
+            [*params, limit + 1],
         )
-        return {"messages": list(reversed(messages))}
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        for message in page:
+            message["citations"] = _history_citations(message.get("citations"))
+        messages = list(reversed(page))
+        return {
+            "messages": messages,
+            "has_more": has_more,
+            "next_before": _history_cursor(messages[0]) if has_more and messages else None,
+        }
     except HTTPException:
         raise
     except DatabaseConfigurationError as error:

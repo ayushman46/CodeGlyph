@@ -877,9 +877,50 @@ class ConversationEndpointTests(EndpointTestCase):
         self.assertEqual(self.chat_rows(), [])
         self.assertEqual(len(self.chat_rows("repo-gadgets")), 1)
         self.assertEqual(len(self.chat_rows("repo-other", OTHER)), 1)
-        self.assertEqual(self.client.get(f"/api/conversations/{REPO_NAME}").json(), {"messages": []})
+        self.assertEqual(self.client.get(f"/api/conversations/{REPO_NAME}").json(), {"messages": [], "has_more": False, "next_before": None})
 
         self.assertEqual(self.client.delete("/api/conversations/unknown").status_code, 404)
+
+    def test_history_pages_back_without_gaps_and_omits_cited_code(self):
+        import json as _json
+        rows = []
+        for index in range(7):
+            # Two pairs share a timestamp, so ordering must fall back to the id.
+            created = f"2026-10-01T09:00:{index // 2:02d}+00:00"
+            message_id = f"m{index:02d}"
+            citations = [{"file_path": "src/a.ts", "start_line": 1, "end_line": 3, "content": "x" * 5000, "cited_in_answer": True}]
+            run(self.store.execute(
+                "INSERT INTO chat_messages (id, repo_id, user_id, role, content, citations, tool_calls, mode, latency_ms, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [message_id, REPO_ID, USER, "assistant" if index % 2 else "user", f"message {index}",
+                 _json.dumps(citations if index % 2 else []), "[]", None, None, created],
+            ))
+            rows.append((created, message_id))
+        expected = [message_id for _created, message_id in sorted(rows)]
+
+        seen, before, pages = [], None, 0
+        while True:
+            params = {"limit": 3, **({"before": before} if before else {})}
+            body = self.client.get(f"/api/conversations/{REPO_NAME}", params=params).json()
+            pages += 1
+            ids = [message["id"] for message in body["messages"]]
+            self.assertEqual(ids, sorted(ids, key=lambda value: dict((m, c) for c, m in rows)[value] + value))
+            seen = ids + seen
+            for message in body["messages"]:
+                for citation in message["citations"]:
+                    self.assertNotIn("content", citation)
+                    self.assertEqual(citation["file_path"], "src/a.ts")
+            if not body["has_more"]:
+                self.assertIsNone(body["next_before"])
+                break
+            before = body["next_before"]
+        self.assertEqual(pages, 3)
+        self.assertEqual(seen, expected)
+
+        # Without a cursor the newest page comes back, as before.
+        newest = self.client.get(f"/api/conversations/{REPO_NAME}", params={"limit": 2}).json()
+        self.assertEqual([message["id"] for message in newest["messages"]], expected[-2:])
+        self.assertTrue(newest["has_more"])
 
 
 class GitHubFileEndpointTests(EndpointTestCase):

@@ -84,7 +84,26 @@ const remarkStreamingCaret = () => (tree) => {
   });
 };
 
-const REMARK_PLUGINS = [remarkGfm];
+// Finished answers mount again each time the chat tab or the repository is
+// reopened, and parsing was most of their render time. A finished answer's
+// text never changes, so its syntax tree is kept and a copy handed out (the
+// steps after parsing rewrite the tree in place). Bounded: long answers make
+// trees of tens of kilobytes.
+const PARSED_ANSWERS_MAX = 80;
+const parsedAnswers = new Map();
+function remarkCachedParse() {
+  const parse = this.parser;
+  this.parser = (document, file) => {
+    let tree = parsedAnswers.get(document);
+    if (tree) parsedAnswers.delete(document);
+    else tree = parse(document, file);
+    parsedAnswers.set(document, tree);
+    if (parsedAnswers.size > PARSED_ANSWERS_MAX) parsedAnswers.delete(parsedAnswers.keys().next().value);
+    return structuredClone(tree);
+  };
+}
+
+const REMARK_PLUGINS = [remarkGfm, remarkCachedParse];
 const REMARK_PLUGINS_STREAMING = [remarkGfm, remarkStreamingCaret];
 
 /** A citation's GitHub permalink (pinned commit), kept for modified clicks. */
@@ -426,6 +445,9 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
   const setComposerDraft = useStore((state) => state.setComposerDraft);
   const isQuerying = useStore((state) => state.isQuerying);
   const isUser = message.role === 'user';
+  // Only a question asked now (and its reply) rises in. History renders in
+  // place: a page of 30 older messages animating at once is a visible stall.
+  const [entering] = useState(() => Boolean(message.live || message.streaming));
   const editRun = isEditRun(message);
   // The conversation's length matters only while this reply streams in.
   const messageCount = useStore((state) => (!isUser && message.streaming ? state.messages.length : 0));
@@ -541,7 +563,7 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
 
   if (isUser) {
     return (
-      <div data-slot="message" data-from="user" className="group flex flex-col items-end animate-rise">
+      <div data-slot="message" data-from="user" className={`group flex flex-col items-end ${entering ? 'animate-rise' : ''}`}>
         <div data-slot="message-content" className="max-w-[min(42rem,88%)] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-ink px-4 py-2.5 text-[14.5px] leading-relaxed text-canvas">
           {message.content}
         </div>
@@ -576,7 +598,7 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
   const showArtifact = editRun && (message.streaming || hasProposal || (!isError && !stoppedEmpty));
 
   return (
-    <div data-slot="message" data-from="assistant" className="flex gap-3 animate-rise">
+    <div data-slot="message" data-from="assistant" className={`flex gap-3 ${entering ? 'animate-rise' : ''}`}>
       <div className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg ${isError ? 'bg-danger-soft text-danger' : 'bg-accent-soft text-accent'}`} aria-hidden="true">
         {isError ? <AlertTriangle className="h-3.5 w-3.5" /> : <Sparkles className="h-3.5 w-3.5" />}
       </div>

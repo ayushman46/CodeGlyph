@@ -604,6 +604,43 @@ class ExploreTests(DatabaseCase):
         self.assertFalse(full["truncated"])
         self.assertEqual(full["line_count"], 4_500)
 
+    async def test_commit_pinned_github_file_is_fetched_once_and_marked_cacheable(self):
+        import api.explore_router as explore
+        from fastapi import Response
+        await self.add_chunks("repo-1", "p-", "app/pinned.py", 1, content="X = 1")
+        fetch = AsyncMock(return_value=b"X = 1\n")
+        p = self.patches()
+        explore._RAW_FILE_CACHE.clear()
+        explore._raw_file_cache_bytes = 0
+        try:
+            # The fixture snapshot is a short SHA: never cached, no cache header.
+            with p[0], p[1], patch.object(explore, "fetch_raw_file", fetch):
+                first = Response()
+                await explore.repository_file("Hello-World", "app/pinned.py", self.user, first)
+                await explore.repository_file("Hello-World", "app/pinned.py", self.user, Response())
+            self.assertEqual(fetch.await_count, 2)
+            self.assertNotIn("cache-control", first.headers)
+            sha = "a" * 40
+            await self.store.execute("UPDATE repo_snapshots SET commit_sha = ? WHERE repo_id = ?", [sha, "repo-1"])
+            fetch.reset_mock()
+            with p[0], p[1], patch.object(explore, "fetch_raw_file", fetch):
+                responses = [Response(), Response()]
+                views = [await explore.repository_file("Hello-World", "app/pinned.py", self.user, r) for r in responses]
+            fetch.assert_awaited_once()
+            self.assertEqual(fetch.await_args.kwargs["ref"], sha)
+            self.assertTrue(all(view["content"] == "X = 1\n" and view["source"] == "github" for view in views))
+            self.assertTrue(all(r.headers["cache-control"] == "private, max-age=3600" for r in responses))
+            # The cache is bounded by size, oldest first.
+            with patch.object(explore, "_RAW_FILE_CACHE_MAX_BYTES", 40):
+                for index in range(5):
+                    explore._cache_raw_file(("o", "n", sha, f"f{index}"), "y" * 10)
+                self.assertLessEqual(explore._raw_file_cache_bytes, 40)
+                self.assertNotIn(("o", "n", sha, "f0"), explore._RAW_FILE_CACHE)
+                self.assertIn(("o", "n", sha, "f4"), explore._RAW_FILE_CACHE)
+        finally:
+            explore._RAW_FILE_CACHE.clear()
+            explore._raw_file_cache_bytes = 0
+
     async def test_hidden_refresh_rows_are_not_served(self):
         await self.add_chunks("repo-1", "old-", "app/core.py", 1, content="OLD = 1")
         await pipeline.begin_index_run(self.store, "repo-1", "job-1", "new-")

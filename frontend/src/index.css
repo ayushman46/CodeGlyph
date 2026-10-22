@@ -73,8 +73,12 @@
   --ease-emphasized: cubic-bezier(0.2, 0.7, 0.2, 1);
   --ease-exit: cubic-bezier(0.4, 0, 1, 1);
 
-  --animate-fade-in: fade-in var(--duration-base) ease-out both;
-  --animate-rise: rise var(--duration-slow) var(--ease-emphasized) both;
+  /* `backwards`, not `both`: the end state is the element's own style, so a
+     finished animation drops its effect instead of leaving a transform (and a
+     compositor property node) on every message for the life of the page. */
+  --animate-fade-in: fade-in var(--duration-base) ease-out backwards;
+  --animate-rise: rise var(--duration-slow) var(--ease-emphasized) backwards;
+  --animate-pop: pop 220ms var(--ease-emphasized) backwards;
   --animate-blink: blink 1s steps(2, start) infinite;
   --animate-shimmer: shimmer 1.6s linear infinite;
 
@@ -85,6 +89,10 @@
   @keyframes rise {
     from { opacity: 0; transform: translateY(6px); }
     to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes pop {
+    from { opacity: 0; transform: scale(0.6); }
+    to { opacity: 1; transform: scale(1); }
   }
   @keyframes blink {
     to { visibility: hidden; }

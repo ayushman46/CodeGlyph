@@ -3,7 +3,7 @@ import {
   forwardRef, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState,
 } from 'react';
 import {
-  DEFAULT_FOLLOW_THRESHOLD, RAIL_INSET, SMOOTH_SCROLL_POLL_MS, SMOOTH_SCROLL_SETTLE_MS, centeredScrollTop,
+  DEFAULT_FOLLOW_THRESHOLD, OPENING_SETTLE_MS, RAIL_INSET, SMOOTH_SCROLL_POLL_MS, SMOOTH_SCROLL_SETTLE_MS, centeredScrollTop,
   describeRailMessages, distanceFromEnd, fitRailItemSize, isLeaveLiveEdgeKey, isRailOverflowing, normalizeMessageText,
   pickActiveRailId, railItemsEqual, smoothScrollSettled, tickScale,
 } from '../../lib/ai/messageScroller';
@@ -338,15 +338,17 @@ export function PreviewRail({
           const highlighted = item.id === highlightedId;
           const scale = tickScale(index, displayedIndex, highlighted);
           const itemContent = (
-            <motion.span
+            <span
               data-slot="preview-rail-tick"
               aria-hidden="true"
-              animate={isHorizontal ? { scaleY: scale } : { scaleX: scale }}
-              transition={reduce ? { duration: 0 } : SPRING_LAYOUT}
+              // A CSS transition, not a spring: the rail has a tick per
+              // message, and a motion value each made every new page of
+              // history (and every hover) diff a hundred animations.
+              style={{ transform: isHorizontal ? `scaleY(${scale})` : `scaleX(${scale})` }}
               // forced-colors: the UA repaints backgrounds as Canvas, which
               // would erase the ticks; CanvasText keeps them drawn.
               className={cn(
-                'block bg-current forced-colors:bg-[color:CanvasText]',
+                'block bg-current forced-colors:bg-[color:CanvasText] motion-safe:transition-transform motion-safe:duration-300 motion-safe:ease-(--ease-emphasized)',
                 isHorizontal ? 'h-12 w-0.5 origin-bottom' : 'h-0.5 w-12 origin-left',
                 highlighted ? 'text-ink' : undefined,
               )}
@@ -558,7 +560,11 @@ export const MessageScroller = forwardRef(
     const railTargetsRef = useRef(new Map());
     const [railItems, setRailItems] = useState([]);
     const [activeRailId, setActiveRailId] = useState('');
-    const [railOverflowing, setRailOverflowing] = useState(false);
+    // Assumed until the first measurement: a conversation that opens with
+    // history nearly always overflows, and reserving the rail's gutter only
+    // after that measurement narrowed the text a frame after the first paint
+    // (on a phone every message re-wrapped and the transcript grew a sixth).
+    const [railOverflowing, setRailOverflowing] = useState(navigation === 'rail');
     // The transcript's height: the rail fits its ticks into it.
     const [railSpace, setRailSpace] = useState(0);
     const {
@@ -731,13 +737,19 @@ export const MessageScroller = forwardRef(
     const busyRef = useRef(busy);
     busyRef.current = busy;
 
+    const openedAtRef = useRef(0);
+    useEffect(() => {
+      openedAtRef.current = performance.now();
+    }, []);
+
     useEffect(() => {
       const content = contentRef.current;
       if (!content || typeof ResizeObserver === 'undefined') return undefined;
       const observer = new ResizeObserver(() => {
         scheduleRailSync();
         if (!followOutput || !followingRef.current) return;
-        scrollToEnd(reduce || !smooth || busyRef.current ? 'auto' : 'smooth');
+        const settling = performance.now() - openedAtRef.current < OPENING_SETTLE_MS;
+        scrollToEnd(reduce || !smooth || busyRef.current || settling ? 'auto' : 'smooth');
       });
       observer.observe(content);
       return () => observer.disconnect();

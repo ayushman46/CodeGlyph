@@ -14,8 +14,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, Response
 from config import get_cors_origins, should_run_local_ingestion_worker, settings
 from api.ingest_router import router as ingest_router
 from api.query_router import router as query_router
@@ -25,6 +24,7 @@ from api.github_router import router as github_router
 from api.explore_router import router as explore_router
 from agent.nemotron import close_async_client
 from database import DatabaseConfigurationError, assert_turso_schema, get_turso_store
+from frontend_static import HashedAssets, revalidated_file
 from ingest.local_worker import process_queue_forever
 
 logger = logging.getLogger("codebase_intel")
@@ -339,7 +339,7 @@ if FRONTEND_DIST.is_dir():
     # and send all remaining non-API paths to the SPA for client-side routing.
     assets_dir = FRONTEND_DIST / "assets"
     if assets_dir.is_dir():
-        app.mount("/assets", StaticFiles(directory=assets_dir), name="frontend-assets")
+        app.mount("/assets", HashedAssets(directory=assets_dir), name="frontend-assets")
 
     @app.get("/{frontend_path:path}", include_in_schema=False)
     def serve_frontend(frontend_path: str):
@@ -348,8 +348,8 @@ if FRONTEND_DIST.is_dir():
             raise HTTPException(status_code=404, detail="Not Found")
         requested_file = (FRONTEND_DIST / frontend_path).resolve()
         if frontend_path and requested_file.is_relative_to(FRONTEND_DIST.resolve()) and requested_file.is_file():
-            return FileResponse(requested_file)
-        return FileResponse(FRONTEND_DIST / "index.html")
+            return revalidated_file(requested_file)
+        return revalidated_file(FRONTEND_DIST / "index.html")
 else:
     # Local API-only startup does not package frontend/dist.
     @app.get("/")

@@ -131,7 +131,7 @@ const GoogleSignInButton = ({ compact = false, size = 'md', className = '', labe
   if (compact) {
     return (
       <>
-        <Button variant="dark" size="sm" onClick={() => void start()} loading={busy} className={className}>
+        <Button data-prefetch-app variant="dark" size="sm" onClick={() => void start()} loading={busy} className={className}>
           Sign in
           {busy && <span className="sr-only">: redirecting to Google</span>}
         </Button>
@@ -141,7 +141,7 @@ const GoogleSignInButton = ({ compact = false, size = 'md', className = '', labe
   }
   return (
     <>
-      <Button variant="secondary" size={size} onClick={() => void start()} loading={busy} className={`shadow-sm ${className}`}>
+      <Button data-prefetch-app variant="secondary" size={size} onClick={() => void start()} loading={busy} className={`shadow-sm ${className}`}>
         {!busy && <GoogleIcon />}
         {busy ? 'Redirecting to Google…' : label}
       </Button>

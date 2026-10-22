@@ -1,4 +1,7 @@
-import { createClient } from '@supabase/supabase-js';
+// The app only uses Supabase for sign-in, so it loads the auth client alone
+// rather than @supabase/supabase-js, which also bundles the database,
+// storage, realtime and functions clients on every page.
+import { AuthClient } from '@supabase/auth-js';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
@@ -43,8 +46,28 @@ const sessionClient = (session) => ({
 
 export const isSupabaseConfigured = Boolean(E2E_SESSION) || Boolean(supabaseUrl && supabaseAnonKey && isValidUrl(supabaseUrl));
 
+/*
+ * Configured exactly as createClient() configures its auth client (same URL,
+ * headers, defaults and storage key), so sessions saved by earlier builds
+ * keep working and the OAuth redirect flow is unchanged.
+ */
+const authOnlyClient = (url, key) => {
+  const base = new URL(url.endsWith('/') ? url : `${url}/`);
+  return {
+    auth: new AuthClient({
+      url: new URL('auth/v1', base).href,
+      headers: { Authorization: `Bearer ${key}`, apikey: key },
+      storageKey: `sb-${base.hostname.split('.')[0]}-auth-token`,
+      autoRefreshToken: true,
+      persistSession: true,
+      detectSessionInUrl: true,
+      flowType: 'implicit',
+    }),
+  };
+};
+
 export const supabase = E2E_SESSION
   ? sessionClient(E2E_SESSION)
   : isSupabaseConfigured
-    ? createClient(supabaseUrl, supabaseAnonKey)
+    ? authOnlyClient(supabaseUrl, supabaseAnonKey)
     : sessionClient(null);

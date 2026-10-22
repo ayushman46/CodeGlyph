@@ -16,6 +16,16 @@ import { useRouteFocus, useScrollRestoration } from './hooks/useRouteChange';
 import { applyTheme } from './lib/theme';
 import useStore, { POST_LOGIN_KEY } from './store/useStore';
 
+// A repository link opened directly (a bookmark, a reload) starts loading its
+// history and overview with the app, alongside the workspace's code, instead
+// of waiting for that code to download and run first.
+const bootRepo = typeof window !== 'undefined' ? matchPath('/app/r/:repoName', window.location.pathname)?.params.repoName : null;
+if (bootRepo) {
+  supabase.auth.getSession()
+    .then(({ data }) => { if (data?.session) useStore.getState().prefetchRepo(decodeURIComponent(bootRepo)); })
+    .catch(() => {});
+}
+
 // A failed chunk download (flaky mobile network) gets one quiet retry before
 // the error boundary takes over (which reloads once for a stale deploy).
 const lazyPage = (load) => lazy(() => load().catch(() => new Promise((resolve) => {

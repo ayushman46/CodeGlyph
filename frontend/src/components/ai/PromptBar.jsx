@@ -177,13 +177,21 @@ export function PromptBar({
   const isMenuOpen = Boolean(suggestion && source?.length);
   const activeItem = matches[Math.min(activeIndex, matches.length - 1)];
 
+  const measuredValue = useRef(value);
   useLayoutEffect(() => {
     const input = inputRef.current;
     if (!input) return;
-    // Grow with the text up to a limit, then scroll.
-    input.style.height = '0px';
-    input.style.height = `${Math.min(input.scrollHeight, MAX_INPUT_HEIGHT)}px`;
-    input.style.overflowY = input.scrollHeight > MAX_INPUT_HEIGHT ? 'auto' : 'hidden';
+    // Grow with the text up to a limit, then scroll. Measuring a shrink needs
+    // the height reset first, and that write costs the page a second full
+    // layout, so only text that may have got shorter (a deletion, a cleared
+    // or replaced draft) pays for it; the first render and typing do not.
+    const mayShrink = !value.startsWith(measuredValue.current);
+    measuredValue.current = value;
+    if (mayShrink) input.style.height = '0px';
+    const height = Math.min(input.scrollHeight, MAX_INPUT_HEIGHT);
+    if (mayShrink || height !== input.clientHeight) input.style.height = `${height}px`;
+    const overflowY = input.scrollHeight > MAX_INPUT_HEIGHT ? 'auto' : 'hidden';
+    if (input.style.overflowY !== overflowY) input.style.overflowY = overflowY;
     if (pendingCaret.current !== null) {
       input.setSelectionRange(pendingCaret.current, pendingCaret.current);
       pendingCaret.current = null;

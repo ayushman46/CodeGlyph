@@ -6,7 +6,7 @@ import {
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { cn } from '../../lib/cn';
-import { EASE_OUT, SPRING_PRESS, SPRING_SWAP } from '../../lib/ease';
+import { EASE_OUT } from '../../lib/ease';
 import {
   COPIED_MILLISECONDS, DEFAULT_CHARACTERS_PER_SECOND, IDLE_REVEAL_CLOCK, defaultStreamingTextLabels, isPlainClick,
   nextFeedback, resolveLabels, revealFrame, sourceKeys, visibleLength as clampVisibleLength,
@@ -90,23 +90,23 @@ function useSmoothStream(text, { charactersPerSecond = DEFAULT_CHARACTERS_PER_SE
   return { text: text.slice(0, visibleLength), isSettled: !isBehind };
 }
 
+// Every reply has three or four of these, so the press is CSS: a spring per
+// button meant a page of 30 older messages mounted a hundred motion values.
+const PRESS = 'motion-safe:transition-[color,background-color,border-color,box-shadow,opacity,scale] motion-safe:duration-200 motion-safe:not-disabled:active:scale-90';
+
 function ActionButton({ label, isPressed, className, children, onClick }) {
-  const shouldReduceMotion = useReducedMotion() ?? false;
   return (
-    <motion.button
+    <button
       type="button"
       aria-label={label}
       title={label}
       aria-pressed={isPressed}
       onClick={onClick}
-      whileTap={shouldReduceMotion ? undefined : { scale: 0.9 }}
-      transition={SPRING_PRESS}
-      // The interactive transition leaves `transform` to the spring. The
-      // pressed fill is important so the link variant's hover cannot undo it.
-      className={cn(buttonVariants({ variant: 'link', size: 'icon-sm' }), 'aria-pressed:bg-surface-3! motion-safe:transition-interactive', className)}
+      // The pressed fill is important so the link variant's hover cannot undo it.
+      className={cn(buttonVariants({ variant: 'link', size: 'icon-sm' }), 'aria-pressed:bg-surface-3!', PRESS, className)}
     >
       {children}
-    </motion.button>
+    </button>
   );
 }
 
@@ -186,6 +186,8 @@ function StreamingText({
   const shouldReduceMotion = useReducedMotion() ?? false;
   const sourcesId = useId();
   const copyTimer = useRef(undefined);
+  // The copy icon pops only once it has been used, not on every reply's mount.
+  const copiedOnce = useRef(false);
   useEffect(() => () => window.clearTimeout(copyTimer.current), []);
 
   const isStreaming = status === 'streaming';
@@ -196,8 +198,12 @@ function StreamingText({
   const isSourcesOpen = sourcesOpen ?? uncontrolledSourcesOpen;
   const hasActions = showActions && !isStreaming && (canCopy || onRetry !== undefined || canRate || hasSources);
   const keys = useMemo(() => sourceKeys(sources), [sources]);
+  // Actions that appear when a reply finishes rise in; a reply that was
+  // already finished (history) shows them in place.
+  const [actionsEnter] = useState(() => !hasActions);
 
   const copy = async () => {
+    copiedOnce.current = true;
     try {
       if (onCopy) await onCopy();
       else await navigator.clipboard.writeText(copyText ?? '');
@@ -242,110 +248,94 @@ function StreamingText({
           <span className="min-w-0 break-words">{labels.error}</span>
         </p>
       )}
-      <AnimatePresence initial={false}>
-        {hasActions && (
-          <motion.div
-            key="actions"
-            data-slot="streaming-text-actions"
-            initial={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, y: 4 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: shouldReduceMotion ? 0.12 : 0.22, ease: EASE_OUT }}
-            className={smallText}
-          >
-            <div className="flex min-w-0 flex-wrap items-center gap-0.5">
-              {canCopy && (
-                <ActionButton label={labels.copy} onClick={() => void copy()}>
-                  <AnimatePresence initial={false} mode="popLayout">
-                    <motion.span
-                      key={copyState === 'copied' ? 'copied' : 'copy'}
-                      aria-hidden="true"
-                      initial={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.6 }}
-                      animate={{ opacity: 1, scale: 1 }}
-                      exit={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.6 }}
-                      transition={shouldReduceMotion ? { duration: 0.1 } : SPRING_SWAP}
-                      className="flex [&_svg]:size-4"
-                    >
-                      {copyState === 'copied' ? <CheckIcon /> : <CopyIcon />}
-                    </motion.span>
-                  </AnimatePresence>
-                </ActionButton>
-              )}
-              {onRetry && (
-                <ActionButton label={labels.retry} onClick={onRetry}>
-                  <RotateCcwIcon aria-hidden="true" />
-                </ActionButton>
-              )}
-              {canRate && (
-                <>
-                  <ActionButton label={labels.helpful} isPressed={feedback === 'up'} onClick={() => rate('up')}>
-                    <ThumbsUpIcon aria-hidden="true" />
-                  </ActionButton>
-                  <ActionButton label={labels.notHelpful} isPressed={feedback === 'down'} onClick={() => rate('down')}>
-                    <ThumbsDownIcon aria-hidden="true" />
-                  </ActionButton>
-                </>
-              )}
-              {hasSources && (
-                <button
-                  type="button"
-                  data-slot="streaming-text-sources-trigger"
-                  aria-expanded={isSourcesOpen}
-                  aria-controls={sourcesId}
-                  onClick={toggleSources}
-                  className={cn('ms-0.5 inline-flex cursor-pointer items-center gap-1 rounded-lg border-0 bg-transparent px-1 py-1 text-ink-2', interactive)}
+      {hasActions && (
+        <div
+          data-slot="streaming-text-actions"
+          className={cn(smallText, actionsEnter && 'animate-rise')}
+        >
+          <div className="flex min-w-0 flex-wrap items-center gap-0.5">
+            {canCopy && (
+              <ActionButton label={labels.copy} onClick={() => void copy()}>
+                <span
+                  key={copyState === 'copied' ? 'copied' : 'copy'}
+                  aria-hidden="true"
+                  className={cn('flex [&_svg]:size-4', copiedOnce.current && 'animate-pop')}
                 >
-                  <SourcesIcon aria-hidden="true" className="size-3.5 shrink-0" />
-                  {labels.sources(sources.length)}
-                  <motion.span
-                    aria-hidden="true"
-                    initial={false}
-                    animate={{ rotate: isSourcesOpen ? 180 : 0 }}
-                    transition={shouldReduceMotion ? { duration: 0 } : SPRING_SWAP}
-                    className="flex"
-                  >
-                    <ChevronDownIcon className="size-3.5 shrink-0" />
-                  </motion.span>
-                </button>
-              )}
-              {/* Mounted with the actions, so a copy is announced when it happens. */}
-              <span role="status" className={copyState === 'failed' ? 'ms-1' : 'sr-only'}>
-                {copyState === 'copied' ? labels.copied : copyState === 'failed' ? labels.copyFailed : ''}
-              </span>
-            </div>
-            {hasSources && (
-              <div id={sourcesId}>
-                <AnimatePresence initial={false}>
-                  {isSourcesOpen && (
-                    <motion.div
-                      key="sources"
-                      initial={shouldReduceMotion ? { opacity: 0 } : { height: 0, opacity: 0, y: -4 }}
-                      animate={shouldReduceMotion ? { opacity: 1 } : { height: 'auto', opacity: 1, y: 0 }}
-                      exit={shouldReduceMotion ? { opacity: 0 } : { height: 0, opacity: 0, y: -4 }}
-                      transition={{ duration: shouldReduceMotion ? 0.12 : 0.22, ease: EASE_OUT }}
-                      className="overflow-hidden"
-                    >
-                      <ul role="list" data-slot="streaming-text-sources" className="m-0 mt-1 flex list-none flex-col rounded-xl bg-surface-2 p-1">
-                        {sources.map((source, index) => (
-                          <motion.li
-                            key={keys[index]}
-                            initial={shouldReduceMotion ? false : { opacity: 0, y: 6 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            transition={{ duration: 0.22, ease: EASE_OUT, delay: 0.04 * index }}
-                            className="min-w-0"
-                          >
-                            <SourceLink source={source} />
-                          </motion.li>
-                        ))}
-                      </ul>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </div>
+                  {copyState === 'copied' ? <CheckIcon /> : <CopyIcon />}
+                </span>
+              </ActionButton>
             )}
-          </motion.div>
-        )}
-      </AnimatePresence>
+            {onRetry && (
+              <ActionButton label={labels.retry} onClick={onRetry}>
+                <RotateCcwIcon aria-hidden="true" />
+              </ActionButton>
+            )}
+            {canRate && (
+              <>
+                <ActionButton label={labels.helpful} isPressed={feedback === 'up'} onClick={() => rate('up')}>
+                  <ThumbsUpIcon aria-hidden="true" />
+                </ActionButton>
+                <ActionButton label={labels.notHelpful} isPressed={feedback === 'down'} onClick={() => rate('down')}>
+                  <ThumbsDownIcon aria-hidden="true" />
+                </ActionButton>
+              </>
+            )}
+            {hasSources && (
+              <button
+                type="button"
+                data-slot="streaming-text-sources-trigger"
+                aria-expanded={isSourcesOpen}
+                aria-controls={sourcesId}
+                onClick={toggleSources}
+                className={cn('ms-0.5 inline-flex cursor-pointer items-center gap-1 rounded-lg border-0 bg-transparent px-1 py-1 text-ink-2', interactive)}
+              >
+                <SourcesIcon aria-hidden="true" className="size-3.5 shrink-0" />
+                {labels.sources(sources.length)}
+                <span
+                  aria-hidden="true"
+                  className={cn('flex motion-safe:transition-[rotate] motion-safe:duration-200 motion-safe:ease-(--ease-emphasized)', isSourcesOpen && 'rotate-180')}
+                >
+                  <ChevronDownIcon className="size-3.5 shrink-0" />
+                </span>
+              </button>
+            )}
+            {/* Mounted with the actions, so a copy is announced when it happens. */}
+            <span role="status" className={copyState === 'failed' ? 'ms-1' : 'sr-only'}>
+              {copyState === 'copied' ? labels.copied : copyState === 'failed' ? labels.copyFailed : ''}
+            </span>
+          </div>
+          {hasSources && (
+            <div id={sourcesId}>
+              <AnimatePresence initial={false}>
+                {isSourcesOpen && (
+                  <motion.div
+                    key="sources"
+                    initial={shouldReduceMotion ? { opacity: 0 } : { height: 0, opacity: 0, y: -4 }}
+                    animate={shouldReduceMotion ? { opacity: 1 } : { height: 'auto', opacity: 1, y: 0 }}
+                    exit={shouldReduceMotion ? { opacity: 0 } : { height: 0, opacity: 0, y: -4 }}
+                    transition={{ duration: shouldReduceMotion ? 0.12 : 0.22, ease: EASE_OUT }}
+                    className="overflow-hidden"
+                  >
+                    <ul role="list" data-slot="streaming-text-sources" className="m-0 mt-1 flex list-none flex-col rounded-xl bg-surface-2 p-1">
+                      {sources.map((source, index) => (
+                        <motion.li
+                          key={keys[index]}
+                          initial={shouldReduceMotion ? false : { opacity: 0, y: 6 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          transition={{ duration: 0.22, ease: EASE_OUT, delay: 0.04 * index }}
+                          className="min-w-0"
+                        >
+                          <SourceLink source={source} />
+                        </motion.li>
+                      ))}
+                    </ul>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

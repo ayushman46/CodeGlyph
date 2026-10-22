@@ -281,11 +281,17 @@ const ProposalArtifact = ({ message, openedBy, onClose, onRetry }) => {
   );
 };
 
+/** Start loading the previous history page this far from the top. */
+const OLDER_HISTORY_THRESHOLD_PX = 600;
+
 const RepoWorkspace = ({ repo, onRequestDialog }) => {
   const messages = useStore((state) => state.messages);
   const isHistoryLoading = useStore((state) => state.isHistoryLoading);
   const historyError = useStore((state) => state.historyError);
   const retryHistory = useStore((state) => state.retryHistory);
+  const historyHasMore = useStore((state) => state.historyHasMore);
+  const isLoadingOlder = useStore((state) => state.isLoadingOlder);
+  const loadOlderMessages = useStore((state) => state.loadOlderMessages);
   const isQuerying = useStore((state) => state.isQuerying);
   const askQuestion = useStore((state) => state.askQuestion);
   const stopQuery = useStore((state) => state.stopQuery);
@@ -346,6 +352,39 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
   const following = useRef(true);
   const onFollowChange = useCallback((next) => { following.current = next; }, []);
   const showTranscript = tab === 'chat' && repo.queryable && !isHistoryLoading && messages.length > 0;
+
+  // Older history loads a page at a time when the reader nears the top. The
+  // scroll position is kept on the message the reader was looking at, so the
+  // prepended page appears above without moving the view.
+  // The transcript's height before the next batch of older messages lands.
+  const olderAnchor = useRef(null);
+  const requestOlder = useCallback(() => {
+    const node = viewportRef.current;
+    if (!node || !historyHasMore || isLoadingOlder) return;
+    olderAnchor.current = node.scrollHeight;
+    void loadOlderMessages();
+  }, [historyHasMore, isLoadingOlder, loadOlderMessages]);
+  const onTranscriptScroll = useCallback((event) => {
+    if (event.currentTarget.scrollTop < OLDER_HISTORY_THRESHOLD_PX) requestOlder();
+  }, [requestOlder]);
+  const firstMessageId = messages[0]?.id;
+  // A page arrives in batches above the reader. Content added above leaves
+  // scrollTop as it was (scroll anchoring is off), so scrollTop is wherever
+  // the reader is now, even mid-scroll: moving it down by the height added
+  // keeps the same lines in view without undoing the reader's own scrolling.
+  useLayoutEffect(() => {
+    const height = olderAnchor.current;
+    const node = viewportRef.current;
+    if (height === null || !node) return;
+    node.scrollTop += node.scrollHeight - height;
+    olderAnchor.current = isLoadingOlder ? node.scrollHeight : null;
+  }, [firstMessageId, isLoadingOlder]);
+  // A short first page may not fill the screen, so there is nothing to
+  // scroll: load the next page straight away.
+  useEffect(() => {
+    const node = viewportRef.current;
+    if (showTranscript && node && historyHasMore && !isLoadingOlder && node.scrollHeight <= node.clientHeight + 8) requestOlder();
+  }, [showTranscript, historyHasMore, isLoadingOlder, firstMessageId, requestOlder]);
   useEffect(() => {
     if (showTranscript) following.current = true;
   }, [showTranscript]);
@@ -677,9 +716,21 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
             navigation="rail"
             onFollowChange={onFollowChange}
             viewportRef={viewportRef}
+            viewportProps={{ onScroll: onTranscriptScroll }}
             contentClassName="mx-auto w-full max-w-3xl px-4 py-6 sm:px-6"
           >
             {historyAlert}
+            {historyHasMore && (
+              // One height for the button and the loading line: the swap
+              // happens above the reader and must not nudge the view.
+              <div className="mb-6 flex h-8 items-center justify-center">
+                {isLoadingOlder ? (
+                  <LoadingState label="Loading earlier messages" showElapsed={false} />
+                ) : (
+                  <Button variant="ghost" size="sm" onClick={requestOlder}>Load earlier messages</Button>
+                )}
+              </div>
+            )}
             <div className="space-y-7">
               {messages.map((message, index) => (
                 <MessageBubble key={message.id} message={message} repo={repo} isLast={index === messages.length - 1} onRegenerate={index === messages.length - 1 ? regenerate : null} onAsk={askFromReply} onRevealChange={index === messages.length - 1 ? setRevealing : undefined} />

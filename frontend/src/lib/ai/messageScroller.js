@@ -14,6 +14,13 @@ export const PREVIEW_DESCRIPTION_LENGTH = 88;
 export const DEFAULT_FOLLOW_THRESHOLD = 56;
 /** How long a smooth programmatic scroll is ignored by the scroll handler. */
 export const SMOOTH_SCROLL_SETTLE_MS = 320;
+/**
+ * After the transcript opens, its content keeps growing for a moment (the
+ * code font swapping in, highlighted code) without any new output. Following
+ * is instant for that long, so the conversation does not glide down on every
+ * open; later growth (a finished reply's actions) still glides.
+ */
+export const OPENING_SETTLE_MS = 1500;
 /** After that, how often a still-moving smooth scroll is checked again. */
 export const SMOOTH_SCROLL_POLL_MS = 80;
 /** Upper bound on ignoring the scroll events of one programmatic scroll. */

@@ -57,6 +57,26 @@ const normalizeMessage = (message) => {
   };
 };
 
+/** Messages per history page: enough to fill a tall screen, small enough to load fast. */
+const HISTORY_PAGE_SIZE = 30;
+// The first page only has to fill the screen (answers are long): rendering 30
+// cited answers before anything shows was most of a workspace's open time.
+// Older pages load as the reader scrolls up.
+const FIRST_HISTORY_PAGE_SIZE = 12;
+// A repository link opened directly starts its first history page with the
+// app (see prefetchRepo); selectRepo takes it over if it is recent.
+const HISTORY_PREFETCH_TTL_MS = 15_000;
+let historyPrefetch = null;
+// An older page is added a few messages per frame, nearest the reader first:
+// one render of 30 long cited answers blocked scrolling for a visible beat.
+const OLDER_BATCH_SIZE = 6;
+// Resolves just after the next paint (a frame callback, then a task), so each
+// batch gets a frame of its own instead of two landing before one paint.
+const afterNextPaint = () => new Promise((resolve) => {
+  if (typeof window !== 'undefined' && window.requestAnimationFrame) window.requestAnimationFrame(() => setTimeout(resolve, 0));
+  else setTimeout(resolve, 0);
+});
+
 const useStore = create((set, get) => ({
   user: null,
   repos: [],
@@ -66,6 +86,10 @@ const useStore = create((set, get) => ({
   messages: [],
   isHistoryLoading: false,
   historyError: '',
+  // History is loaded newest-first in pages; older pages load on demand.
+  historyHasMore: false,
+  historyCursor: null,
+  isLoadingOlder: false,
   isQuerying: false,
   queryEpoch: 0,
   isSigningIn: false,
@@ -298,24 +322,44 @@ const useStore = create((set, get) => ({
 
   // ------------------------------------------------------------ conversation
 
+  /** Start a repository's first history page and overview before its workspace code has loaded. */
+  prefetchRepo: (repoName) => {
+    if (!repoName || historyPrefetch?.repoName === repoName) return;
+    const promise = getConversation(repoName, { params: { limit: FIRST_HISTORY_PAGE_SIZE } });
+    // A failed prefetch is not an error: selectRepo simply asks again.
+    promise.catch(() => {});
+    historyPrefetch = { repoName, promise, at: Date.now() };
+    void get().loadOverview(repoName);
+  },
+
   selectRepo: async (repoName) => {
     if (get().selectedRepo === repoName && (get().messages.length || get().isHistoryLoading)) return;
+    const prefetched = historyPrefetch?.repoName === repoName && Date.now() - historyPrefetch.at < HISTORY_PREFETCH_TTL_MS
+      ? historyPrefetch.promise : null;
+    historyPrefetch = null;
     historyController?.abort();
     queryController?.abort();
     historyController = null;
     queryController = null;
     const closedSources = { open: false, messageId: null, activeIndex: null, file: null, stack: [] };
     if (!repoName) {
-      set((state) => ({ selectedRepo: null, messages: [], isHistoryLoading: false, historyError: '', isQuerying: false, queryEpoch: state.queryEpoch + 1, sources: closedSources }));
+      set((state) => ({ selectedRepo: null, messages: [], isHistoryLoading: false, historyError: '', historyHasMore: false, historyCursor: null, isLoadingOlder: false, isQuerying: false, queryEpoch: state.queryEpoch + 1, sources: closedSources }));
       return;
     }
-    set((state) => ({ selectedRepo: repoName, messages: [], isHistoryLoading: true, historyError: '', isQuerying: false, queryEpoch: state.queryEpoch + 1, sources: closedSources }));
+    set((state) => ({ selectedRepo: repoName, messages: [], isHistoryLoading: true, historyError: '', historyHasMore: false, historyCursor: null, isLoadingOlder: false, isQuerying: false, queryEpoch: state.queryEpoch + 1, sources: closedSources }));
     const controller = new AbortController();
     historyController = controller;
     try {
-      const response = await getConversation(repoName, { signal: controller.signal });
+      const response = (prefetched && await prefetched.catch(() => null))
+        || await getConversation(repoName, { signal: controller.signal, params: { limit: FIRST_HISTORY_PAGE_SIZE } });
       if (get().selectedRepo === repoName && historyController === controller) {
-        set({ messages: (response.data.messages || []).map(normalizeMessage), isHistoryLoading: false, historyError: '' });
+        set({
+          messages: (response.data.messages || []).map(normalizeMessage),
+          isHistoryLoading: false,
+          historyError: '',
+          historyHasMore: Boolean(response.data.has_more),
+          historyCursor: response.data.next_before || null,
+        });
       }
     } catch (error) {
       if (error?.code === 'ERR_CANCELED' || error?.name === 'CanceledError') return;
@@ -325,6 +369,35 @@ const useStore = create((set, get) => ({
       }
     } finally {
       if (historyController === controller) historyController = null;
+    }
+  },
+
+  /** Prepend the next older page of the selected repository's history. */
+  loadOlderMessages: async () => {
+    const { selectedRepo: repoName, historyHasMore, historyCursor, isLoadingOlder, isHistoryLoading } = get();
+    if (!repoName || !historyHasMore || !historyCursor || isLoadingOlder || isHistoryLoading) return;
+    set({ isLoadingOlder: true });
+    try {
+      const response = await getConversation(repoName, { params: { limit: HISTORY_PAGE_SIZE, before: historyCursor } });
+      const older = (response.data.messages || []).map(normalizeMessage);
+      // The cursor moves only once the whole page is in, so a page cut short
+      // (another repository, a cleared chat) is never skipped.
+      const current = () => get().selectedRepo === repoName && get().historyCursor === historyCursor;
+      for (let end = older.length; end > 0; end -= OLDER_BATCH_SIZE) {
+        if (!current()) return;
+        const batch = older.slice(Math.max(0, end - OLDER_BATCH_SIZE), end);
+        set((state) => {
+          const known = new Set(state.messages.map((message) => message.id));
+          return { messages: [...batch.filter((message) => !known.has(message.id)), ...state.messages] };
+        });
+        if (end > OLDER_BATCH_SIZE) await afterNextPaint();
+      }
+      if (!current()) return;
+      set({ historyHasMore: Boolean(response.data.has_more), historyCursor: response.data.next_before || null });
+    } catch (error) {
+      if (get().selectedRepo === repoName) set({ historyError: errorMessage(error, 'Earlier messages could not be loaded.') });
+    } finally {
+      if (get().selectedRepo === repoName) set({ isLoadingOlder: false });
     }
   },
 
@@ -339,7 +412,7 @@ const useStore = create((set, get) => ({
     if (!repo) return;
     queryController?.abort();
     await clearConversation(repo);
-    set((state) => ({ messages: [], isQuerying: false, queryEpoch: state.queryEpoch + 1, sources: { open: false, messageId: null, activeIndex: null, file: null, stack: [] } }));
+    set((state) => ({ messages: [], historyHasMore: false, historyCursor: null, isQuerying: false, queryEpoch: state.queryEpoch + 1, sources: { open: false, messageId: null, activeIndex: null, file: null, stack: [] } }));
   },
 
   stopQuery: () => {
@@ -373,7 +446,7 @@ const useStore = create((set, get) => ({
         isQuerying: true,
         messages: [
           ...previous,
-          { id: uid(), role: 'user', content: text, created_at: now, citations: [], tool_calls: [] },
+          { id: uid(), role: 'user', content: text, created_at: now, citations: [], tool_calls: [], live: true },
           {
             id: assistantId, role: 'assistant', content: '', streaming: true, created_at: now, workflow, model_profile: modelProfile,
             started_at: startedAt,
