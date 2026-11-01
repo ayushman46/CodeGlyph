@@ -6,9 +6,11 @@
   one is running, otherwise an embedded file under .local/) so development
   never touches a production Turso database. Override with --database.
 * --insecure-local-auth replaces Supabase sign-in with one fixed local user so
-  the UI can be exercised without Google OAuth. It only works when the server
-  is bound to 127.0.0.1 and every request comes from the loopback interface.
-  Never use this for anything reachable from a network.
+  the UI can be exercised without Google OAuth. A bearer token of the form
+  `local:<id>` acts as that local user instead, so several people (or test
+  agents) can use separate accounts against one local server. It only works
+  when the server is bound to 127.0.0.1 and every request comes from the
+  loopback interface. Never use this for anything reachable from a network.
 
 The frontend can then be started with
     VITE_API_BASE_URL=http://127.0.0.1:8000/api npm --prefix frontend run dev
@@ -18,6 +20,7 @@ the API (any bearer value is accepted from loopback).
 
 import argparse
 import os
+import re
 import socket
 import sys
 from pathlib import Path
@@ -77,7 +80,10 @@ def main() -> int:
             client = request.client.host if request.client else ""
             if client not in {"127.0.0.1", "::1"}:
                 raise HTTPException(status_code=401, detail="Local auth only accepts loopback requests.")
-            return AuthenticatedUser(id=args.local_user_id, access_token="local", raw_user=None)
+            token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+            named = re.fullmatch(r"local:([A-Za-z0-9_-]{1,64})", token)
+            user_id = named.group(1) if named else args.local_user_id
+            return AuthenticatedUser(id=user_id, access_token="local", raw_user=None)
 
         app.dependency_overrides[get_current_user] = local_user
         print("WARNING: insecure local auth is enabled (loopback only).", file=sys.stderr)

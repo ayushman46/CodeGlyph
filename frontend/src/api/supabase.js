@@ -21,16 +21,28 @@ const isValidUrl = (url) => {
  * sign-in. Vite replaces the flag at build time; production builds never set
  * it, so this branch is removed from the shipped bundle.
  */
+// A test build can act as a named local user (scripts/dev_server.py accepts
+// `local:<id>` tokens from loopback), so several test accounts can share one
+// local server: set localStorage `ci-e2e-user` before the app loads.
+const e2eUser = (() => {
+  if (import.meta.env.VITE_E2E_FAKE_SESSION !== 'true') return null;
+  try {
+    const name = window.localStorage.getItem('ci-e2e-user');
+    return name && /^[A-Za-z0-9_-]{1,64}$/.test(name) ? name : null;
+  } catch {
+    return null;
+  }
+})();
 const E2E_SESSION = import.meta.env.VITE_E2E_FAKE_SESSION === 'true'
   ? {
-    access_token: 'e2e-access-token',
+    access_token: e2eUser ? `local:${e2eUser}` : 'e2e-access-token',
     token_type: 'bearer',
     expires_at: Math.floor(Date.now() / 1000) + 3600,
     user: {
-      id: 'e2e-user',
-      email: 'tester@example.test',
+      id: e2eUser || 'e2e-user',
+      email: e2eUser ? `${e2eUser}@example.test` : 'tester@example.test',
       created_at: '2026-01-01T00:00:00Z',
-      user_metadata: { full_name: 'E2E Tester' },
+      user_metadata: { full_name: e2eUser || 'E2E Tester' },
     },
   }
   : null;
