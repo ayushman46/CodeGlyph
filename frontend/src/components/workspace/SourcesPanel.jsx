@@ -1,5 +1,5 @@
 import { ArrowLeft, FileCode2, Folder } from 'lucide-react';
-import { useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { basename, formatLines, groupByDirectory, partitionCitations } from '../../lib/citations';
 import useStore from '../../store/useStore';
 import { ArtifactPanel } from '../ai/ArtifactPanel';
@@ -89,6 +89,7 @@ const SourcesPanel = ({ repo, onClose, autoFocus = false, panelRef }) => {
   const messages = useStore((state) => state.messages);
   const openFile = useStore((state) => state.openFile);
   const backToSources = useStore((state) => state.backToSources);
+  const setSourcesSelection = useStore((state) => state.setSourcesSelection);
   const messageIndex = messages.findIndex((item) => item.id === sources.messageId);
   const message = messageIndex >= 0 ? messages[messageIndex] : null;
   const question = useMemo(() => {
@@ -146,6 +147,12 @@ const SourcesPanel = ({ repo, onClose, autoFocus = false, panelRef }) => {
 
   const open = (citation) => openFile({ path: citation.file_path, start: citation.start_line || null, end: citation.end_line || null });
 
+  // A file opened from a citation shows "Cited lines"; one opened from code
+  // search, a symbol, the file tree or a link names its line instead.
+  let targetLabel = 'Cited lines';
+  if (file?.from && file.start) targetLabel = file.end && file.end !== file.start ? `Lines ${file.start}–${file.end}` : `Line ${file.start}`;
+  const openLinkedFile = useCallback((target) => openFile({ path: target, from: 'link' }), [openFile]);
+
   const announcement = file
     ? `Showing ${file.path}${file.start ? `, lines ${file.start} to ${file.end || file.start}` : ''}.`
     : '';
@@ -166,6 +173,9 @@ const SourcesPanel = ({ repo, onClose, autoFocus = false, panelRef }) => {
           onClose={onClose}
           autoFocus={focusOnMount}
           panelRef={setPanelRef}
+          targetLabel={targetLabel}
+          onSelectionChange={setSourcesSelection}
+          onOpenPath={openLinkedFile}
           navigation={canGoBack ? (
             <Button variant="link" size="icon-sm" onClick={backToSources} aria-label={backLabel} title={backLabel}>
               <ArrowLeft aria-hidden="true" />

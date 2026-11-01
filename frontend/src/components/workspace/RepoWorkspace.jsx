@@ -9,6 +9,7 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import useMediaQuery from '../../hooks/useMediaQuery';
 import { errorMessage } from '../../api/client';
 import { parseRepository } from '../../lib/citations';
+import { fileLinkKey, readFileLink, viewerLink, writeFileLink } from '../../lib/codeNav';
 import { formatCount, shortSha } from '../../lib/format';
 import { isKeywordOnly, phaseLabel, statusTone } from '../../lib/phase';
 import { downloadText, proposalPatch, slugify } from '../../lib/patch';
@@ -339,6 +340,33 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
     setFinished(false);
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
   }, [repo.id]);
+
+  // The open file and lines live in the URL (?file=src/a.py&line=10), so a
+  // reload or a copied link reopens the viewer there. The link is read once
+  // the repository is selected (selecting resets the panel); after that the
+  // URL follows the viewer, and a link to another file arriving later opens
+  // it. Only the query string changes (replace), never the transcript.
+  const selectedRepo = useStore((state) => state.selectedRepo);
+  const openFile = useStore((state) => state.openFile);
+  const linkReadFor = useRef(null);
+  const linkWritten = useRef('');
+  const urlLink = readFileLink(location.search);
+  const urlLinkKey = fileLinkKey(urlLink);
+  useEffect(() => {
+    if (selectedRepo !== repo.repo_name || !repo.queryable) return;
+    const first = linkReadFor.current !== repo.id;
+    linkReadFor.current = repo.id;
+    if (!urlLink || urlLinkKey === fileLinkKey(viewerLink(useStore.getState().sources))) return;
+    if (!first && urlLinkKey === linkWritten.current) return;
+    openFile({ path: urlLink.path, start: urlLink.start, end: urlLink.end, from: 'link' });
+  }, [selectedRepo, repo.repo_name, repo.queryable, repo.id, urlLinkKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (linkReadFor.current !== repo.id) return;
+    const link = viewerLink(useStore.getState().sources);
+    linkWritten.current = fileLinkKey(link);
+    const search = writeFileLink(location.search, link);
+    if (search !== location.search) navigate({ pathname: location.pathname, search, hash: location.hash }, { replace: true, state: location.state });
+  }, [sources, repo.id, location.search]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // The Message Scroller follows the conversation while the reader is at
   // its end. Asking a question returns there from anywhere, so the new
