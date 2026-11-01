@@ -975,7 +975,7 @@ async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool) -
 
 _PLAN_KEYS_FROM_RETRIEVAL = (
     "follow_up_terms", "absent_terms", "ignored_file_like_terms", "missing_files", "strict_target_relaxed",
-    "semantic_search", "directory_listing",
+    "semantic_search", "directory_listing", "unretrieved_identifiers",
 )
 
 

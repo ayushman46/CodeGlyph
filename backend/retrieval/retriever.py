@@ -139,7 +139,16 @@ QUERY_STOPWORDS = {
     # Usage verbs prefix-match unrelated identifiers ("used" -> useDebounce);
     # usage questions search call sites by identifier instead.
     "used", "uses", "called", "calls", "usage",
+    # Narrative words of bug reports and walkthrough requests. They match
+    # prose everywhere and push the technical words of a long question out
+    # of the bounded term list.
+    "bug", "report", "works", "but", "why", "who", "walk", "through", "fails", "same", "way", "inside",
+    "every", "each", "exactly", "actually", "short", "small", "then", "there", "them", "they", "should",
+    "could", "want", "need", "else", "has", "have", "had", "not", "was", "were", "did", "down", "over",
+    "find", "list", "trace", "place", "point",
 }
+# Long questions keep this many of their own terms (code-shaped names first).
+MAX_QUESTION_TERMS = 12
 
 
 def is_overview_file(file_path: str) -> bool:
@@ -248,14 +257,44 @@ def extract_requested_file_paths(query: str) -> list[str]:
             continue
         if (not is_overview_file(path) or allow_overview) and path not in paths:
             paths.append(path)
-    return paths
+    # "httpx/_client.py ... modules that import _client.py" names one file
+    # twice. The bare name would only repeat it (and double its budget).
+    return [
+        path for path in paths
+        if not any(other != path and other.lower().endswith("/" + path.lower()) for other in paths)
+    ]
+
+
+# Wording about the answer itself ("with citations", "file:line", "keep it
+# short") is an instruction, not a topic: "citations" must not select the
+# retrieval/citation path family, and "file"/"line" match every chunk.
+_ANSWER_INSTRUCTION_PATTERN = re.compile(
+    r"\b(?:with|include|including|add|and|give|show)\s+(?:the\s+)?(?:exact\s+|precise\s+)?"
+    r"(?:file\s*:\s*line\s+)?(?:citations?|references?|line\s+numbers?)\b|"
+    r"\bfile\s*:\s*line(?:\s+(?:citations?|references?|numbers?))?\b|"
+    r"\bkeep\s+it\s+(?:short|brief|concise)\b|https?://\S+",
+    re.IGNORECASE,
+)
+# "Lint or style rules" and "coding style" are about code conventions, not CSS.
+_CODE_STYLE_PATTERN = re.compile(
+    r"\b(?:code|coding|lint(?:ing)?|naming|formatting|programming|python|javascript|typescript)\s+"
+    r"(?:(?:or|and)\s+|/\s*)?style\b|"
+    r"\bstyle[\s-]*(?:guides?|rules?|conventions?|checks?|checkers?|linters?|issues?|violations?)\b",
+    re.IGNORECASE,
+)
+
+
+def strip_answer_instructions(query: str) -> str:
+    """The question without wording that only shapes the answer."""
+    return _ANSWER_INSTRUCTION_PATTERN.sub(" ", str(query or ""))
 
 
 def extract_question_path_hints(query: str) -> list[str]:
     """Infer a small set of component-name path hints from natural language."""
+    text = _CODE_STYLE_PATTERN.sub(" ", strip_answer_instructions(query))
     hints: list[str] = []
     for pattern, candidates in QUESTION_PATH_HINTS:
-        if pattern.search(query):
+        if pattern.search(text):
             hints.extend(candidates)
     return list(dict.fromkeys(hints))[:16]
 
@@ -381,12 +420,20 @@ def merge_overlapping_chunk(selected: Dict, candidate: Dict, max_lines: int = MA
     return merged
 
 
+# Evidence for a symbol the question names (its definition, its call sites),
+# and a followed call with its definition, is not limited by the per-file
+# diversity cap: "list every call site of X" may need three sections of one
+# file, and "why does prepare() fail" needs the call and the callee.
+_PRECISE_SYMBOL_METHODS = {"symbol_definition", "symbol_usage", "called_definition", "followed_call"}
+
+
 def select_diverse_chunks(candidates: list[Dict], limit: int, excluded_ids: set[str] | None = None) -> list[Dict]:
     """Pick up to ``limit`` chunks, at most two per file where possible.
 
     Overlapping or adjacent chunks of one file (the chunker emits overlapping
     windows) are merged into one citation span instead of using two slots for
-    largely duplicate text.
+    largely duplicate text. Definitions and call sites of a named symbol are
+    exempt from the per-file cap.
     """
     excluded_ids = excluded_ids or set()
     selected: list[Dict] = []
@@ -409,7 +456,9 @@ def select_diverse_chunks(candidates: list[Dict], limit: int, excluded_ids: set[
                 continue
             if try_merge(chunk):
                 continue
-            if strict and per_file[file_path] >= MAX_CHUNKS_PER_FILE:
+            if strict and per_file[file_path] >= MAX_CHUNKS_PER_FILE and not (
+                _PRECISE_SYMBOL_METHODS & set(chunk.get("_retrieval_methods") or [])
+            ):
                 continue
             selected.append(chunk)
             selected_ids.add(chunk_id)
@@ -421,14 +470,22 @@ def select_diverse_chunks(candidates: list[Dict], limit: int, excluded_ids: set[
 
 def search_terms(query: str) -> list[str]:
     """Keep sparse matching resilient to punctuation and provider-unavailable embeddings."""
-    terms = [
+    # "(not tests or docs)" names what to leave out, not what to search for.
+    text = NEGATED_SCOPE_PATTERN.sub(" ", strip_answer_instructions(query))
+    words = [
         word.lower()
-        for word in WORD_PATTERN.findall(query)
+        for word in WORD_PATTERN.findall(text)
         if len(word) >= 3 and word.lower() not in QUERY_STOPWORDS
     ]
+    # Code-shaped names (``_encode_files``, ``Client.get``) say more about the
+    # target than prose does, so they keep their place when a long question
+    # is cut to the term budget. The sort is stable for everything else.
+    names = {name.lower() for name in extract_question_identifiers(text)}
+    names.update(member.lower() for _, member in extract_qualified_names(text))
+    terms = sorted(dict.fromkeys(words), key=lambda word: word not in names)
     for term in list(terms):
         terms.extend(RETRIEVAL_TERM_ALIASES.get(term, ()))
-    return list(dict.fromkeys(terms))[:10]
+    return list(dict.fromkeys(terms))[:MAX_QUESTION_TERMS]
 
 
 def build_evidence_plan(query: str, workflow: str = "general") -> dict:
@@ -468,6 +525,8 @@ def build_evidence_plan(query: str, workflow: str = "general") -> dict:
         "overview_files_allowed": overview_allowed,
         "tests_requested": question_wants_tests(query),
         "docs_requested": question_wants_docs(query),
+        "tests_excluded": question_excludes_tests(query),
+        "docs_excluded": question_excludes_docs(query),
     }
 
 
@@ -725,17 +784,38 @@ async def requested_file_chunks(store, repo_id: str, file_path: str, limit: int)
     )
 
 
-async def requested_files_chunks(store, repo_id: str, file_paths: list[str], limit: int, staging_prefix: str | None = None) -> list[Dict]:
+def _focus_score_sql(focus: dict | None) -> tuple[str, list[object]]:
+    """A coarse SQL relevance score for sections: a named identifier present
+    counts 4 (exact case), a question word present counts 1."""
+    names = [str(name) for name in (focus or {}).get("names") or [] if str(name)][:6]
+    lowered = {name.lower() for name in names}
+    terms = [str(term) for term in (focus or {}).get("terms") or [] if str(term) and str(term) not in lowered][:6]
+    parts = [*("(CASE WHEN instr(content, ?) > 0 THEN 4 ELSE 0 END)" for _ in names),
+             *("(CASE WHEN instr(lower(content), ?) > 0 THEN 1 ELSE 0 END)" for _ in terms)]
+    return (" + ".join(parts) if parts else "0"), [*names, *terms]
+
+
+async def requested_files_chunks(
+    store,
+    repo_id: str,
+    file_paths: list[str],
+    limit: int,
+    staging_prefix: str | None = None,
+    focus: dict | None = None,
+) -> list[Dict]:
     """Fetch all explicitly requested files in one database round trip.
 
-    Explicit paths are an exact citation contract: the caller will return only
-    these rows. A single OR query retains the previous per-path candidate
-    budget while avoiding one network round trip per path.
+    A single OR query retains the per-path candidate budget while avoiding one
+    network round trip per path. With a ``focus`` (the names and words of the
+    question) the candidates are the sections that contain them, not the
+    first sections of the file: a question about ``make_response`` in a
+    1,500-line file needs line 1,267, not lines 1-660.
     """
     if not file_paths:
         return []
+    score_sql, score_args = _focus_score_sql(focus)
     conditions: list[str] = []
-    args: list[object] = [repo_id]
+    args: list[object] = [*score_args, repo_id]
     for file_path in file_paths:
         exact_or_suffix = escape_like(file_path.lower()) if "/" in file_path else f"%/{escape_like(file_path.lower())}"
         conditions.append("(lower(file_path) = ? OR lower(file_path) LIKE ? ESCAPE '\\')")
@@ -746,11 +826,167 @@ async def requested_files_chunks(store, repo_id: str, file_paths: list[str], lim
         staging_filter = " AND id NOT LIKE ?"
         args.append(f"{staging_prefix}%")
     args.append(max(1, limit) * len(file_paths))
-    return await store.fetch_all(
-        "SELECT id, file_path, start_line, end_line, language, symbols, content FROM chunks "
-        f"WHERE repo_id = ? AND ({' OR '.join(conditions)}){staging_filter} ORDER BY file_path, start_line LIMIT ?",
+    rows = await store.fetch_all(
+        f"SELECT id, file_path, start_line, end_line, language, symbols, content, ({score_sql}) AS focus_score FROM chunks "
+        f"WHERE repo_id = ? AND ({' OR '.join(conditions)}){staging_filter} "
+        "ORDER BY focus_score DESC, file_path, start_line LIMIT ?",
         args,
     )
+    for row in rows:
+        if isinstance(row, dict):
+            row.pop("focus_score", None)
+    return rows
+
+
+# Ranking of the sections inside a named file. Declaring a name the question
+# uses outranks any number of mentions; mentions outrank plain words.
+SECTION_DECLARATION_WEIGHT = 6.0
+SECTION_MENTION_WEIGHT = 3.0
+SECTION_QUALIFIED_WEIGHT = 2.0
+SECTION_TERM_WEIGHT = 0.5
+# Sections of a named file shown before related evidence from other files.
+NAMED_FILE_LEADING_SECTIONS = 3
+
+
+def question_focus(query: str, requested_paths: list[str] | None = None) -> dict:
+    """What a question is about, for ranking the sections of a file.
+
+    ``names`` are code names (identifiers and dotted members such as the
+    ``get`` of ``Client.get``), matched with exact case; ``qualified`` keeps
+    their owners; ``terms`` are the other question words. Words that only
+    repeat a requested path ("flask", "client") are dropped because every
+    section of that file contains them.
+    """
+    qualified = extract_qualified_names(query)
+    names = list(dict.fromkeys([*extract_question_identifiers(query), *(member for _, member in qualified)]))
+    path_words = {token for path in requested_paths or [] for token in re.split(r"[^a-z0-9]+", path.lower()) if token}
+    lowered_names = {name.lower() for name in names}
+    terms = [
+        term for term in search_terms(query)
+        if term not in lowered_names and term.strip("_") not in path_words
+    ]
+    return {"names": names[:8], "qualified": qualified, "terms": terms}
+
+
+def score_file_section(chunk: Dict, focus: dict) -> tuple[float, list[str], list[str]]:
+    """Score one section for a question: ``(score, declared names, mentioned names)``."""
+    content = str(chunk.get("content") or "")
+    symbols = set(_symbol_list(chunk.get("symbols")))
+    score, declared, mentioned = 0.0, [], []
+    for name in focus.get("names") or []:
+        mentions = len(re.findall(rf"(?<![\w$]){re.escape(name)}(?![\w$])", content))
+        if name in symbols or _definition_regex(name).search(content):
+            score += SECTION_DECLARATION_WEIGHT
+            declared.append(name)
+        if mentions:
+            score += SECTION_MENTION_WEIGHT + 0.25 * min(mentions, 4)
+            mentioned.append(name)
+    for owner, member in focus.get("qualified") or []:
+        if re.search(rf"(?<![\w$]){re.escape(owner)}\.(?:prototype\.)?{re.escape(member)}(?![\w$])", content):
+            score += SECTION_QUALIFIED_WEIGHT
+    lowered = content.lower()
+    score += SECTION_TERM_WEIGHT * sum(1 for term in focus.get("terms") or [] if term in lowered)
+    return score, declared, mentioned
+
+
+def rank_file_sections(chunks: list[Dict], focus: dict) -> list[Dict]:
+    """Order sections of named files by relevance to the question.
+
+    Each returned copy carries ``_section_score`` and a reason naming the
+    declarations or mentions it contains. With nothing to rank by, sections
+    keep line order, so "explain this file" still starts at the top.
+    """
+    ranked: list[tuple[float, Dict]] = []
+    for chunk in chunks:
+        score, declared, mentioned = score_file_section(chunk, focus)
+        enriched = dict(chunk)
+        reasons = ["Explicit file path requested in the question"]
+        if declared:
+            reasons.append("Defines " + ", ".join(f"`{name}`" for name in declared) + ", named in the question")
+        elif mentioned:
+            reasons.append("Uses " + ", ".join(f"`{name}`" for name in mentioned) + ", named in the question")
+        enriched["_retrieval_methods"] = ["requested_file"]
+        enriched["_retrieval_reasons"] = reasons
+        enriched["_section_score"] = score
+        enriched["_section_named"] = bool(declared or mentioned)
+        ranked.append((score, enriched))
+    ranked.sort(key=lambda item: (-item[0], str(item[1].get("file_path")), int(item[1].get("start_line") or 0)))
+    return [chunk for _, chunk in ranked]
+
+
+def _without_overlap(chunk: Dict, chosen: list[Dict]) -> Dict | None:
+    """``chunk`` minus the lines ``chosen`` sections of its file already show
+    (the longest remaining run), or ``None`` when little or nothing is new."""
+    start, end = int(chunk["start_line"]), int(chunk["end_line"])
+    covered = sorted(
+        (int(other["start_line"]), int(other["end_line"])) for other in chosen
+        if other.get("file_path") == chunk.get("file_path")
+    )
+    runs, cursor = [], start
+    for first, last in covered:
+        if last < cursor or first > end:
+            continue
+        if first > cursor:
+            runs.append((cursor, first - 1))
+        cursor = max(cursor, last + 1)
+    if cursor <= end:
+        runs.append((cursor, end))
+    if not runs:
+        return None
+    first, last = max(runs, key=lambda run: run[1] - run[0])
+    if (first, last) != (start, end) and last - first < 4:
+        return None
+    return window_chunk(chunk, first, last)
+
+
+def select_named_sections(ranked: list[Dict], per_file_limit: int, leading_per_file: int) -> tuple[list[Dict], list[Dict]]:
+    """Choose sections of named files from ``rank_file_sections`` output.
+
+    Returns ``(leading, rest)``: each file's best sections first (so several
+    named files all get their key evidence before any budget cut), then the
+    remaining choices by score. Overlapping windows of two relevant sections
+    merge into one span; a less relevant overlapping section keeps only its
+    new lines, so filler never rides along with the best evidence.
+    """
+    by_file: dict[str, list[Dict]] = {}
+    for chunk in ranked:
+        by_file.setdefault(str(chunk.get("file_path") or ""), []).append(chunk)
+
+    def names_a_symbol(chunk: Dict) -> bool:
+        # Only sections that declare or use a name from the question merge;
+        # a shared plain word is too weak a reason to show 400 lines.
+        return bool(chunk.get("_section_named"))
+
+    chosen_by_file: dict[str, list[Dict]] = {}
+    for path, chunks in by_file.items():
+        chosen: list[Dict] = []
+        for chunk in chunks:
+            if len(chosen) >= max(1, per_file_limit):
+                break
+            merged = None
+            if names_a_symbol(chunk):
+                for index, other in enumerate(chosen):
+                    if names_a_symbol(other):
+                        merged = merge_overlapping_chunk(other, chunk)
+                        if merged is not None:
+                            chosen[index] = merged
+                            break
+            if merged is None:
+                remainder = _without_overlap(chunk, chosen)
+                if remainder is not None:
+                    chosen.append(remainder)
+        chosen_by_file[path] = chosen
+    leading: list[Dict] = []
+    for rank in range(max(0, leading_per_file)):
+        for chosen in chosen_by_file.values():
+            if rank < len(chosen) and (rank == 0 or float(chosen[rank].get("_section_score") or 0) > 0):
+                leading.append(chosen[rank])
+    lead_ids = {id(chunk) for chunk in leading}
+    rest = sorted(
+        (chunk for chosen in chosen_by_file.values() for chunk in chosen if id(chunk) not in lead_ids),
+        key=lambda chunk: (-float(chunk.get("_section_score") or 0), str(chunk.get("file_path")), int(chunk.get("start_line") or 0)),
+    )
+    return leading, rest
 
 
 async def complete_files_chunks(
@@ -935,14 +1171,24 @@ async def path_hint_chunks(
     hint: str,
     limit: int = 2,
     include_overview_files: bool = False,
+    terms: list[str] | None = None,
 ) -> list[Dict]:
-    """Fetch a small representative sample for an evidence-plan path hint."""
+    """Fetch a small representative sample for an evidence-plan path hint.
+
+    With question ``terms`` the sample is the sections that contain the most
+    of them, not the first sections of the first matching file.
+    """
     overview_filter = "" if include_overview_files else f" AND NOT {overview_file_sql('chunks')}"
-    return await store.fetch_all(
-        "SELECT id, file_path, start_line, end_line, language, symbols, content FROM chunks "
-        f"WHERE repo_id = ? AND lower(file_path) LIKE ?{overview_filter} ORDER BY file_path, start_line LIMIT ?",
-        [repo_id, f"%{hint.lower()}%", limit],
+    score_sql, score_args = _focus_score_sql({"terms": terms or []})
+    rows = await store.fetch_all(
+        f"SELECT id, file_path, start_line, end_line, language, symbols, content, ({score_sql}) AS focus_score FROM chunks "
+        f"WHERE repo_id = ? AND lower(file_path) LIKE ?{overview_filter} ORDER BY focus_score DESC, file_path, start_line LIMIT ?",
+        [*score_args, repo_id, f"%{hint.lower()}%", limit],
     )
+    for row in rows:
+        if isinstance(row, dict):
+            row.pop("focus_score", None)
+    return rows
 
 
 async def path_hint_chunks_batch(
@@ -951,21 +1197,27 @@ async def path_hint_chunks_batch(
     hints: list[str],
     limit: int = 2,
     include_overview_files: bool = False,
+    terms: list[str] | None = None,
 ) -> list[Dict]:
     """Fetch the bounded result for every path hint in one SQL statement.
 
     The window function applies the same ``LIMIT`` independently to each hint
-    that the former one-query-per-hint implementation used. Rows carry the
-    matching hint so callers can preserve the evidence-plan explanations.
+    that the former one-query-per-hint implementation used. Within a hint,
+    sections containing more of the question ``terms`` come first (line
+    order breaks ties), so a hint does not always sample the head of the
+    alphabetically first file. Rows carry the matching hint so callers can
+    preserve the evidence-plan explanations.
     """
     hints = list(dict.fromkeys(hints))
     if not hints:
         return []
+    score_sql, score_args = _focus_score_sql({"terms": terms or []})
+    term_order = f"{score_sql.replace('content', 'c.content')} DESC, " if score_args else ""
     values = ", ".join("(?, ?, ?)" for _ in hints)
     args: list[object] = []
     for hint_index, hint in enumerate(hints):
         args.extend([hint_index, hint, f"%{hint.lower()}%"])
-    args.extend([repo_id, max(1, limit)])
+    args.extend([*score_args, repo_id, max(1, limit)])
     overview_filter = "" if include_overview_files else f" AND NOT {overview_file_sql('c')}"
     try:
         rows = await store.fetch_all(
@@ -973,7 +1225,7 @@ async def path_hint_chunks_batch(
             "ranked AS ("
             "SELECT c.id, c.file_path, c.start_line, c.end_line, c.language, c.symbols, c.content, "
             "h.hint AS matched_hint, h.hint_order AS hint_order, "
-            "ROW_NUMBER() OVER (PARTITION BY h.hint ORDER BY c.file_path, c.start_line) AS hint_rank "
+            f"ROW_NUMBER() OVER (PARTITION BY h.hint ORDER BY {term_order}c.file_path, c.start_line) AS hint_rank "
             "FROM chunks c JOIN hints h ON lower(c.file_path) LIKE h.pattern "
             f"WHERE c.repo_id = ?{overview_filter}) "
             "SELECT id, file_path, start_line, end_line, language, symbols, content, matched_hint, hint_order "
@@ -988,7 +1240,7 @@ async def path_hint_chunks_batch(
         rows: list[Dict] = []
         for hint_order, hint in enumerate(hints):
             for chunk in await path_hint_chunks(
-                store, repo_id, hint, limit=limit, include_overview_files=include_overview_files
+                store, repo_id, hint, limit=limit, include_overview_files=include_overview_files, terms=terms,
             ):
                 row = dict(chunk)
                 row["matched_hint"] = hint
@@ -1014,6 +1266,273 @@ async def dependent_file_chunks(store, repo_id: str, target_paths: list[str], li
         "ORDER BY c.file_path, c.start_line LIMIT ?",
         [repo_id, *target_args, limit],
     )
+
+
+def window_chunk(chunk: Dict, first_line: int, last_line: int) -> Dict | None:
+    """A copy of ``chunk`` cut to ``first_line..last_line``, content aligned.
+
+    An import line or a single call site needs a few lines of evidence, not
+    the whole 150-line section around it.
+    """
+    start, end = int(chunk["start_line"]), int(chunk["end_line"])
+    first, last = max(int(first_line), start), min(int(last_line), end)
+    if last < first:
+        return None
+    if (first, last) == (start, end):
+        return dict(chunk)
+    lines = _chunk_lines(chunk)
+    if lines is None:
+        return None
+    window = dict(chunk)
+    window["id"] = f"{chunk.get('id')}#L{first}-L{last}"
+    window["start_line"], window["end_line"] = first, last
+    window["content"] = "\n".join(lines[first - start:last - start + 1])
+    return window
+
+
+_ENCLOSING_DECLARATION = re.compile(
+    r"^\s*(?:(?:export|default|public|private|protected|static|async)\s+)*"
+    r"(?:def|class|function\*?|fn|func)\s+[\w$]+|^\s*[\w$.]+\s*[:=]\s*(?:async\s+)?function\b"
+)
+
+
+def _code_line_mask(lines: list[str]) -> list[bool]:
+    """Which lines are code: not imports, comments, doctest prompts, or lines
+    inside a Python docstring (a section is assumed to start outside one)."""
+    mask: list[bool] = []
+    in_docstring = False
+    for line in lines:
+        stripped = line.strip()
+        quotes = stripped.count('"""') + stripped.count("'''")
+        mask.append(not (in_docstring or quotes) and not stripped.startswith(("import ", "from ", "#", "//", "*", ">>>")))
+        if quotes % 2:
+            in_docstring = not in_docstring
+    return mask
+
+
+def call_site_window(chunk: Dict, names: list[str], *, max_lines: int = 60) -> Dict | None:
+    """The lines around the first call of ``names`` in a chunk, starting at the
+    enclosing declaration when it is close, so the caller is identifiable."""
+    lines = _chunk_lines(chunk)
+    if lines is None:
+        return None
+    start = int(chunk["start_line"])
+    patterns = [
+        (re.compile(rf"(?<![\w$]){re.escape(name)}\s*\("), _definition_regex(name)) for name in names if name
+    ]
+    # Usage examples inside a docstring are neither call sites nor the
+    # enclosing function, so only code lines are considered.
+    code = _code_line_mask(lines)
+    for offset, line in enumerate(lines):
+        if not code[offset] or not any(call.search(line) and not declaration.search(line) for call, declaration in patterns):
+            continue
+        first = max(0, offset - 8)
+        for back in range(offset, max(-1, offset - max_lines), -1):
+            if code[back] and _ENCLOSING_DECLARATION.search(lines[back]):
+                first = back
+                break
+        return window_chunk(chunk, start + first, start + min(len(lines) - 1, offset + 3))
+    return None
+
+
+async def importer_windows(
+    store,
+    repo_id: str,
+    target_paths: list[str],
+    *,
+    limit: int = 4,
+    include_tests: bool = False,
+    staging_prefix: str | None = None,
+) -> list[Dict]:
+    """The import statements of files that import a target (resolved graph).
+
+    One row per importing file: the section containing the import line, cut
+    to the statement (up to its closing parenthesis), so "which modules
+    import X?" is answered with exact, verifiable lines.
+    """
+    paths = list(dict.fromkeys(str(path) for path in target_paths if path))
+    if not paths:
+        return []
+    placeholders = ",".join("?" for _ in paths)
+    staging_filter, staging_args = ("", []) if not staging_prefix else (" AND c.id NOT LIKE ?", [f"{staging_prefix}%"])
+    rows = await store.fetch_all(
+        "SELECT d.source_file, d.target_file, d.line_number, c.id, c.file_path, c.start_line, c.end_line, c.language, "
+        "c.symbols, c.content FROM repo_dependencies d JOIN chunks c ON c.repo_id = d.repo_id AND c.file_path = d.source_file "
+        "AND c.start_line <= d.line_number AND c.end_line >= d.line_number "
+        f"WHERE d.repo_id = ? AND d.target_file IN ({placeholders}) AND d.line_number > 0{staging_filter} "
+        "ORDER BY d.source_file, c.start_line LIMIT ?",
+        [repo_id, *paths, *staging_args, max(1, limit) * 4],
+    )
+    windows: dict[str, Dict] = {}
+    for row in exclude_staged(rows, staging_prefix):
+        source = str(row.get("source_file") or "")
+        if not source or source in windows or source in paths or (is_test_path(source) and not include_tests):
+            continue
+        line = int(row.get("line_number") or 0)
+        lines = _chunk_lines(row) or []
+        offset = line - int(row.get("start_line") or 0)
+        last = line
+        # A parenthesised multi-line import ends at its closing parenthesis.
+        if 0 <= offset < len(lines) and "(" in lines[offset] and ")" not in lines[offset]:
+            for extra in range(offset + 1, min(len(lines), offset + 30)):
+                if ")" in lines[extra]:
+                    last = line + (extra - offset)
+                    break
+        chunk = {key: row.get(key) for key in ("id", "file_path", "start_line", "end_line", "language", "symbols", "content")}
+        window = window_chunk(chunk, line, last)
+        if window:
+            window["_imports"] = str(row.get("target_file") or "")
+            windows[source] = window
+    ordered = sorted(windows.values(), key=lambda item: (is_test_path(str(item.get("file_path"))), str(item.get("file_path"))))
+    return ordered[: max(1, limit)]
+
+
+_TEST_NAME_MARKERS = {"test", "tests", "spec", "specs", "e2e"}
+# Only executable test code pairs with source; a stylesheet or template under
+# tests/ is a fixture.
+_TEST_CODE_PATH = re.compile(
+    r"\.(?:py|js|jsx|mjs|cjs|ts|tsx|mts|cts|go|rb|java|kt|kts|scala|rs|php|cs|swift|ex|exs|dart|lua|clj)$",
+    re.IGNORECASE,
+)
+
+
+def _name_tokens(text: str) -> set[str]:
+    """Lowercase name tokens without test markers or plural ``s``."""
+    tokens = {token for token in re.split(r"[^a-z0-9]+", str(text).lower()) if token} - _TEST_NAME_MARKERS
+    return {token[:-1] if token.endswith("s") and len(token) > 3 else token for token in tokens}
+
+
+def _test_pairing_tier(
+    path: str,
+    stems: list[str],
+    members: list[tuple[str | None, str]],
+    importers: set[str],
+) -> int:
+    """How strongly a test file's name ties it to the question (0 = not at all)."""
+    base = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    base_tokens = _name_tokens(base)
+    for owner, member in members:
+        wanted = _name_tokens(member)
+        if wanted and wanted <= base_tokens and (not owner or _name_tokens(owner) <= base_tokens):
+            return 3
+    # ``tests/test_foo.py``, ``foo.test.ts`` or ``test/foo.js``; a folder such
+    # as ``tests/test_types/`` counts for a file that is itself named as a
+    # test. A fixture such as ``tests/test_apps/cliapp/app.py`` is neither.
+    parts = path.lower().split("/")
+    named_as_test = bool(re.search(r"(?:^|[._-])(?:tests?|specs?)(?:[._-]|$)", parts[-1].rsplit(".", 1)[0]))
+    in_test_root = len(parts) > 1 and parts[-2] in {"test", "tests", "spec", "specs", "__tests__"}
+    stem_tokens = [_name_tokens(stem) for stem in stems]
+    segments = [base_tokens] if named_as_test or in_test_root else []
+    if named_as_test:
+        segments.extend(_name_tokens(segment) for segment in parts[:-1])
+    if path in importers or any(tokens and tokens == wanted for tokens in segments for wanted in stem_tokens):
+        return 2
+    first = base.lower().split(".", 1)[0]
+    if len(first) >= 3 and any(len(stem) > 4 and stem != first and stem.startswith(first) for stem in stems):
+        return 1
+    return 0
+
+
+async def paired_test_chunks(
+    store,
+    repo_id: str,
+    source_paths: list[str],
+    names: list[str],
+    qualified: list[tuple[str, str]],
+    *,
+    limit: int = 3,
+    staging_prefix: str | None = None,
+) -> list[Dict]:
+    """Test files that cover a source file or a named symbol, by convention.
+
+    Tiers, strongest first: a test file named after the symbol
+    (``res.redirect`` -> ``test/res.redirect.js``); a test named after the
+    source file (``foo.py`` -> ``tests/test_foo.py``, ``foo.test.ts``) or a
+    test that imports it; a test named with an abbreviation of the source
+    file (``response.js`` -> ``test/res.*.js``). Only the strongest tier
+    present is used. Each file contributes its section that mentions the
+    names most.
+    """
+    stems = []
+    for path in source_paths:
+        stem = str(path).replace("\\", "/").rsplit("/", 1)[-1].split(".", 1)[0].strip("_").lower()
+        if len(stem) >= 3 and stem not in stems:
+            stems.append(stem)
+    members = [(owner.lower(), member.lower()) for owner, member in qualified]
+    members.extend((None, name.lower()) for name in names if name and (None, name.lower()) not in members)
+    patterns: list[str] = []
+    for _, member in members:
+        if len(member.strip("_")) >= 3:
+            patterns.append(f"%{escape_like(member.strip('_'))}%")
+    for stem in stems:
+        patterns.append(f"%{escape_like(stem)}%")
+        if len(stem) > 4:
+            patterns.append(f"%/{escape_like(stem[:3])}.%")
+    patterns = list(dict.fromkeys(patterns))[:12]
+    if not patterns and not source_paths:
+        return []
+    staging_filter, staging_args = ("", []) if not staging_prefix else (" AND id NOT LIKE ?", [f"{staging_prefix}%"])
+    jobs = []
+    if patterns:
+        jobs.append(store.fetch_all(
+            "SELECT DISTINCT file_path FROM chunks WHERE repo_id = ? AND ("
+            + " OR ".join("lower(file_path) LIKE ? ESCAPE '\\'" for _ in patterns)
+            + f"){staging_filter} LIMIT 400",
+            [repo_id, *patterns, *staging_args],
+        ))
+    if source_paths:
+        placeholders = ",".join("?" for _ in source_paths)
+        jobs.append(store.fetch_all(
+            f"SELECT DISTINCT source_file AS file_path FROM repo_dependencies WHERE repo_id = ? AND target_file IN ({placeholders}) LIMIT 200",
+            [repo_id, *source_paths],
+        ))
+    results = await asyncio.gather(*jobs, return_exceptions=True)
+    importers: set[str] = set()
+    candidates: list[str] = []
+    for index, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.debug("Test pairing lookup unavailable (%s)", type(result).__name__)
+            continue
+        is_import_job = bool(source_paths) and index == len(jobs) - 1
+        for row in result:
+            path = str(row.get("file_path") or "")
+            if path and is_import_job:
+                importers.add(path)
+            if path and path not in candidates:
+                candidates.append(path)
+    tiers: dict[str, int] = {}
+    for path in candidates:
+        if is_test_path(path) and _TEST_CODE_PATH.search(path) and path not in source_paths:
+            tier = _test_pairing_tier(path, stems, members, importers)
+            if tier:
+                tiers[path] = tier
+    if not tiers:
+        return []
+    best = max(tiers.values())
+    # An abbreviation ("res.*" for response.js) matches a whole family of
+    # tests; keep fewer of those than of exact name matches.
+    chosen = sorted(path for path, tier in tiers.items() if tier == best)[: max(1, limit if best > 1 else min(2, limit))]
+    placeholders = ",".join("?" for _ in chosen)
+    rows = await store.fetch_all(
+        "SELECT id, file_path, start_line, end_line, language, symbols, content FROM chunks "
+        f"WHERE repo_id = ? AND file_path IN ({placeholders}){staging_filter} ORDER BY file_path, start_line LIMIT 80",
+        [repo_id, *chosen, *staging_args],
+    )
+    needles = [re.compile(rf"(?<![\w$]){re.escape(member)}(?![\w$])", re.IGNORECASE) for _, member in members]
+    best_rows: dict[str, tuple[int, Dict]] = {}
+    for row in exclude_staged(rows, staging_prefix):
+        path = str(row.get("file_path") or "")
+        content = str(row.get("content") or "")
+        hits = sum(len(needle.findall(content)) for needle in needles)
+        if path not in best_rows or hits > best_rows[path][0]:
+            best_rows[path] = (hits, row)
+    result = []
+    for path in chosen:
+        if path in best_rows:
+            row = dict(best_rows[path][1])
+            row["_pairing_tier"] = tiers[path]
+            result.append(row)
+    return result
 
 
 _LOCALE_PATH = re.compile(r"(?:^|/)(?:locales?|i18n|l10n|translations|lang)/")
@@ -1057,12 +1576,40 @@ def is_doc_path(file_path: str) -> bool:
     return bool(DOC_PATH_PATTERN.search(str(file_path or "")))
 
 
+# "Library code (not tests or docs)" names tests and docs only to exclude
+# them. A negated mention must neither lift the test/doc demotion nor count
+# as a request for that evidence. "Not tested" and "has no tests" are about
+# test coverage, so they are deliberately not negations here.
+_SCOPE_WORD = r"(?:tests?|test\s+files?|test\s+code|specs?|docs?|documentation|examples?|fixtures?)"
+NEGATED_SCOPE_PATTERN = re.compile(
+    r"(?:\b(?:not|excluding|exclude|without|except|ignore|ignoring|skip|skipping|outside(?:\s+of)?|"
+    r"other\s+than|rather\s+than|instead\s+of)\s+|\bnon-?)"
+    rf"(?:(?:the|any|in|from)\s+)?{_SCOPE_WORD}\b"
+    rf"(?:\s*(?:,|/|\bor\b|\band\b|\bnor\b)\s*(?:the\s+)?{_SCOPE_WORD}\b)*",
+    re.IGNORECASE,
+)
+
+
+def _negated_scopes(query: str) -> str:
+    return " ".join(match.group(0) for match in NEGATED_SCOPE_PATTERN.finditer(str(query or "")))
+
+
 def question_wants_tests(query: str) -> bool:
-    return bool(TEST_QUESTION_PATTERN.search(query or ""))
+    return bool(TEST_QUESTION_PATTERN.search(NEGATED_SCOPE_PATTERN.sub(" ", query or "")))
 
 
 def question_wants_docs(query: str) -> bool:
-    return bool(DOC_QUESTION_PATTERN.search(query or "")) or is_explicit_overview_request(query or "")
+    text = NEGATED_SCOPE_PATTERN.sub(" ", query or "")
+    return bool(DOC_QUESTION_PATTERN.search(text)) or is_explicit_overview_request(text)
+
+
+def question_excludes_tests(query: str) -> bool:
+    """The question explicitly rules out tests ("not tests", "excluding specs")."""
+    return bool(re.search(r"\b(?:tests?|test\s+files?|test\s+code|specs?|fixtures?)\b", _negated_scopes(query), re.IGNORECASE))
+
+
+def question_excludes_docs(query: str) -> bool:
+    return bool(re.search(r"\b(?:docs?|documentation)\b", _negated_scopes(query), re.IGNORECASE))
 
 
 def _path_noise_penalties(query: str) -> list[tuple[re.Pattern, float]]:
@@ -1088,10 +1635,22 @@ def _path_noise_penalties(query: str) -> list[tuple[re.Pattern, float]]:
 
 
 # Identifier-shaped tokens: camelCase, PascalCase with an inner capital,
-# snake_case, SCREAMING_CASE and anything in backticks.
+# snake_case (including private ``_name`` and dunder names), SCREAMING_CASE
+# and anything in backticks.
 _IDENTIFIER_TOKEN = re.compile(
-    r"\b(?:[a-z_$][A-Za-z0-9_$]*[A-Z][A-Za-z0-9_$]*|[A-Z][a-z0-9]+[A-Z][A-Za-z0-9_]*|[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+)\b"
+    r"\b(?:[a-z_$][A-Za-z0-9_$]*[A-Z][A-Za-z0-9_$]*|[A-Z][a-z0-9]+[A-Z][A-Za-z0-9_]*|"
+    r"_*[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+|_+[A-Za-z][A-Za-z0-9]{2,})\b"
 )
+# ``Owner.member`` in prose names a method or attribute: ``Client.get``,
+# ``res.redirect``, ``Flask.make_response``. File paths are removed before
+# matching; a chain followed by "/" is a URL or path, not code.
+_QUALIFIED_NAME = re.compile(r"(?<![\w$./-])([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)(?![\w$/-])")
+# A trailing extension or domain ("Next.js", "example.com") is not a member.
+_QUALIFIED_MEMBER_STOPWORDS = {
+    "py", "js", "ts", "jsx", "tsx", "mjs", "cjs", "json", "md", "mdx", "yml", "yaml", "toml", "css", "scss",
+    "html", "txt", "rs", "go", "rb", "java", "php", "sh", "sql", "lock", "cfg", "ini", "xml", "vue", "svelte",
+    "env", "com", "org", "net", "io", "dev", "ai", "co",
+}
 _BACKTICK_TOKEN = re.compile(r"`([A-Za-z_$][\w$.]{1,80})`")
 # A single capitalised word is a symbol only when the question calls it one:
 # "the Booking model", "the Stripe class", "where is Booking defined".
@@ -1109,15 +1668,41 @@ DEFINITION_QUESTION_PATTERN = re.compile(
 _SYMBOL_STOPWORDS = {"API", "URL", "HTTP", "JSON", "SQL", "UI", "ID", "OK", "README"}
 
 
+def _without_file_paths(text: str) -> str:
+    """Blank out file paths so ``test_basic.py`` or ``_client.py`` are not names."""
+    return FILE_PATH_PATTERN.sub(" ", text)
+
+
+def extract_qualified_names(query: str) -> list[tuple[str, str]]:
+    """``(owner, member)`` pairs for dotted code names in a question, at most four.
+
+    ``httpx.Client.get`` gives ``("Client", "get")``: the last two parts are
+    the class or object and its member, and a leading package is dropped.
+    """
+    pairs: list[tuple[str, str]] = []
+    for match in _QUALIFIED_NAME.finditer(_without_file_paths(strip_answer_instructions(query))):
+        chain = match.group(1)
+        if chain.lower() in DOTTED_TECHNOLOGY_NAMES:
+            continue
+        owner, member = chain.split(".")[-2:]
+        owner, member = owner.strip("$"), member.strip("$")
+        if len(owner) < 2 or len(member) < 2 or member.lower() in _QUALIFIED_MEMBER_STOPWORDS:
+            continue
+        if (owner, member) not in pairs:
+            pairs.append((owner, member))
+    return pairs[:4]
+
+
 def extract_question_identifiers(query: str) -> list[str]:
     """Return code identifiers named in a question (exact case), at most six."""
     text = str(query or "")
+    prose = _without_file_paths(text)
     found: list[str] = []
     for match in _BACKTICK_TOKEN.finditer(text):
         found.append(match.group(1).split(".")[-1])
-    for match in _IDENTIFIER_TOKEN.finditer(text):
+    for match in _IDENTIFIER_TOKEN.finditer(prose):
         found.append(match.group(0))
-    for match in _TYPED_SYMBOL.finditer(text):
+    for match in _TYPED_SYMBOL.finditer(prose):
         found.append(match.group(1) or match.group(2))
     if len(text.split()) == 1 and re.fullmatch(r"[A-Za-z_$][\w$]{2,}", text.strip()):
         found.append(text.strip())
@@ -1205,21 +1790,31 @@ async def symbol_definition_chunks(
     limit_per_symbol: int = 2,
     staging_prefix: str | None = None,
     kinds: dict[str, str] | None = None,
+    owners: dict[str, str] | None = None,
 ) -> list[Dict]:
     """Chunks that define an identifier named in the question.
 
     Two bounded lookups: the stored ``chunks.symbols`` list (exact name), and
     an exact (non-prefix) FTS match filtered by a declaration regex, which
     also finds class methods the chunker does not list as symbols.
+
+    ``owners`` maps a member to the class or object the question qualified it
+    with (``Client.get`` -> ``{"get": "Client"}``). A generic member such as
+    ``get`` is defined in many classes; the owner picks the declaration that
+    follows ``class Client`` in its file, or an assignment such as
+    ``res.redirect = function``.
     """
     names = [name for name in identifiers if _FTS_TERM_CLEAN.sub("", name)][:4]
     if not names:
         return []
     staging_filter, staging_args = ("", []) if not staging_prefix else (" AND id NOT LIKE ?", [f"{staging_prefix}%"])
+    fts_staging = staging_filter.replace(" id ", " c.id ")
     columns = "id, file_path, start_line, end_line, language, symbols, content"
     found: dict[str, Dict] = {}
     for name in names:
+        owner = (owners or {}).get(name)
         candidates: list[Dict] = []
+        owner_rows: list[Dict] = []
         try:
             candidates.extend(await store.fetch_all(
                 f"SELECT {columns} FROM chunks WHERE repo_id = ? AND symbols LIKE ? ESCAPE '\\'{staging_filter} LIMIT 60",
@@ -1227,16 +1822,51 @@ async def symbol_definition_chunks(
             ))
         except Exception as error:
             logger.debug("Symbol lookup unavailable (%s)", type(error).__name__)
-        try:
-            fts_staging = staging_filter.replace(" id ", " c.id ")
-            candidates.extend(await store.fetch_all(
-                "SELECT c.id, c.file_path, c.start_line, c.end_line, c.language, c.symbols, c.content FROM chunks_fts "
-                f"JOIN chunks c ON c.rowid = chunks_fts.rowid WHERE chunks_fts MATCH ? AND c.repo_id = ?{fts_staging} "
-                "ORDER BY bm25(chunks_fts, 1.0, 4.0) ASC LIMIT 300",
-                [f'"{_FTS_TERM_CLEAN.sub("", name).lower()}"', repo_id, *staging_args],
-            ))
-        except Exception as error:
-            logger.debug("Exact identifier FTS unavailable (%s)", type(error).__name__)
+        # A plain-word member ("get") matches most of a repository; its owner
+        # lookups below are precise, so the broad scan is skipped for it.
+        if not owner or _IDENTIFIER_TOKEN.fullmatch(name):
+            try:
+                candidates.extend(await store.fetch_all(
+                    "SELECT c.id, c.file_path, c.start_line, c.end_line, c.language, c.symbols, c.content FROM chunks_fts "
+                    f"JOIN chunks c ON c.rowid = chunks_fts.rowid WHERE chunks_fts MATCH ? AND c.repo_id = ?{fts_staging} "
+                    "ORDER BY bm25(chunks_fts, 1.0, 4.0) ASC LIMIT 300",
+                    [f'"{_FTS_TERM_CLEAN.sub("", name).lower()}"', repo_id, *staging_args],
+                ))
+            except Exception as error:
+                logger.debug("Exact identifier FTS unavailable (%s)", type(error).__name__)
+        if owner:
+            owner_pattern = f'%"{escape_like(owner)}"%'
+            jobs = [
+                # The owner's declaration (for its line), members declared in
+                # files that declare the owner, and ``owner.member`` literals.
+                store.fetch_all(
+                    f"SELECT {columns} FROM chunks WHERE repo_id = ? AND symbols LIKE ? ESCAPE '\\'{staging_filter} LIMIT 20",
+                    [repo_id, owner_pattern, *staging_args],
+                ),
+                store.fetch_all(
+                    f"SELECT {columns} FROM chunks WHERE repo_id = ? AND symbols LIKE ? ESCAPE '\\'{staging_filter} "
+                    "AND file_path IN (SELECT file_path FROM chunks WHERE repo_id = ? AND symbols LIKE ? ESCAPE '\\') LIMIT 40",
+                    [repo_id, f'%"{escape_like(name)}"%', *staging_args, repo_id, owner_pattern],
+                ),
+                store.fetch_all(
+                    "SELECT c.id, c.file_path, c.start_line, c.end_line, c.language, c.symbols, c.content FROM chunks_fts "
+                    f"JOIN chunks c ON c.rowid = chunks_fts.rowid WHERE chunks_fts MATCH ? AND c.repo_id = ?{fts_staging} "
+                    "ORDER BY bm25(chunks_fts, 1.0, 4.0) ASC LIMIT 80",
+                    [f'"{_FTS_TERM_CLEAN.sub("", owner).lower()} {_FTS_TERM_CLEAN.sub("", name).lower()}"', repo_id, *staging_args],
+                ),
+            ]
+            owner_results = await asyncio.gather(*jobs, return_exceptions=True)
+            for index, result in enumerate(owner_results):
+                if isinstance(result, Exception):
+                    logger.debug("Qualified symbol lookup unavailable (%s)", type(result).__name__)
+                elif index == 0:
+                    owner_rows = list(result)
+                else:
+                    candidates.extend(result)
+        owner_lines = _owner_declaration_lines(exclude_staged(owner_rows, staging_prefix), owner) if owner else {}
+        qualified_declaration = re.compile(
+            rf"(?<![\w$]){re.escape(owner)}\.(?:prototype\.)?{re.escape(name)}\s*=(?!=)"
+        ) if owner else None
         declaration = _definition_regex(name)
         kind = (kinds or {}).get(name)
         kind_declaration = re.compile(
@@ -1252,29 +1882,65 @@ async def symbol_definition_chunks(
             seen.add(chunk_id)
             content = str(row.get("content") or "")
             in_symbols = name in _symbol_list(row.get("symbols"))
-            declares = bool(declaration.search(content))
+            declaration_match = declaration.search(content)
+            qualified_match = qualified_declaration.search(content) if qualified_declaration else None
+            declares = bool(declaration_match or qualified_match)
             if not (in_symbols or declares):
                 continue
             # Prefer, in order: implementation code over tests/docs/migrations,
+            # the owner the question names (an ``owner.member =`` assignment,
+            # or the nearest declaration after ``class Owner`` in its file),
             # the kind the question names, a declaration the chunker also
             # recorded as a symbol, an exported declaration, and a file
             # named after the symbol.
             stem = path.rsplit("/", 1)[-1].split(".", 1)[0].lower()
             noisy = is_test_path(path) or is_doc_path(path) or bool(_MIGRATION_PATH.search(path.lower()))
+            owner_rank, owner_distance, offset = 1, 0, 0
+            if declaration_match or qualified_match:
+                offset = content[: (qualified_match or declaration_match).start()].count("\n")
+            if qualified_match:
+                owner_rank = 0
+            elif owner and declaration_match:
+                line = int(row.get("start_line") or 0) + offset
+                preceding = [start for start in owner_lines.get(path, []) if start <= line]
+                if preceding:
+                    owner_rank, owner_distance = 0, line - max(preceding)
             quality = (
                 1 if noisy else 0,
+                owner_rank,
+                owner_distance,
                 0 if kind_declaration is None or kind_declaration.search(content) else 1,
                 0 if declares and in_symbols else 1 if declares else 2,
                 0 if re.search(rf"\bexport\b[^\n]*\b{re.escape(name)}\b", content) else 1,
                 0 if stem == name.lower() else 1,
+                # A section that starts at the declaration holds more of its body.
+                offset,
             )
             matches.append((quality, row))
         matches.sort(key=lambda item: (item[0], str(item[1].get("file_path")), int(item[1].get("start_line") or 0)))
-        for _, row in matches[: max(1, limit_per_symbol)]:
+        for quality, row in matches[: max(1, limit_per_symbol)]:
             enriched = dict(row)
-            enriched["_defined_symbol"] = name
+            enriched["_defined_symbol"] = f"{owner}.{name}" if owner and quality[1] == 0 else name
             found.setdefault(str(row["id"]), enriched)
     return list(found.values())
+
+
+def _owner_declaration_lines(rows: list[Dict], owner: str) -> dict[str, list[int]]:
+    """Line numbers of ``class Owner`` (or ``Owner = ...`` objects) per file."""
+    pattern = re.compile(
+        rf"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(?:class|interface|struct|object|trait)\s+{re.escape(owner)}\b|"
+        rf"^\s*(?:export\s+)?(?:const|let|var)\s+{re.escape(owner)}\s*=",
+        re.MULTILINE,
+    )
+    lines: dict[str, list[int]] = defaultdict(list)
+    for row in rows:
+        content = str(row.get("content") or "")
+        for match in pattern.finditer(content):
+            line = int(row.get("start_line") or 0) + content[: match.start()].count("\n")
+            path = str(row.get("file_path") or "")
+            if line not in lines[path]:
+                lines[path].append(line)
+    return lines
 
 
 async def symbol_call_sites(
@@ -1284,11 +1950,15 @@ async def symbol_call_sites(
     *,
     limit: int = 10,
     staging_prefix: str | None = None,
+    per_file: int = 1,
 ) -> list[Dict]:
     """Chunks that call (not declare or import) the named identifiers.
 
-    One chunk per file: the best-ranked chunk whose content contains a call
-    such as ``name(`` or ``obj.name(`` on a line that is not the declaration.
+    ``per_file`` chunks per file (one by default): the best-ranked chunks
+    whose content contains a call such as ``name(`` or ``obj.name(`` on a
+    line that is not the declaration. A further chunk of a file counts only
+    for a call line the earlier ones do not already show, so "list every call
+    site" can reach a second caller in the same large file.
     """
     clean = [name for name in dict.fromkeys(_FTS_TERM_CLEAN.sub("", str(n)) for n in names) if len(name) >= 3][:3]
     if not clean:
@@ -1304,22 +1974,169 @@ async def symbol_call_sites(
         (re.compile(rf"(?<![\w$]){re.escape(name)}\s*(?:<[^>\n]*>)?\s*\("), _definition_regex(name))
         for name in clean
     ]
-    best: dict[str, Dict] = {}
+    best: dict[str, list[Dict]] = {}
     for row in exclude_staged(rows, staging_prefix):
         path = str(row.get("file_path") or "")
-        if not path or path in best or is_overview_file(path):
+        taken = best.get(path, [])
+        if not path or len(taken) >= max(1, per_file) or is_overview_file(path):
             continue
-        for line in str(row.get("content") or "").split("\n"):
+        start = int(row.get("start_line") or 0)
+        for offset, line in enumerate(str(row.get("content") or "").split("\n")):
             stripped = line.strip()
             if stripped.startswith(("import ", "export {", "export *", "from ", "//", "*", "#")):
                 continue
+            if any(int(other.get("start_line") or 0) <= start + offset <= int(other.get("end_line") or 0) for other in taken):
+                continue
             if any(call.search(line) and not declaration.search(line) for call, declaration in patterns):
-                best[path] = row
+                best.setdefault(path, []).append(row)
                 break
         if len(best) >= limit * 2:
             break
-    ordered = sorted(best.values(), key=lambda row: is_test_path(str(row.get("file_path"))) or is_doc_path(str(row.get("file_path"))))
+    ordered = sorted(
+        (row for rows_of_file in best.values() for row in rows_of_file),
+        key=lambda row: is_test_path(str(row.get("file_path"))) or is_doc_path(str(row.get("file_path"))),
+    )
     return ordered[:limit]
+
+
+TOOLING_QUESTION_PATTERN = re.compile(
+    r"\b(?:run|running|execute)\b[^.?!]{0,40}\b(?:tests?|specs?|suite|lint(?:er)?|linting|build|locally)\b|"
+    r"\b(?:lint|linter|linters|linting|eslint|prettier|ruff|flake8|pylint|formatter)\b|"
+    r"\b(?:npm|yarn|pnpm|poetry|tox|nox)\b|"
+    r"\b(?:install|set\s*up|setup)\b[^.?!]{0,30}\b(?:locally|dev(?:elopment)?|dependencies)\b",
+    re.IGNORECASE,
+)
+# Root files that define how a project is run, tested and linted, in the
+# order they are preferred as evidence.
+TOOLING_MANIFEST_FILES = (
+    "package.json", "pyproject.toml", "setup.cfg", "tox.ini", "noxfile.py", "Makefile", "makefile", "pytest.ini",
+    "setup.py", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs", ".eslintrc.yml", ".eslintrc.yaml", "eslint.config.js",
+    "eslint.config.mjs", ".prettierrc", "ruff.toml", ".flake8", ".mocharc.yml", ".mocharc.json", "Cargo.toml", "go.mod",
+)
+
+
+async def tooling_manifest_chunks(store, repo_id: str, *, limit: int = 4, staging_prefix: str | None = None) -> list[Dict]:
+    """The first sections of the repository's root manifests and tool configs."""
+    placeholders = ",".join("?" for _ in TOOLING_MANIFEST_FILES)
+    staging_filter, staging_args = ("", []) if not staging_prefix else (" AND id NOT LIKE ?", [f"{staging_prefix}%"])
+    rows = await store.fetch_all(
+        "SELECT id, file_path, start_line, end_line, language, symbols, content FROM chunks "
+        f"WHERE repo_id = ? AND file_path IN ({placeholders}){staging_filter} ORDER BY file_path, start_line LIMIT 24",
+        [repo_id, *TOOLING_MANIFEST_FILES, *staging_args],
+    )
+    priority = {name: index for index, name in enumerate(TOOLING_MANIFEST_FILES)}
+    per_file: dict[str, int] = defaultdict(int)
+    chosen: list[Dict] = []
+    for row in sorted(
+        exclude_staged(rows, staging_prefix),
+        key=lambda item: (priority.get(str(item.get("file_path")), len(priority)), int(item.get("start_line") or 0)),
+    ):
+        path = str(row.get("file_path") or "")
+        if path not in priority or per_file[path] >= 2:
+            continue
+        per_file[path] += 1
+        chosen.append(row)
+    return chosen[: max(1, limit)]
+
+
+_CALLED_NAME = re.compile(r"(?<![\w$])(_*[A-Za-z][\w$]*)\s*\(")
+# Language keywords and ubiquitous builtins look like calls but have no
+# repository definition worth following.
+_NOT_FOLLOWED_CALLS = {
+    "while", "return", "print", "isinstance", "issubclass", "super", "dict", "list", "tuple", "type", "range",
+    "function", "require", "catch", "switch", "typeof", "assert", "getattr", "setattr", "hasattr", "sorted", "filter",
+    "enumerate", "bool", "float", "repr", "iter", "next", "open", "format", "join", "split", "strip", "append",
+    "extend", "items", "keys", "values", "update", "elif", "with", "lambda", "raise", "except", "async", "await",
+    "yield", "self", "this", "console", "Error", "TypeError", "ValueError", "Promise", "Object", "Array", "String",
+}
+
+
+def _identifier_words(text: str) -> set[str]:
+    """Lowercase words of identifiers in ``text`` (camelCase and snake_case
+    split), with a plural ``s`` removed: ``_encode_files`` -> {encode, file}."""
+    words = re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", str(text))
+    return {word[:-1] if word.endswith("s") and len(word) > 3 else word for word in (w.lower() for w in words)}
+
+
+def called_names_for_question(chunks: list[Dict], terms: list[str], known_symbols: set[str], limit: int = 2) -> list[tuple[str, str, int]]:
+    """Names called in ``chunks`` that share a word with the question.
+
+    Returns ``(name, call-site chunk id, call line)``, best first: more shared
+    words in the name, then on the calling line (a name must share one word
+    and its call line at least one more). Names already defined in the
+    evidence (``known_symbols``) are skipped.
+    """
+    wanted = _identifier_words(" ".join(terms))
+    best: dict[str, tuple[float, str, int]] = {}
+    for chunk in chunks:
+        start = int(chunk.get("start_line") or 0)
+        lines = str(chunk.get("content") or "").split("\n")
+        for offset, (line, is_code) in enumerate(zip(lines, _code_line_mask(lines))):
+            if not is_code:
+                continue
+            for match in _CALLED_NAME.finditer(line):
+                name = match.group(1)
+                if len(name.strip("_")) < 4 or name in _NOT_FOLLOWED_CALLS or name in known_symbols:
+                    continue
+                # A one-word name ("request", "get") is called everywhere;
+                # only compound names are specific enough to follow.
+                if len(_identifier_words(name)) < 2 or _definition_regex(name).search(line):
+                    continue
+                shared = len(_identifier_words(name) & wanted)
+                if not shared:
+                    continue
+                around = len(_identifier_words(line.replace(name, " ")) & wanted)
+                score = shared + 0.5 * min(2, around)
+                if score >= 1.5 and (name not in best or score > best[name][0]):
+                    best[name] = (score, str(chunk.get("id")), start + offset)
+    ordered = sorted(best.items(), key=lambda item: (-item[1][0], item[0]))
+    return [(name, chunk_id, line) for name, (_, chunk_id, line) in ordered[: max(1, limit)]]
+
+
+async def called_definition_chunks(
+    store,
+    repo_id: str,
+    call_site_chunks: list[Dict],
+    terms: list[str],
+    *,
+    known_symbols: set[str] | None = None,
+    staging_prefix: str | None = None,
+) -> list[tuple[Dict, str, str, str]]:
+    """Definitions of question-related functions that the evidence calls.
+
+    Returns ``(definition chunk, call-site chunk id, name, "path:line")``.
+    One bounded symbol lookup covers every followed name; a definition in
+    the calling file, closest to the call, is preferred.
+    """
+    calls = called_names_for_question(call_site_chunks, terms, known_symbols or set())
+    if not calls:
+        return []
+    staging_filter, staging_args = ("", []) if not staging_prefix else (" AND id NOT LIKE ?", [f"{staging_prefix}%"])
+    rows = await store.fetch_all(
+        "SELECT id, file_path, start_line, end_line, language, symbols, content FROM chunks WHERE repo_id = ? AND ("
+        + " OR ".join("symbols LIKE ? ESCAPE '\\'" for _ in calls) + f"){staging_filter} LIMIT 60",
+        [repo_id, *(f'%"{escape_like(name)}"%' for name, _, _ in calls), *staging_args],
+    )
+    rows = exclude_staged(rows, staging_prefix)
+    by_id = {str(chunk.get("id")): chunk for chunk in call_site_chunks}
+    found: list[tuple[Dict, str, str, str]] = []
+    for name, call_site_id, call_line in calls:
+        call_path = str(by_id.get(call_site_id, {}).get("file_path") or "")
+        declaration = _definition_regex(name)
+        candidates = []
+        for row in rows:
+            content = str(row.get("content") or "")
+            match = declaration.search(content)
+            if not match or str(row.get("id")) == call_site_id or name not in _symbol_list(row.get("symbols")):
+                continue
+            path = str(row.get("file_path") or "")
+            line = int(row.get("start_line") or 0) + content[: match.start()].count("\n")
+            noisy = is_test_path(path) or is_doc_path(path)
+            candidates.append(((noisy, path != call_path, abs(line - call_line), line - int(row.get("start_line") or 0)), row))
+        if candidates:
+            candidates.sort(key=lambda item: item[0])
+            found.append((candidates[0][1], call_site_id, name, f"{call_path}:{call_line}"))
+    return found
 
 
 async def absent_question_terms(store, repo_id: str, terms: list[str]) -> list[str]:
@@ -1391,6 +2208,12 @@ SYMBOL_MENTION_BONUS = 0.035
 # few files that file-level semantic search ranks highest.
 STRICT_KEEP_SEMANTIC_FILES = 3
 USAGE_WEIGHT = 1.5
+# A manifest answering "how do I run the tests?" counts as two votes.
+TOOLING_WEIGHT = 2.0
+# A definition reached from a call site scores just below the call site, and
+# at least a little more than one first-place keyword vote.
+CALLED_DEFINITION_SHARE = 0.99
+CALLED_DEFINITION_FLOOR = 0.5 * SYMBOL_MENTION_BONUS
 USAGE_QUESTION_PATTERN = re.compile(
     r"\b(?:called|calls?|callers?|used|uses|usages?|invoked|invokes|referenced|references|imported|imports|consumed|consumers?)\b",
     re.IGNORECASE,
@@ -1487,6 +2310,113 @@ def _plan_scope_without_paths(query: str) -> str:
     return _query_scope(query, [], extract_issue_reference(query))
 
 
+# A named file is ranked from this many candidate sections (more for files
+# longer than that); related evidence from other files is capped.
+NAMED_FILE_CANDIDATE_SECTIONS = 24
+NAMED_FILE_COMPANIONS = 5
+
+
+def _companion(chunk: Dict, method: str, reason: str, evidence_plan: dict) -> Dict:
+    enriched = {key: value for key, value in chunk.items() if not key.startswith("_")}
+    enriched["_retrieval_methods"] = [method]
+    enriched["_retrieval_reasons"] = [reason]
+    enriched["_evidence_plan"] = evidence_plan
+    enriched["_relevance_score"] = 1.0
+    return enriched
+
+
+async def _named_file_evidence(
+    store,
+    repo_id: str,
+    query: str,
+    rows: list[Dict],
+    actual_paths: list[str],
+    evidence_plan: dict,
+    focus: dict,
+    *,
+    section_limit: int,
+    staging_prefix: str | None,
+) -> list[Dict]:
+    """Evidence for a question that names files.
+
+    The named files' sections are ranked by the question (declarations of the
+    names it uses first). When the question asks for tests, callers or
+    importers, those come from the other files that hold them: paired test
+    files, call sites, and import statements from the resolved graph. They
+    follow the few best sections so the context budget cannot cut them, and
+    they never displace the named file's best evidence.
+    """
+    ranked = rank_file_sections(rows, focus)
+    names = list(focus.get("names") or [])
+    wants_tests = bool(evidence_plan.get("tests_requested")) and not evidence_plan.get("tests_excluded")
+    jobs: dict[str, object] = {}
+    if wants_tests:
+        jobs["tests"] = paired_test_chunks(
+            store, repo_id, actual_paths, names, focus.get("qualified") or [], limit=3, staging_prefix=staging_prefix,
+        )
+    if names and USAGE_QUESTION_PATTERN.search(query):
+        jobs["callers"] = symbol_call_sites(store, repo_id, names[:2], limit=6, staging_prefix=staging_prefix)
+    if is_impact_question(query):
+        jobs["importers"] = importer_windows(
+            store, repo_id, actual_paths, limit=4, include_tests=wants_tests, staging_prefix=staging_prefix,
+        )
+    results: dict[str, list[Dict]] = {}
+    if jobs:
+        for key, result in zip(jobs, await asyncio.gather(*jobs.values(), return_exceptions=True)):
+            if isinstance(result, Exception):
+                logger.warning("Related evidence for a named file failed for %s (%s)", repo_id, type(result).__name__)
+                result = []
+            results[key] = exclude_staged(list(result), staging_prefix)
+    companions: list[Dict] = []
+    named = ", ".join(actual_paths[:2])
+    for row in results.get("tests", []):
+        subject = ", ".join(f"`{owner}.{member}`" for owner, member in focus.get("qualified") or []) or named
+        companions.append(_companion(row, "paired_test", f"Test file paired by name with {subject}", evidence_plan))
+    wants_docs = bool(evidence_plan.get("docs_requested")) and not evidence_plan.get("docs_excluded")
+    for row in results.get("callers", []):
+        path = str(row.get("file_path") or "")
+        if path in actual_paths or (is_test_path(path) and not wants_tests) or (is_doc_path(path) and not wants_docs):
+            continue
+        window = call_site_window(row, names[:2])
+        if window:
+            called = next((name for name in names[:2] if re.search(rf"(?<![\w$]){re.escape(name)}\s*\(", window["content"])), names[0])
+            companions.append(_companion(window, "symbol_usage", f"Calls `{called}` outside the named file", evidence_plan))
+    for row in results.get("importers", []):
+        companions.append(_companion(
+            row, "dependency", f"Imports {row.get('_imports') or named} (resolved import graph)", evidence_plan,
+        ))
+    companions = companions[:NAMED_FILE_COMPANIONS]
+    file_count = max(1, len(actual_paths))
+    per_file_limit = max(2, (section_limit - len(companions)) // file_count)
+    leading, rest = select_named_sections(ranked, per_file_limit, NAMED_FILE_LEADING_SECTIONS)
+    for section in [*leading, *rest]:
+        section.pop("_section_score", None)
+        section.pop("_section_named", None)
+        section["_evidence_plan"] = evidence_plan
+        section["_relevance_score"] = 2.0
+    evidence = [*leading, *companions, *rest]
+    _note_unretrieved_names(evidence_plan, focus, evidence)
+    return evidence
+
+
+def _note_unretrieved_names(evidence_plan: dict, focus: dict, chunks: list[Dict]) -> None:
+    """Record code names from the question that no evidence chunk contains.
+
+    The answer can then say "the retrieved code does not include X" instead
+    of concluding that X does not exist in the repository.
+    """
+    labels = {member: f"{owner}.{member}" for owner, member in focus.get("qualified") or []}
+    missing = []
+    for name in focus.get("names") or []:
+        pattern = re.compile(rf"(?<![\w$]){re.escape(name)}(?![\w$])")
+        if not any(pattern.search(str(chunk.get("content") or "")) for chunk in chunks):
+            missing.append(labels.get(name, name))
+    if missing:
+        evidence_plan["unretrieved_identifiers"] = missing[:6]
+    else:
+        evidence_plan.pop("unretrieved_identifiers", None)
+
+
 async def _retrieve_context(
     store,
     repo_id: str,
@@ -1521,9 +2451,19 @@ async def _retrieve_context(
     if requested_paths:
         # Editing needs the complete bounded set of chunks for the named file
         # so the model can form exact search/replace hunks. Normal questions
-        # retain their small citation budget and latency.
+        # retain their small citation budget and latency, but rank the file's
+        # sections by the question: the candidates are the sections that
+        # contain its names and words, not the first sections of the file.
         per_file_limit = settings.editing_max_chunks_per_file if editing_mode else top_k
-        rows = exclude_staged(await requested_files_chunks(store, repo_id, requested_paths, per_file_limit, staging_prefix), staging_prefix)
+        focus = None if editing_mode else question_focus(query, requested_paths)
+        candidate_limit = (
+            max(per_file_limit * 3, NAMED_FILE_CANDIDATE_SECTIONS)
+            if focus and (focus["names"] or focus["terms"]) else per_file_limit
+        )
+        rows = exclude_staged(
+            await requested_files_chunks(store, repo_id, requested_paths, candidate_limit, staging_prefix, focus=focus),
+            staging_prefix,
+        )
         resolved = [
             path for path in requested_paths
             if any(_path_matches_request(str(row.get("file_path") or ""), path) for row in rows)
@@ -1546,7 +2486,12 @@ async def _retrieve_context(
             requested_paths = resolved or requested_paths
     if requested_paths:
         actual_paths = list(dict.fromkeys(str(chunk.get("file_path") or "") for chunk in rows if chunk.get("file_path")))
-        if editing_mode and actual_paths:
+        if not editing_mode:
+            return await _named_file_evidence(
+                store, repo_id, query, rows, actual_paths, evidence_plan, focus or question_focus(query, requested_paths),
+                section_limit=per_file_limit * len(requested_paths), staging_prefix=staging_prefix,
+            )
+        if actual_paths:
             rows = exclude_staged(
                 await complete_files_chunks(store, repo_id, actual_paths, settings.editing_max_chunks_per_file, staging_prefix=staging_prefix),
                 staging_prefix,
@@ -1559,8 +2504,6 @@ async def _retrieve_context(
             enriched["_evidence_plan"] = evidence_plan
             enriched["_relevance_score"] = 2.0
             requested_chunks.append(enriched)
-        if not editing_mode:
-            return requested_chunks[: per_file_limit * len(requested_paths)]
 
         # An issue body often names the primary file but describes a change
         # that depends on callers, imports, or tests. Add a small supporting
@@ -1594,9 +2537,16 @@ async def _retrieve_context(
         directory_listing_chunk(store, repo_id, directory_candidates[0])
     ) if directory_candidates else None
     identifiers = extract_question_identifiers(query)
-    definition_question = bool(identifiers) and bool(DEFINITION_QUESTION_PATTERN.search(query))
+    # Dotted names add their member, looked up with its owner: "Client.get"
+    # finds ``def get`` under ``class Client``, "res.redirect" finds
+    # ``res.redirect = function``.
+    qualified = [] if editing_mode else extract_qualified_names(query)
+    owners = {member: owner for owner, member in qualified}
+    symbol_names = list(dict.fromkeys([*identifiers, *owners]))
+    definition_question = bool(symbol_names) and bool(DEFINITION_QUESTION_PATTERN.search(query))
     lowered_query = query.lower()
     question_terms = [term for term in search_terms(query) if term in lowered_query]
+    wants_tests = bool(evidence_plan.get("tests_requested")) and not evidence_plan.get("tests_excluded")
 
     # Issue text often mentions one subsystem while the actual fix also needs
     # tests, configuration, callers, or a dependency. Keep the bounded hybrid
@@ -1610,7 +2560,9 @@ async def _retrieve_context(
     )
     plan_hints = evidence_plan.get("path_hints", [])[:8]
     plan_task = asyncio.create_task(
-        path_hint_chunks_batch(store, repo_id, plan_hints, include_overview_files=include_overview_files)
+        path_hint_chunks_batch(
+            store, repo_id, plan_hints, include_overview_files=include_overview_files, terms=question_terms,
+        )
     ) if plan_hints else None
     readme_task = (
         asyncio.create_task(store.fetch_all(
@@ -1626,16 +2578,28 @@ async def _retrieve_context(
     )
     # "Where is X called/used?" also searches for the call sites of the
     # identifiers in the question (or, for a follow-up, in the earlier topic).
-    usage_names = (extract_question_identifiers(query) or extract_question_identifiers(search_text))[:2] \
+    # Two call sites per file, so "list every call site" can show a second
+    # caller in the same large file.
+    usage_names = (symbol_names or extract_question_identifiers(search_text))[:2] \
         if USAGE_QUESTION_PATTERN.search(query) and not editing_mode else []
     usage_task = asyncio.create_task(
-        symbol_call_sites(store, repo_id, usage_names, limit=8, staging_prefix=staging_prefix)
+        symbol_call_sites(store, repo_id, usage_names, limit=8, staging_prefix=staging_prefix, per_file=2)
     ) if usage_names else None
     symbol_task = asyncio.create_task(
         symbol_definition_chunks(
-            store, repo_id, identifiers, staging_prefix=staging_prefix, kinds=extract_question_symbol_kinds(query),
+            store, repo_id, symbol_names, staging_prefix=staging_prefix, kinds=extract_question_symbol_kinds(query),
+            owners=owners,
         )
-    ) if identifiers else None
+    ) if symbol_names else None
+    # "Which tests cover res.redirect?" pairs test files with the named code.
+    tests_task = asyncio.create_task(
+        paired_test_chunks(store, repo_id, [], symbol_names, qualified, limit=3, staging_prefix=staging_prefix)
+    ) if wants_tests and symbol_names and not editing_mode else None
+    # "How do I run the tests / what lint rules apply?" is answered by the
+    # project's manifests and tool configuration at the repository root.
+    tooling_task = asyncio.create_task(
+        tooling_manifest_chunks(store, repo_id, staging_prefix=staging_prefix)
+    ) if not editing_mode and TOOLING_QUESTION_PATTERN.search(query) else None
     # The query embedding is computed while keyword retrieval runs. A follow-up
     # embeds the expanded text so "where is that called?" keeps its topic. A
     # provider outage or a saturated limiter degrades to keyword + path
@@ -1643,7 +2607,7 @@ async def _retrieve_context(
     embedding_task = asyncio.create_task(asyncio.to_thread(embed_query, search_text))
 
     pending = [sparse_task]
-    for task in (plan_task, readme_task, overview_task, symbol_task, usage_task):
+    for task in (plan_task, readme_task, overview_task, symbol_task, usage_task, tests_task, tooling_task):
         if task:
             pending.append(task)
     results = await asyncio.gather(*pending, return_exceptions=True)
@@ -1672,6 +2636,8 @@ async def _retrieve_context(
     overview_chunks = take(overview_task)
     symbol_chunks = exclude_staged(take(symbol_task), staging_prefix)
     usage_chunks = exclude_staged(take(usage_task), staging_prefix)
+    paired_tests = exclude_staged(take(tests_task), staging_prefix)
+    tooling_chunks = exclude_staged(take(tooling_task), staging_prefix)
     plan_results = exclude_staged(plan_results, staging_prefix)
     # Question terms that no keyword result contains are probed against the
     # whole index (while the query embedding is still in flight). A term
@@ -1842,6 +2808,13 @@ async def _retrieve_context(
     for rank, chunk in enumerate(plan_results):
         matched_hint = str(chunk.get("matched_hint") or "path")
         vote(chunk, "workflow_target", f"Evidence-plan target matching the '{matched_hint}' path hint", PATH_SAMPLE_WEIGHT / (RRF_K + rank + 1))
+    # 4b. Test files paired by name with the code a test question names.
+    for chunk in paired_tests:
+        vote(chunk, "paired_test", "Test file paired by name with code the question names", SYMBOL_MENTION_BONUS)
+    # 4c. Root manifests and tool configuration for "how do I run/lint it?".
+    for rank, chunk in enumerate(tooling_chunks):
+        vote(chunk, "tooling_manifest", "Project manifest or tool configuration (scripts, test and lint setup)",
+             TOOLING_WEIGHT / (RRF_K + rank + 1))
     file_ranks = {path: rank for rank, path in enumerate(by_demotion(list(semantic_file_ranks)))}
 
     path_hints = evidence_plan.get("path_hints") or []
@@ -1867,6 +2840,37 @@ async def _retrieve_context(
             scores[chunk_id] = scores.get(chunk_id, 0.0) + PREVIOUS_CITATION_BOOST
             chunk_map[chunk_id] = annotate(chunk, "conversation", "Cited in the previous answer")
     ranked_chunks = [chunk_map[chunk_id] for chunk_id in sorted(scores, key=lambda key: (-scores[key], key))]
+    strict_question = is_strict_target_question(query, requested_paths, include_overview_files) and not issue_request
+
+    # 7. One hop from a call site to the definition it calls. The best
+    #    evidence for "why does prepare() fail with files=" is the call
+    #    ``self._encode_files(files, data)``; the answer also needs the body of
+    #    ``_encode_files``. Only called names that share a word with the
+    #    question are followed, and each definition ranks just below the call
+    #    site that led to it. Targeted questions (a location, a component)
+    #    keep their narrow evidence.
+    if not editing_mode and not strict_question and question_terms:
+        try:
+            expansions = await called_definition_chunks(
+                store, repo_id, [chunk for chunk in ranked_chunks[:6] if not demoted(chunk)], question_terms,
+                known_symbols={name for chunk in ranked_chunks[:top_k] for name in _symbol_list(chunk.get("symbols"))},
+                staging_prefix=staging_prefix,
+            )
+        except Exception as error:
+            logger.warning("Call-site definition expansion failed for %s (%s)", repo_id, type(error).__name__)
+            expansions = []
+        for definition, call_site_id, name, location in expansions:
+            # The definition ranks right below its call site whatever other
+            # votes it already has, so the budget that shows the call also
+            # shows the body it calls.
+            target = max(CALLED_DEFINITION_SHARE * scores.get(call_site_id, 0.0), CALLED_DEFINITION_FLOOR)
+            vote(definition, "called_definition", f"Defines `{name}`, which is called at {location}",
+                 max(0.0, target - scores.get(str(definition.get("id")), 0.0)))
+            # The call and the definition are shown together.
+            if call_site_id in chunk_map:
+                vote(chunk_map[call_site_id], "followed_call", f"Calls `{name}`, whose definition is included", 0.0)
+        if expansions:
+            ranked_chunks = [chunk_map[chunk_id] for chunk_id in sorted(scores, key=lambda key: (-scores[key], key))]
 
     # Impact questions get one extra, explicitly labelled pass over the
     # resolved dependency graph. If no file is named, use only a few directly
@@ -1902,19 +2906,28 @@ async def _retrieve_context(
             chunk for chunk in ranked_chunks
             if not is_overview_file(str(chunk.get("file_path", "")))
         ]
+    # "Library code (not tests or docs)": an explicit exclusion removes that
+    # evidence outright whenever anything else matched.
+    if not editing_mode:
+        for excluded, is_excluded_path in (("tests_excluded", is_test_path), ("docs_excluded", is_doc_path)):
+            if evidence_plan.get(excluded):
+                ranked_chunks = [
+                    chunk for chunk in ranked_chunks if not is_excluded_path(str(chunk.get("file_path", "")))
+                ] or ranked_chunks
 
     # A targeted component or implementation-location question keeps only
     # files whose paths identify the requested area, plus direct evidence that
-    # is independently strong (an exact definition, or the best chunks of the
-    # semantically closest files). When no path matches (the navbar lives in
-    # Layout.tsx, say), fall back to the best direct keyword/semantic evidence.
-    if is_strict_target_question(query, requested_paths, include_overview_files) and not issue_request:
+    # is independently strong (an exact definition, a paired test or a tool
+    # manifest the question asks for, or the best chunks of the semantically
+    # closest files). When no path matches (the navbar lives in Layout.tsx,
+    # say), fall back to the best direct keyword/semantic evidence.
+    if strict_question:
         target_hints = extract_question_path_hints(query)
         strong_files = {path for path, rank in file_ranks.items() if rank < STRICT_KEEP_SEMANTIC_FILES and not demoted(path)}
         targeted_chunks = [
             chunk for chunk in ranked_chunks
             if (target_hints and path_matches_hints(str(chunk.get("file_path", "")), target_hints))
-            or "symbol_definition" in (chunk.get("_retrieval_methods") or [])
+            or {"symbol_definition", "paired_test", "tooling_manifest"} & set(chunk.get("_retrieval_methods") or [])
         ]
         # A hint match does not rescue demoted evidence (a migration matching
         # "database", a doc matching "auth") when real code also matched.
@@ -1973,6 +2986,8 @@ async def _retrieve_context(
             listing["_relevance_score"] = 1.0
             evidence_plan["directory_listing"] = listing["file_path"]
             final_chunks = [listing, *final_chunks[: max(0, top_k - 1)]]
+    if not editing_mode and final_chunks:
+        _note_unretrieved_names(evidence_plan, {"names": symbol_names, "qualified": qualified}, final_chunks)
     return final_chunks
 
 
