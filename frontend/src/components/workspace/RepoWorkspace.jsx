@@ -9,6 +9,7 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import useMediaQuery from '../../hooks/useMediaQuery';
 import { errorMessage } from '../../api/client';
 import { parseRepository } from '../../lib/citations';
+import { CONVERSATION_PARAM } from '../../lib/conversations';
 import { formatCount, shortSha } from '../../lib/format';
 import { isKeywordOnly, phaseLabel, statusTone } from '../../lib/phase';
 import { downloadText, proposalPatch, slugify } from '../../lib/patch';
@@ -23,7 +24,9 @@ import { MessageScroller } from '../ai/MessageScroller';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
 import Menu from '../ui/Menu';
+import { toast } from '../ui/Toast';
 import Composer from './Composer';
+import ConversationList from './ConversationList';
 import DiffView from './DiffView';
 import { REVIEW_LABEL, isEditRun } from './EditProposalCard';
 import IngestionProgress, { IndexingLoadingState, useIndexingEta } from './IngestionProgress';
@@ -34,8 +37,9 @@ import SourcesPanel from './SourcesPanel';
 
 const TABS = [['chat', 'Chat', MessageSquareText], ['overview', 'Overview', LayoutDashboard]];
 
-const exportMarkdown = (repo, messages) => {
-  const lines = [`# ${repo.full_name || repo.repo_name}`, '', `Exported from Codebase Intel on ${new Date().toLocaleString()}.`, ''];
+const exportMarkdown = (repo, messages, conversation) => {
+  const heading = [repo.full_name || repo.repo_name, conversation?.title].filter(Boolean).join(': ');
+  const lines = [`# ${heading}`, '', `Exported from Codebase Intel on ${new Date().toLocaleString()}.`, ''];
   messages.forEach((message) => {
     lines.push(message.role === 'user' ? `## Q: ${message.content}` : message.content, '');
     if (message.role === 'assistant' && message.citations?.length) {
@@ -295,7 +299,10 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
   const isQuerying = useStore((state) => state.isQuerying);
   const askQuestion = useStore((state) => state.askQuestion);
   const stopQuery = useStore((state) => state.stopQuery);
-  const clearChat = useStore((state) => state.clearChat);
+  const startNewChat = useStore((state) => state.startNewChat);
+  const conversation = useStore((state) => state.conversation);
+  const selectedRepo = useStore((state) => state.selectedRepo);
+  const collectConversation = useStore((state) => state.collectConversation);
   const sources = useStore((state) => state.sources);
   const sourcesOpen = sources.open;
   const closeSources = useStore((state) => state.closeSources);
@@ -333,6 +340,21 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
       return params;
     }, { replace: true, state: location.state });
   };
+
+  // The open conversation lives in the URL too (?c=<id>), so a reload or a
+  // copied link reopens it. Only once this repository's history has loaded:
+  // during a switch the store still holds the previous repository's.
+  const conversationId = conversation?.id || null;
+  const urlConversation = searchParams.get(CONVERSATION_PARAM) || null;
+  useEffect(() => {
+    if (selectedRepo !== repo.repo_name || isHistoryLoading || urlConversation === conversationId) return;
+    setSearchParams((current) => {
+      const params = new URLSearchParams(current);
+      if (conversationId) params.set(CONVERSATION_PARAM, conversationId);
+      else params.delete(CONVERSATION_PARAM);
+      return params;
+    }, { replace: true, state: location.state });
+  }, [conversationId, urlConversation, selectedRepo, repo.repo_name, isHistoryLoading]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     setActionError('');
@@ -552,6 +574,23 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
     setRetrying(false);
   };
 
+  // A new chat never deletes anything: the open conversation stays in History.
+  const newChat = () => {
+    const saved = conversation?.id && messages.length ? conversation : null;
+    setActionError('');
+    setTab('chat');
+    startNewChat();
+    composerRef.current?.focus();
+    if (saved) toast({ title: 'New chat started', description: `“${saved.title || 'Your previous conversation'}” is saved in History.`, duration: 4000 });
+  };
+
+  // Exports the whole open conversation, including pages not loaded yet.
+  const exportConversation = () => runAction(async () => {
+    const all = await collectConversation();
+    const name = conversation?.title ? `${slugify(repo.repo_name)}-${slugify(conversation.title, 'conversation')}` : `${slugify(repo.repo_name)}-conversation`;
+    downloadText(`${name}.md`, exportMarkdown(repo, all, conversation), 'text/markdown');
+  }, 'Could not export the conversation. Try again.');
+
   const dismissNotice = (key) => {
     rememberDismissed(key);
     setDismissed(readDismissed());
@@ -649,7 +688,8 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
                   </button>
                 ))}
               </div>
-              <Button size="icon" variant="ghost" icon={SquarePen} aria-label="New chat" title="New chat" disabled={!messages.length || isQuerying} onClick={() => runAction(clearChat, 'Could not clear the conversation.')} />
+              {repo.queryable && <ConversationList repoName={repo.repo_name} onNewChat={newChat} onOpen={() => setTab('chat')} />}
+              <Button size="icon" variant="ghost" icon={SquarePen} aria-label="New chat" title="New chat (the current conversation stays in History)" disabled={!messages.length || isQuerying} onClick={newChat} />
               <Menu
                 label="Repository actions"
                 trigger={({ toggle, props }) => (
@@ -658,7 +698,7 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
                   </button>
                 )}
                 items={[
-                  { label: 'Export conversation', icon: Download, disabled: !messages.length, onSelect: () => downloadText(`${slugify(repo.repo_name)}-conversation.md`, exportMarkdown(repo, messages), 'text/markdown') },
+                  { label: 'Export conversation', icon: Download, disabled: !messages.length, onSelect: exportConversation },
                   repo.is_indexing
                     ? { label: 'Stop indexing…', icon: Square, disabled: stopping, onSelect: () => onRequestDialog('stop', repo) }
                     : { label: 'Re-index…', icon: RefreshCw, onSelect: () => onRequestDialog('reindex', repo) },
