@@ -133,6 +133,40 @@ class PythonResolutionTests(unittest.TestCase):
         }))
         self.assertEqual(found, {("app/main.py", "pkg/models.py"), ("app/main.py", "pkg/__init__.py")})
 
+    def test_a_package_in_docs_never_stands_in_for_the_standard_library_or_other_projects(self):
+        found = pairs(build_graph({
+            "pyproject.toml": "[project]\nname = 'app'\n",
+            "src/app/__init__.py": "",
+            "src/app/main.py": "import logging\nimport logging.handlers\nimport utils\n",
+            "tests/test_main.py": "import logging\nimport logging.handlers\nimport app\n",
+            "docs/examples/logging/__init__.py": "",
+            "docs/examples/logging/handlers.py": "",
+            "docs/examples/run.py": "import logging\n",
+            "scripts/utils/__init__.py": "",
+        }))
+        self.assertEqual(found, {
+            ("tests/test_main.py", "src/app/__init__.py"),
+            # Inside its own tree the example package is what Python finds.
+            ("docs/examples/run.py", "docs/examples/logging/__init__.py"),
+        })
+
+    def test_installed_projects_and_fixture_apps_in_a_test_folder_still_resolve(self):
+        found = pairs(build_graph({
+            # A monorepo: every project is installed, so any file can import it.
+            "packages/core/pyproject.toml": "[project]\nname = 'core'\n",
+            "packages/core/src/core/__init__.py": "",
+            "packages/core/tests/test_core.py": "import core\n",
+            "apps/web/main.py": "import core\n",
+            # Flask's conftest puts tests/test_apps on sys.path.
+            "tests/test_blueprints.py": "from blueprintapp import app\n",
+            "tests/test_apps/blueprintapp/__init__.py": "app = 1\n",
+        }))
+        self.assertEqual(found, {
+            ("packages/core/tests/test_core.py", "packages/core/src/core/__init__.py"),
+            ("apps/web/main.py", "packages/core/src/core/__init__.py"),
+            ("tests/test_blueprints.py", "tests/test_apps/blueprintapp/__init__.py"),
+        })
+
 
 class JavaScriptResolutionTests(unittest.TestCase):
     def test_tests_that_require_the_package_directory_resolve_to_its_entry(self):

@@ -16,7 +16,9 @@ Python imports are resolved the way the interpreter finds them: from the
 directories that hold top-level packages (``src/`` layouts included), from
 the script's own directory when it is not inside a package (how pytest runs
 ``tests/``), and relative to the current package. ``import flask`` in
-``tests/test_basic.py`` therefore resolves to ``src/flask/__init__.py``.
+``tests/test_basic.py`` therefore resolves to ``src/flask/__init__.py``. A
+package outside an installable project (``docs/examples/logging``) is only
+seen from its own tree, so it never stands in for the standard library.
 
 The graph can be built from a checkout (``build_manifest_and_dependency_manifest``)
 or from file text already in the index (``DependencyScanner``), so an index
@@ -29,6 +31,7 @@ import json
 import os
 import posixpath
 import re
+import sys
 from collections.abc import Iterable
 
 _PY_FROM = re.compile(r"^\s*from\s+([.A-Za-z_][\w.]*(?:/[^\s]+)?)(?:\s+import\s+.+)?", re.MULTILINE)
@@ -76,12 +79,18 @@ _PY_IMPORT_LINE = re.compile(r"^\s*import\s+([A-Za-z_][\w.]*(?:\s+as\s+\w+)?(?:\
 _PY_FROM_LINE = re.compile(r"^\s*from\s+(\.+|\.*[A-Za-z_][\w.]*)\s+import\s+(.*)$")
 _PY_NAME = re.compile(r"^[A-Za-z_]\w*$")
 _PY_MODULE_SUFFIXES = (".py", ".pyi", "/__init__.py", "/__init__.pyi")
+# A directory holding one of these is an installable project: its packages
+# are importable from anywhere once installed (monorepos, ``examples/x``).
+_PY_PROJECT_FILES = frozenset({"pyproject.toml", "setup.py", "setup.cfg"})
+# Source folders a project keeps its packages in (``src/flask``, ``lib/ansible``).
+_PY_SOURCE_DIRS = frozenset({"src", "lib"})
+_PY_STDLIB = frozenset(getattr(sys, "stdlib_module_names", ()))
 
 # The graph is replaced as a whole, and its last row records the resolver
 # version that built it. Raise the version whenever resolution changes so
 # existing indexes are rebuilt (from the indexed text) on next use. The row
 # uses empty paths, which never match a real file in any graph query.
-GRAPH_VERSION = 2
+GRAPH_VERSION = 3
 _GRAPH_VERSION_PREFIX = "graph-version:"
 
 
@@ -383,6 +392,14 @@ class _PyResolver:
     outside any package (a script, or a pytest ``tests/`` directory without
     ``__init__.py``) also sees its own directory first, which is where
     Python puts it on ``sys.path``.
+
+    Other roots are only searched from files in the same project tree, from
+    a test folder that contains them, or when the root is an installable
+    project (it, or the folder above its ``src``, has a
+    ``pyproject.toml``/``setup.py``). A package under
+    ``docs/examples/logging`` therefore never captures ``import logging``
+    elsewhere, and a standard library name never resolves to another
+    project's package at all.
     """
 
     def __init__(self, known_files: set[str]) -> None:
@@ -397,6 +414,22 @@ class _PyResolver:
             if parent not in self.packages:
                 self.top_level.setdefault(posixpath.basename(package), set()).add(parent)
         self.roots = sorted({"", "src", *(root for roots in self.top_level.values() for root in roots)})
+        projects = {posixpath.dirname(path) for path in known_files if posixpath.basename(path) in _PY_PROJECT_FILES}
+        self.installable = {root for root in self.roots if root in projects or _project_dir(root) in projects}
+
+    def _visible(self, root: str, name: str, source_path: str) -> bool:
+        """Whether ``import name`` in ``source_path`` may be found under ``root``."""
+        project = _project_dir(root)
+        if project == "" or source_path.startswith(project + "/"):
+            return True
+        if name in _PY_STDLIB:
+            return False
+        # Fixture apps inside a test folder (a conftest puts ``tests/test_apps``
+        # on ``sys.path`` for ``from blueprintapp import app``).
+        script = self.script_root(source_path)
+        if script and root.startswith(script + "/"):
+            return True
+        return root in self.installable
 
     def module_file(self, base: str) -> str | None:
         """``base.py`` or ``base/__init__.py`` (``base`` is a path without suffix)."""
@@ -416,11 +449,12 @@ class _PyResolver:
         return directory
 
     def _roots_for(self, name: str, source_path: str) -> list[str]:
-        own = self.top_level.get(name, set())
+        own = [root for root in self.top_level.get(name, ()) if self._visible(root, name, source_path)]
         # Several copies of a package (vendored, examples): the one sharing
         # the longest path with the importing file wins, then the shortest.
         ranked = sorted(own, key=lambda root: (-_common_depth(root, source_path), len(root), root))
-        ordered = [self.script_root(source_path), *ranked, "", "src", *self.roots]
+        others = [root for root in self.roots if self._visible(root, name, source_path)]
+        ordered = [self.script_root(source_path), *ranked, "", "src", *others]
         return list(dict.fromkeys(ordered))
 
     def init_file(self, directory: str) -> str | None:
@@ -523,6 +557,11 @@ class _PyResolver:
             if not relative:
                 results.extend((target, init) for init in self.ancestor_inits(module, root, source_path))
         return results
+
+
+def _project_dir(root: str) -> str:
+    """The project folder of a search root: ``packages/a`` for ``packages/a/src``."""
+    return posixpath.dirname(root) if posixpath.basename(root) in _PY_SOURCE_DIRS else root
 
 
 def _common_depth(directory: str, source_path: str) -> int:
