@@ -999,6 +999,8 @@ async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool) -
                             answer = "".join(parts) + "\n\n> The answer was interrupted. Ask again to regenerate it."
                             mode = "partial"
                         else:
+                            # The other model failed too: nothing was written by it.
+                            answer_notice = None
                             logger.warning("Live answer generation unavailable for repository %s (%s); returning evidence",
                                            repo["id"], answer_failure["reason"])
                             answer, mode = build_retrieval_fallback(citation_chunks, workflow, answer_failure["message"]), "retrieval_fallback"

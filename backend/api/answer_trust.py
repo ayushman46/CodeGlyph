@@ -318,7 +318,10 @@ def describe_answer_failure(error: Exception, model_profile: str) -> dict:
     requested = _PROFILE_NAMES.get(model_profile, "answer")
     if previous is not None:
         other = _PROFILE_NAMES.get(alternate_profile(model_profile), "other")
-        message = f"{_failure_sentence(previous, requested)}, and {_failure_sentence(error, other)}."
+        if _failure_reason(previous) == _failure_reason(error) == "timeout":
+            message = f"neither the {requested} nor the {other} model responded in time."
+        else:
+            message = f"{_failure_sentence(previous, requested)}, and {_failure_sentence(error, other)}."
     else:
         message = f"{_failure_sentence(error, requested)}."
     return {

@@ -859,7 +859,7 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
           </Notice>
         )}
 
-        {message.answer_notice?.message && settled && (
+        {message.answer_notice?.message && settled && message.mode !== 'retrieval_fallback' && (
           <Notice tone="neutral" icon={Info} title={`Written by the ${PROFILE_NAMES[message.answer_notice.model_profile] || 'other'} model`}>
             {message.answer_notice.message}
           </Notice>

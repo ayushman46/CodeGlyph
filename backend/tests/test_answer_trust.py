@@ -608,6 +608,16 @@ class AnswerTrustEndpointTests(answers.EndpointTestCase):
                       "is busy or down (HTTP 503).", done["answer"])
         self.assertEqual(self.history()[-1]["answer_failure"], done["answer_failure"])
 
+    def test_when_the_other_model_fails_too_no_switch_is_reported(self):
+        primary = LLMProviderError("x", reason="timeout")
+        error = LLMProviderError("x", reason="timeout")
+        error.previous = primary
+        done = self.ask(stream_of(ModelSwitch("fast", primary), error=error), model_profile="detailed")[-1][1]
+        self.assertEqual(done["mode"], "retrieval_fallback")
+        self.assertIsNone(done["answer_notice"])
+        self.assertEqual(done["answer_failure"]["message"], "Neither the Detailed nor the Fast model responded in time.")
+        self.assertNotIn("answer_notice", self.history()[-1])
+
     def test_a_model_switch_is_reported_with_the_answer(self):
         switch = ModelSwitch("fast", LLMProviderError("x", reason="planning"))
         done = self.ask(stream_of(switch, "The answer is in `src/auth.py:L1-L2`."), model_profile="detailed")[-1][1]
