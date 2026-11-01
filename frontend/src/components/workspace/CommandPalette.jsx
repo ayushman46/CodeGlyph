@@ -7,6 +7,7 @@ import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { parseRepositoryInput } from '../../lib/format';
 import { statusSentence } from '../../lib/phase';
+import { canManage } from '../../lib/sharing';
 import { getThemePreference, resolveTheme, setThemePreference } from '../../lib/theme';
 import useStore from '../../store/useStore';
 import useFocusTrap from '../../hooks/useFocusTrap';
@@ -77,6 +78,9 @@ const CommandPalette = ({ open, onClose, onAddRepository, currentRepo = null, on
         { id: 'tab-overview', label: 'Open overview', icon: LayoutDashboard, group: current.repo_name, run: () => onShowTab?.('overview') },
         { id: 'coverage', label: 'Coverage report', icon: PieChart, group: current.repo_name, run: act('coverage') },
         ...(current.queryable ? [{ id: 'impact', label: 'Change impact', icon: GitFork, group: current.repo_name, run: act('impact') }] : []),
+      ] : []),
+      // Stopping, re-indexing, renaming and deleting are the owner's alone.
+      ...(current && canManage(current) ? [
         current.is_indexing
           ? { id: 'stop', label: 'Stop indexing', icon: Square, group: current.repo_name, run: act('stop') }
           : { id: 'reindex', label: 'Re-index', icon: RefreshCw, group: current.repo_name, run: act('reindex') },

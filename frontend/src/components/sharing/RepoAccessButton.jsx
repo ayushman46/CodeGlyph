@@ -48,15 +48,16 @@ export const AccessDialog = ({ repo, open, onClose, stay = false }) => {
       size="sm"
       title="Shared with you"
       description={`${owner} shared ${repo.repo_name} with you. You ask questions using their index; your conversations stay private to you.`}
+      // Keys keep React from reusing (and colour-animating) the other state's buttons.
       footer={confirming ? (
         <>
-          <Button variant="ghost" size="sm" onClick={() => setConfirming(false)} disabled={busy}>Cancel</Button>
-          <Button variant="danger" size="sm" loading={busy} onClick={leave}>Leave repository</Button>
+          <Button key="cancel" variant="ghost" size="sm" onClick={() => setConfirming(false)} disabled={busy}>Cancel</Button>
+          <Button key="leave" variant="danger" size="sm" loading={busy} onClick={leave}>Leave repository</Button>
         </>
       ) : (
         <>
-          <Button variant="danger-ghost" size="sm" icon={LogOut} className="mr-auto" onClick={() => setConfirming(true)}>Leave…</Button>
-          <Button variant="secondary" size="sm" onClick={onClose}>Done</Button>
+          <Button key="ask-leave" variant="danger-ghost" size="sm" icon={LogOut} className="mr-auto" onClick={() => setConfirming(true)}>Leave…</Button>
+          <Button key="done" variant="secondary" size="sm" onClick={onClose}>Done</Button>
         </>
       )}
     >

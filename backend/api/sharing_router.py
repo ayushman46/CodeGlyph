@@ -90,11 +90,6 @@ def account_label(user: Any) -> str:
     return "A teammate"
 
 
-def _date_label(value: Any) -> str:
-    parsed = _parse_time(value)
-    return parsed.strftime("%d %b %Y").lstrip("0") if parsed else "an earlier date"
-
-
 def _full_name(github_url: Any) -> str:
     try:
         owner, name = parse_github_repository(str(github_url or ""))
@@ -325,7 +320,7 @@ async def _load_invite(store, token: str) -> dict[str, Any]:
     if state == "expired":
         raise HTTPException(
             status_code=410,
-            detail=f"This invite link expired on {_date_label(invite.get('expires_at'))}. Ask {owner} for a new link.",
+            detail=f"This invite link has expired. Ask {owner} for a new link.",
             headers={"X-Error-Code": "invite_expired"},
         )
     return invite

@@ -139,6 +139,13 @@ test('a viewer sees the repository under Shared with you, can ask, and cannot us
   await page.getByRole('button', { name: `Shared with you by ${OWNER_LABEL}: Viewer access` }).click();
   const access = page.getByRole('dialog', { name: 'Shared with you' });
   await expect(access.getByText('Need Edit & PR? Ask ann@example.com to make you an editor.')).toBeVisible();
+  await access.getByRole('button', { name: 'Done' }).click();
+
+  // The command palette offers the same actions as the menu.
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+K' : 'Control+K');
+  const commands = page.getByRole('listbox', { name: 'Commands' });
+  await expect(commands.getByRole('option', { name: /Coverage report/ })).toBeVisible();
+  await expect(commands.getByRole('option', { name: /Rename repository|Delete repository|Re-index/ })).toHaveCount(0);
 });
 
 test('an editor can switch to Edit & PR on a shared repository', async ({ page }) => {
@@ -169,11 +176,13 @@ test('opening an invite link shows the repository, owner and role, and Join open
 test('an expired or revoked invite link says so', async ({ page }) => {
   await mockApi(page);
   await mockSharing(page, {
-    invite: { error: { status: 410, code: 'invite_expired', detail: `This invite link expired on 1 Nov 2026. Ask ${OWNER_LABEL} for a new link.` } },
+    invite: { error: { status: 410, code: 'invite_expired', detail: `This invite link has expired. Ask ${OWNER_LABEL} for a new link.` } },
   });
   await page.goto(`/invite/${TOKEN}`);
   await expect(page.getByRole('heading', { name: 'This invite link has expired' })).toBeVisible();
-  await expect(page.getByText(`Ask ${OWNER_LABEL} for a new link.`)).toBeVisible();
+  await expect(page.getByText(`Ask ${OWNER_LABEL} for a new link.`, { exact: true })).toBeVisible();
+  // The heading is not repeated in the explanation under it.
+  await expect(page.getByText(/This invite link has expired/)).toHaveCount(1);
   await expect(page.getByRole('button', { name: 'Join' })).toHaveCount(0);
 });
 

@@ -96,12 +96,22 @@ export const inviteSentence = (role, expiresAt, locale = undefined) => {
  * The title and next step for an invite link the server refused, from the
  * response status and its X-Error-Code header.
  */
+const plain = (text) => text.replace(/[’']/g, "'").toLowerCase();
+
 export const inviteProblem = (status, code, detail = '') => {
-  if (code === 'invite_expired') return { title: 'This invite link has expired', detail: detail || 'Ask the person who shared it for a new link.' };
-  if (code === 'invite_revoked') return { title: 'This invite link was revoked', detail: detail || 'Ask the person who shared it for a new link.' };
-  if (code === 'share_removed') return { title: 'Your access was removed', detail: detail || 'Ask the owner for a new invite link if you still need this repository.' };
+  const problem = (title, fallback) => {
+    // The server's message stands alone for API clients, so it may start
+    // with the title; under that heading the sentence would only repeat it.
+    const text = String(detail || '').trim();
+    const first = text.match(/^[^.]*\.\s*/)?.[0] || '';
+    const rest = first && plain(first).startsWith(plain(title)) ? text.slice(first.length) : text;
+    return { title, detail: rest || fallback };
+  };
+  if (code === 'invite_expired') return problem('This invite link has expired', 'Ask the person who shared it for a new link.');
+  if (code === 'invite_revoked') return problem('This invite link was revoked', 'Ask the person who shared it for a new link.');
+  if (code === 'share_removed') return problem('Your access was removed', 'Ask the owner for a new invite link if you still need this repository.');
   if (status === 404 || code === 'invite_invalid') {
-    return { title: 'This invite link isn’t valid', detail: detail || 'Check that you copied the whole link, or ask for a new one.' };
+    return problem('This invite link isn’t valid', 'Check that you copied the whole link, or ask for a new one.');
   }
-  return { title: 'This invite couldn’t be opened', detail: detail || 'Check your connection and try again.' };
+  return problem('This invite couldn’t be opened', 'Check your connection and try again.');
 };

@@ -67,6 +67,13 @@ test('an invite sentence says the role and the last day it works', () => {
   assert.equal(inviteSentence('editor', '', 'en-GB'), 'Anyone signed in with this link can join as an editor.');
 });
 
+test('a server message that starts with the title is not repeated under it', () => {
+  assert.equal(inviteProblem(410, 'invite_revoked', 'This invite link was revoked. Ask ann for a new link.').detail, 'Ask ann for a new link.');
+  assert.equal(inviteProblem(410, 'invite_expired', 'This invite link has expired. Ask ann for a new link.').detail, 'Ask ann for a new link.');
+  assert.equal(inviteProblem(404, 'invite_invalid', "This invite link isn't valid. Check that you copied the whole link.").detail, 'Check that you copied the whole link.');
+  assert.equal(inviteProblem(410, 'invite_revoked', 'This invite link was revoked.').detail, 'Ask the person who shared it for a new link.');
+});
+
 test('refused invite links get a clear title and the server\'s next step', () => {
   assert.equal(inviteProblem(410, 'invite_expired', 'This invite link expired on 9 Nov 2026. Ask ann for a new link.').title, 'This invite link has expired');
   assert.equal(inviteProblem(410, 'invite_revoked').title, 'This invite link was revoked');
