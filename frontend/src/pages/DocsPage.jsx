@@ -92,7 +92,7 @@ const SECTIONS = [
     icon: MessageSquareText,
     eyebrow: 'Asking questions',
     title: 'Answers that show their work.',
-    summary: 'Pick a workflow and ask in plain language. Every claim cites `file:line` ranges checked against the indexed code.',
+    summary: 'Pick a workflow and ask in plain language. Answers cite `file:line` ranges, and every reference and code name is checked against the indexed code.',
     blocks: [
       { type: 'h2', text: 'Workflows' },
       { type: 'p', text: 'A workflow focuses retrieval and shapes how the answer is organised.' },
@@ -111,6 +111,18 @@ const SECTIONS = [
       { type: 'p', text: 'Answers stream in real time. Claims cite code with its path and line range:' },
       { type: 'pills', items: ['src/server/auth.ts:L12-L40', 'packages/db/schema.prisma:L88-L104'] },
       { type: 'p', text: 'Every citation opens the exact lines in the built-in file viewer and links to GitHub at the indexed commit, so the code you read is the code the answer was based on. Sources are grouped by folder, which makes it easy to see which parts of the repository an answer relied on.' },
+      { type: 'h2', text: 'What the checks mean' },
+      { type: 'p', text: 'Under each answer, a line says how many file/line references exist in the indexed code. That confirms where the answer points, not that every sentence is right. Anything that needs a second look is listed with the reason:' },
+      {
+        type: 'list',
+        items: [
+          ['Not part of this answer’s evidence', 'The file is indexed but the model was not shown those lines. The reference still opens the file.'],
+          ['Matches several files', 'A bare name such as view.js; the matching files are listed.'],
+          ['Not in the indexed snapshot', 'The path does not exist in the index.'],
+          ['Not found in the indexed code', 'A function, class or other code name that occurs nowhere in the indexed files. Search code checks it in one click.'],
+        ],
+      },
+      { type: 'callout', title: 'Long answers and copying', text: 'An answer that reaches the length limit says so; Continue writes the rest into the same message. Copy reply, or Copy section on a heading, copies Markdown with each reference linked to its lines on GitHub at the answer’s commit.' },
       { type: 'callout', title: 'Follow-up questions', text: 'Ask follow-ups in the same conversation; recent messages are kept in context. Conversations are saved per repository, so you can pick up where you left off.' },
     ],
   },
