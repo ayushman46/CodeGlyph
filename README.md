@@ -12,6 +12,8 @@ It is built for the first hours in an unfamiliar codebase: new engineers onboard
 - **Accurate retrieval.** File-level semantic search, keyword search with prefix matching and path weighting, path-aware ranking for component questions, the import graph for impact questions, and follow-up awareness for short questions like "where is it called?".
 - **Code editing and pull requests.** Describe a change or paste a GitHub issue URL. The agent plans the change across files (call sites, types, styles, tests, new files when needed), reads the current files from GitHub, writes exact search/replace hunks, validates every hunk against the real file, and shows the result inline in the chat. The review screen has unified and split diffs, in-place editing with a live diff, a prefilled pull request, `.patch` download, and one-click PR creation (a branch in the repository, or a fork when you lack write access). Nothing is pushed without your review.
 - **Exploration tools.** Repository overview (languages, folder map, key files, suggested questions), instant code search, and change-impact analysis.
+- **Start here for new engineers.** The overview names the entry file, the core folder, the install / test / run commands and a 3–5 step reading path, each linked to the file and line it comes from. It is built from the indexed manifests, README and imports, with no model call.
+- **Clear first minutes.** A queued repository shows how many are ahead of it and an estimated start (from recent indexing runs); a mistyped `owner/repo` is reported as not found before anything is added.
 - Light and dark themes, a command palette (`⌘K` / `Ctrl+K`), keyboard-first chat, and a responsive layout down to phone width.
 
 ## Architecture
@@ -159,10 +161,10 @@ All routes require a Supabase bearer token except health/readiness and the GitHu
 | Method | Route | Purpose |
 | --- | --- | --- |
 | GET | `/api/health`, `/api/ready` | Liveness and dependency readiness |
-| POST | `/api/ingest` | Queue a repository (URL or `owner/repo`) |
-| GET | `/api/repos`, `/api/repos/statuses`, `/api/status/{repo}` | Repository state (`is_indexing`, `queryable`, phase, progress, coverage summary) |
+| POST | `/api/ingest` | Queue a repository (URL or `owner/repo`); 404 when GitHub has no such public repository |
+| GET | `/api/repos`, `/api/repos/statuses`, `/api/status/{repo}` | Repository state (`is_indexing`, `queryable`, phase, progress, `searchable_files`, `semantic_sections`, `queue` while waiting, coverage summary) |
 | GET | `/api/repos/{repo}/coverage` | Omitted files with reasons and the indexing budget |
-| GET | `/api/repos/{repo}/overview` | Languages, folder map, key files, suggested questions |
+| GET | `/api/repos/{repo}/overview` | Languages, folder map, key files, suggested questions, `start_here` (entry, core folder, cited commands, reading path) |
 | GET | `/api/repos/{repo}/search?q=` | Instant code search |
 | GET | `/api/repos/{repo}/file?path=` | One file at the indexed commit |
 | GET | `/api/repos/{repo}/impact?file_path=` | Files that import a file, and what it imports |
