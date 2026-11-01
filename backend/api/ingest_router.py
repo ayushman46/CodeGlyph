@@ -1,23 +1,63 @@
 import logging
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from api.auth import get_current_user
 from api.repository_state import friendly_conflict, raise_storage_error
-from config import ingest_request_limiter
+from config import ingest_request_limiter, settings
 from database import DatabaseConfigurationError, TransientDatabaseError, assert_turso_schema, get_turso_store
-from ingest.cloner import RepositoryValidationError, normalize_github_url, parse_github_ref, repository_source_url
+from ingest.cloner import (
+    ARCHIVE_USER_AGENT,
+    RepositoryValidationError,
+    normalize_github_url,
+    parse_github_ref,
+    parse_github_repository,
+    repository_source_url,
+)
 from ingest.pipeline import IngestionConflictError, enqueue_ingestion_job, enforce_ingestion_capacity, ensure_repo_record
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _START_FAILED = "Couldn't start indexing this repository because of a problem on our side. Try again in a moment."
+# A quick look before anything is stored, so a mistyped name never leaves a
+# failed repository behind. Slow or unreachable GitHub never blocks indexing.
+_EXISTENCE_CHECK_TIMEOUT_SECONDS = 4.0
 
 
 class IngestRequest(BaseModel):
     github_url: str = Field(min_length=1, max_length=2_048)
+
+
+async def public_repository_exists(owner: str, name: str) -> bool | None:
+    """Whether GitHub serves ``owner/name``: True, False (404), or None (unknown).
+
+    Asks the same archive host the worker downloads from (no API rate limit),
+    with a HEAD request for the default branch. A 404 there is exactly the
+    "Repository not found" failure the worker would hit later; any other
+    answer, a timeout or a network error is "unknown" and indexing proceeds.
+    """
+    url = f"{settings.github_codeload_base_url.rstrip('/')}/{owner}/{name}/tar.gz/HEAD"
+    try:
+        async with httpx.AsyncClient(timeout=_EXISTENCE_CHECK_TIMEOUT_SECONDS, follow_redirects=True) as client:
+            response = await client.head(url, headers={"User-Agent": ARCHIVE_USER_AGENT})
+    except (httpx.HTTPError, OSError) as error:
+        logger.info("Repository existence check skipped for %s/%s: %s", owner, name, error)
+        return None
+    if response.status_code == 404:
+        return False
+    if response.status_code < 400:
+        return True
+    return None
+
+
+def _not_found_message(owner: str, name: str) -> str:
+    return (
+        f"Repository not found: github.com/{owner}/{name} doesn't exist or isn't public. "
+        "Check the owner and repository name."
+    )
 
 
 @router.post("/ingest")
@@ -30,12 +70,18 @@ async def ingest_repo(req: IngestRequest, current_user=Depends(get_current_user)
         # The durable job keeps the linked branch/tag/commit so the worker
         # indexes exactly what the user pointed at.
         source_url = repository_source_url(req.github_url, ref)
+        owner, name = parse_github_repository(github_url)
     except RepositoryValidationError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     limiter_acquired = False
     try:
         await ingest_request_limiter.acquire(current_user.id)
         limiter_acquired = True
+        # Checked before anything is stored (and before "a job is already
+        # running"): a repository GitHub says is missing is reported here
+        # and never added to the workspace.
+        if await public_repository_exists(owner, name) is False:
+            raise HTTPException(status_code=404, detail=_not_found_message(owner, name))
         await assert_turso_schema()
         # Turso is server-only. The verified Supabase user id is persisted on
         # each record and is required again by all user-facing queries.
@@ -43,6 +89,8 @@ async def ingest_repo(req: IngestRequest, current_user=Depends(get_current_user)
         await enforce_ingestion_capacity(store, current_user.id, github_url)
         repo_id, repo_name = await ensure_repo_record(store, github_url, current_user.id)
         await enqueue_ingestion_job(store, source_url, current_user.id, repo_id)
+    except HTTPException:
+        raise
     except RepositoryValidationError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except IngestionConflictError as error:
