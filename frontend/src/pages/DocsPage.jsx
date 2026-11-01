@@ -111,7 +111,10 @@ const SECTIONS = [
       { type: 'p', text: 'Answers stream in real time. Claims cite code with its path and line range:' },
       { type: 'pills', items: ['src/server/auth.ts:L12-L40', 'packages/db/schema.prisma:L88-L104'] },
       { type: 'p', text: 'Every citation opens the exact lines in the built-in file viewer and links to GitHub at the indexed commit, so the code you read is the code the answer was based on. Sources are grouped by folder, which makes it easy to see which parts of the repository an answer relied on.' },
-      { type: 'callout', title: 'Follow-up questions', text: 'Ask follow-ups in the same conversation; recent messages are kept in context. Conversations are saved per repository, so you can pick up where you left off.' },
+      { type: 'callout', title: 'Follow-up questions', text: 'Ask follow-ups in the same conversation; its recent messages are kept in context, and other conversations are not.' },
+      { type: 'h2', text: 'Saved conversations' },
+      { type: 'p', text: 'Each repository keeps as many conversations as you need. New chat starts an empty one and never deletes the one you were in. History, in the chat header, lists your conversations with their titles (the first question, which you can rename), when they were last used and how many messages and proposals they hold. Opening one shows all its messages, and its proposals still open for review. The open conversation is in the page link, so a reload brings you back to it.' },
+      { type: 'p', text: 'Deleting a conversation asks first, and the notification that follows has an Undo. Conversations are private to you.' },
     ],
   },
   {

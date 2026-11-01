@@ -12,6 +12,7 @@ It is built for the first hours in an unfamiliar codebase: new engineers onboard
 - **Accurate retrieval.** File-level semantic search, keyword search with prefix matching and path weighting, path-aware ranking for component questions, the import graph for impact questions, and follow-up awareness for short questions like "where is it called?".
 - **Code editing and pull requests.** Describe a change or paste a GitHub issue URL. The agent plans the change across files (call sites, types, styles, tests, new files when needed), reads the current files from GitHub, writes exact search/replace hunks, validates every hunk against the real file, and shows the result inline in the chat. The review screen has unified and split diffs, in-place editing with a live diff, a prefilled pull request, `.patch` download, and one-click PR creation (a branch in the repository, or a fork when you lack write access). Nothing is pushed without your review.
 - **Exploration tools.** Repository overview (languages, folder map, key files, suggested questions), instant code search, and change-impact analysis.
+- **Saved conversations.** Each repository keeps several conversations. New chat starts a fresh one without deleting anything; History lists them with titles, dates and message and proposal counts, and reopens any of them with its proposals. Follow-ups use only the open conversation. Deleting asks first and can be undone. Conversations are private to the user who asked.
 - Light and dark themes, a command palette (`⌘K` / `Ctrl+K`), keyboard-first chat, and a responsive layout down to phone width.
 
 ## Architecture
@@ -83,7 +84,7 @@ Workflows: general, new-engineer onboarding, architecture, security review, open
 
 ### 1. Turso, Supabase, NVIDIA
 
-- Create a Turso database and token (`turso db create`, `turso db tokens create`). The schema is created automatically on first start; you can also apply `turso/00_init.sql` … `turso/06_scale_and_editing.sql` manually.
+- Create a Turso database and token (`turso db create`, `turso db tokens create`). The schema is created automatically on first start; you can also apply `turso/00_init.sql` … `turso/07_conversations.sql` manually.
 - In Supabase, enable the Google provider and add your frontend origins (Vercel and/or Render URL, and `http://localhost:5173`) to the redirect allow list.
 - Create an NVIDIA API key with access to the configured Nemotron models.
 
@@ -170,7 +171,11 @@ All routes require a Supabase bearer token except health/readiness and the GitHu
 | PATCH / DELETE | `/api/repos/{repo}` | Rename or delete |
 | POST | `/api/query` | Grounded answer (JSON) |
 | POST | `/api/query/stream` | Grounded answer as server-sent events (`stage`, `citations`, `token`, `done`, `error`) |
-| GET / DELETE | `/api/conversations/{repo}` | Conversation history / new chat |
+| GET | `/api/conversations/{repo}?conversation_id=&limit=&before=` | One conversation's messages, newest page first (the latest conversation without an id). Questions continue one with `conversation_id`, or start one with `new_conversation: true`; `done` returns it |
+| GET | `/api/conversations/{repo}/threads` | Saved conversations: title, dates, message and proposal counts |
+| PATCH / DELETE | `/api/conversations/{repo}/threads/{id}` | Rename / delete (hidden, not erased) |
+| POST | `/api/conversations/{repo}/threads/{id}/restore` | Undo a delete |
+| DELETE | `/api/conversations/{repo}` | Hide all of a repository's conversations (for older clients; returns the ids to restore) |
 | GET | `/api/edits/{id}` | Saved edit proposal with a fresh editing ticket |
 | GET | `/api/github/status`, `/api/github/login`, `/api/github/callback` | GitHub connection (callback redirects to `{GITHUB_FRONTEND_ORIGIN}/github/callback`) |
 | POST | `/api/github/complete` | SPA finishes the OAuth connection with the fragment code and the user's bearer token |
