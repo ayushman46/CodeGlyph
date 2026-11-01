@@ -190,6 +190,8 @@ export const SYMBOLS = [
   { name: 'getBooking', kind: 'function', path: 'packages/features/bookings/lib/getBooking.ts', line: 3, container: null },
 ];
 const OUTLINE = [{ name: 'handleConfirmation', kind: 'function', line: 42, end_line: 118, depth: 0 }];
+/** The mocked cal.com repository, for tests that change a repository's state (status polls). */
+export const READY_REPO = readyRepo;
 
 const sse = (events) => `: connected\n\n${events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join('')}`;
 

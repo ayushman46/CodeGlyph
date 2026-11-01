@@ -96,33 +96,54 @@ const FolderContents = ({ dir, depth, folders, expanded, onToggle, onRetry, onOp
 
 /**
  * The repository's indexed files as a browsable tree. Folders expand in
- * place; choosing a file opens it in the viewer.
+ * place; choosing a file opens it in the viewer. `version` names the index
+ * (its commit and indexing state): when it changes, as when a refresh
+ * finishes, the open folders reload in place and stay open.
  */
-const FileTree = ({ repoName, onOpenFile, className = '' }) => {
+const FileTree = ({ repoName, version = '', onOpenFile, className = '' }) => {
   const [folders, setFolders] = useState({});
   const [expanded, setExpanded] = useState(() => new Set());
   const repoRef = useRef(repoName);
   repoRef.current = repoName;
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
+  // The latest request per folder: a slower, older answer never wins.
+  const requests = useRef({});
 
-  const load = useCallback(async (dir) => {
+  const load = useCallback(async (dir, { quiet = false } = {}) => {
     const forRepo = repoName;
-    setFolders((current) => ({ ...current, [dir]: { loading: true } }));
+    const request = (requests.current[dir] || 0) + 1;
+    requests.current[dir] = request;
+    // A quiet reload keeps the current listing on screen until the new one arrives.
+    setFolders((current) => (quiet && current[dir]?.data ? current : { ...current, [dir]: { loading: true } }));
     try {
       const response = await listRepositoryFiles(forRepo, { dir });
-      if (repoRef.current !== forRepo) return;
+      if (repoRef.current !== forRepo || requests.current[dir] !== request) return;
       const data = { directories: response.data?.directories || [], files: response.data?.files || [] };
       setFolders((current) => ({ ...current, [dir]: { data } }));
     } catch (error) {
-      if (repoRef.current !== forRepo) return;
+      if (repoRef.current !== forRepo || requests.current[dir] !== request) return;
       setFolders((current) => ({ ...current, [dir]: { error: errorMessage(error, 'Could not list these files.') } }));
     }
   }, [repoName]);
 
+  const loaded = useRef({ repoName: null, version });
   useEffect(() => {
-    setFolders({});
-    setExpanded(new Set());
-    void load('');
-  }, [load]);
+    if (loaded.current.repoName !== repoName) {
+      loaded.current = { repoName, version };
+      requests.current = {};
+      setFolders({});
+      setExpanded(new Set());
+      void load('');
+      return;
+    }
+    if (loaded.current.version === version) return;
+    loaded.current = { repoName, version };
+    // A new index: folders that are closed load afresh when next opened.
+    const open = ['', ...expandedRef.current];
+    setFolders((current) => Object.fromEntries(open.filter((dir) => current[dir]).map((dir) => [dir, current[dir]])));
+    open.forEach((dir) => void load(dir, { quiet: true }));
+  }, [repoName, version, load]);
 
   const toggle = (dir) => {
     setExpanded((current) => {

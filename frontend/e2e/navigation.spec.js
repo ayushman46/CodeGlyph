@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { CITED_PATH, mockApi } from './fixtures.js';
+import { CITED_PATH, READY_REPO, mockApi } from './fixtures.js';
 
 // Finding and opening code: exact search, ⌘K files and symbols, @ mentions,
 // the file tree, links to a file and line, the outline and Markdown files.
@@ -132,6 +132,31 @@ test('an empty file opens as empty, and the tree says so', async ({ page }) => {
   await expect(panel.getByText('This file is empty.')).toBeVisible();
   await expect(panel.getByText('From the index')).toHaveCount(0);
   await expect(panel.getByText(/^\d+ lines?$/)).toHaveCount(0);
+});
+
+test('the file tree reloads its open folders when the index changes (FEAT-03)', async ({ page }) => {
+  await mockApi(page);
+  let refreshed = false;
+  // fastapi (mocked as indexing) keeps the status poll running every 3 s.
+  await page.route('**/api/repos/statuses', (route) => route.fulfill(json([
+    refreshed ? { ...READY_REPO, commit_sha: 'c'.repeat(40), indexed_at: '2026-10-03T00:00:00Z' } : READY_REPO,
+  ])));
+  await page.route('**/api/repos/cal.com/files**', (route) => {
+    const dir = new URL(route.request().url()).searchParams.get('dir') || '';
+    if (!dir) return route.fulfill(json({ path: '', directories: [{ path: 'lib', name: 'lib', files: refreshed ? 1 : 2 }], files: [], total_files: 2 }));
+    const files = refreshed ? ['lib/new.ts'] : ['lib/old.ts', 'lib/removed.ts'];
+    return route.fulfill(json({ path: 'lib', directories: [], files: files.map((path) => ({ path, name: path.slice(4), bytes: 10 })), total_files: files.length }));
+  });
+  await page.goto('/app/r/cal.com?tab=overview');
+  const tree = page.getByRole('list', { name: 'Indexed files' });
+  await tree.getByRole('button', { name: /^lib\// }).click();
+  await expect(tree.getByRole('button', { name: 'removed.ts' })).toBeVisible();
+  // A refresh finishes: the next status poll reports a new commit.
+  refreshed = true;
+  await expect(tree.getByRole('button', { name: 'new.ts' })).toBeVisible({ timeout: 15_000 });
+  await expect(tree.getByRole('button', { name: 'removed.ts' })).toHaveCount(0);
+  // The folder stayed open.
+  await expect(tree.getByRole('button', { name: /^lib\// })).toHaveAttribute('aria-expanded', 'true');
 });
 
 test('the viewer names the enclosing declaration and lists an outline (FEAT-02)', async ({ page }) => {

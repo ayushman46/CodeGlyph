@@ -163,7 +163,12 @@ const RepoOverview = ({ repo, onAsk, compact = false, onOpenCoverage, onShowOver
               <h2 id="folder-map-title" className="text-[13px] font-semibold text-ink">Files</h2>
               {data?.total_files > 0 && <span className="text-[11px] text-ink-3">{formatCount(data.total_files)} files</span>}
             </div>
-            <FileTree repoName={repo.repo_name} onOpenFile={(path) => openFile({ path, from: 'tree' })} className="scroll-thin max-h-[26rem] overflow-y-auto" />
+            <FileTree
+              repoName={repo.repo_name}
+              version={[repo.commit_sha, repo.indexed_at, repo.queryable, repo.is_indexing].join(':')}
+              onOpenFile={(path) => openFile({ path, from: 'tree' })}
+              className="scroll-thin max-h-[26rem] overflow-y-auto"
+            />
           </section>
           <div className="space-y-4">
             <CoverageCard repo={repo} onOpenCoverage={onOpenCoverage} />
