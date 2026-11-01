@@ -1,17 +1,20 @@
 import {
   AlertCircle, AlertTriangle, ArrowRight, CalendarDays, CreditCard, Database, ExternalLink, FolderGit2, Github,
-  LogOut, Mail, Plus, RefreshCw, ShieldCheck, Unplug,
+  LogOut, Mail, Plus, RefreshCw, ShieldCheck, Unplug, Users,
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { disconnectGithub, errorMessage, getGithubLoginUrl } from '../api/client';
 import { Avatar } from '../components/SiteHeader';
+import { AccessDialog } from '../components/sharing/RepoAccessButton';
+import ShareDialog from '../components/sharing/ShareDialog';
 import Badge from '../components/ui/Badge';
 import Button from '../components/ui/Button';
 import ProgressBar from '../components/ui/ProgressBar';
 import Spinner from '../components/ui/Spinner';
 import { formatBytes, relativeTime } from '../lib/format';
 import { phaseLabel, statusTone } from '../lib/phase';
+import { ROLE_LABELS, membersLine, ownerName, roleOf, splitRepos } from '../lib/sharing';
 import useStore from '../store/useStore';
 
 const GITHUB_POPUP = 'codebase-intel-github';
@@ -74,9 +77,79 @@ const repoSize = (repo) => {
   return !repo.is_indexing && repo.status !== 'failed' && repo.status !== 'cancelled' ? bytes : 0;
 };
 
+const repoLink = (repo) => `/app/r/${encodeURIComponent(repo.repo_name)}`;
+
+/**
+ * Team access: the repositories you share (with how many people, and a way
+ * to manage access) and the ones shared with you (role, owner, Leave).
+ */
+const TeamAccessCard = ({ owned, shared, loaded }) => {
+  const [dialog, setDialog] = useState(null);
+  const sharing = [...owned].sort((a, b) => (Number(b.member_count) || 0) - (Number(a.member_count) || 0) || a.repo_name.localeCompare(b.repo_name));
+  const shownOwned = sharing.slice(0, REPO_LIST_LIMIT);
+  return (
+    <Card labelledBy="team-heading" className="md:col-span-3">
+      <CardHeader
+        icon={Users}
+        id="team-heading"
+        title="Team access"
+        description="Share a repository so teammates can ask about it without indexing it again. They use your index, and it counts only toward your storage."
+      />
+      {!loaded ? (
+        <div role="status" aria-label="Loading team access" className="mt-5 space-y-3"><div className="skeleton h-10 w-full" /></div>
+      ) : (
+        <div className="mt-5 grid gap-5 md:grid-cols-2">
+          <section aria-labelledby="team-owned-heading" className="min-w-0">
+            <h3 id="team-owned-heading" className="text-[12px] font-semibold uppercase tracking-wider text-ink-3">Repositories you can share</h3>
+            {shownOwned.length === 0 ? (
+              <p className="mt-2 text-[13px] leading-relaxed text-ink-2">Index a repository, then share it from here or from its Share button.</p>
+            ) : (
+              <ul className="mt-2 divide-y divide-line overflow-hidden rounded-2xl border border-line" aria-label="Repositories you can share">
+                {shownOwned.map((repo) => (
+                  <li key={repo.id} className="flex items-center gap-3 px-4 py-2.5">
+                    <span className="min-w-0 flex-1">
+                      <Link to={repoLink(repo)} className="block truncate text-sm font-medium text-ink hover:text-accent-strong">{repo.repo_name}</Link>
+                      <span className="block text-xs text-ink-2">{membersLine(repo) || 'Only you'}</span>
+                    </span>
+                    <Button size="xs" variant="secondary" icon={Users} onClick={() => setDialog({ type: 'share', repo })} aria-label={`Manage access to ${repo.repo_name}`}>Manage</Button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+          <section aria-labelledby="team-shared-heading" className="min-w-0">
+            <h3 id="team-shared-heading" className="text-[12px] font-semibold uppercase tracking-wider text-ink-3">Shared with you</h3>
+            {shared.length === 0 ? (
+              <p className="mt-2 text-[13px] leading-relaxed text-ink-2">When a teammate sends you an invite link, the repository appears here and in your workspace sidebar.</p>
+            ) : (
+              <ul className="mt-2 divide-y divide-line overflow-hidden rounded-2xl border border-line" aria-label="Repositories shared with you">
+                {shared.map((repo) => (
+                  <li key={repo.id} className="flex items-center gap-3 px-4 py-2.5">
+                    <span className="min-w-0 flex-1">
+                      <Link to={repoLink(repo)} className="block truncate text-sm font-medium text-ink hover:text-accent-strong">{repo.repo_name}</Link>
+                      <span className="block truncate text-xs text-ink-2">From {ownerName(repo)}</span>
+                    </span>
+                    <Badge tone={roleOf(repo) === 'editor' ? 'accent' : 'neutral'}>{ROLE_LABELS[roleOf(repo)]}</Badge>
+                    <Button size="xs" variant="ghost" onClick={() => setDialog({ type: 'access', repo })} aria-label={`Your access to ${repo.repo_name}`}>Details</Button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </div>
+      )}
+      {dialog?.type === 'share' && <ShareDialog repo={dialog.repo} open onClose={() => setDialog(null)} />}
+      {dialog?.type === 'access' && <AccessDialog repo={dialog.repo} open stay onClose={() => setDialog(null)} />}
+    </Card>
+  );
+};
+
 const AccountPage = () => {
   const user = useStore((state) => state.user);
-  const repos = useStore((state) => state.repos);
+  const allRepos = useStore((state) => state.repos);
+  // Storage and the repository list are about your own repositories; the
+  // ones shared with you use their owner's storage (see Team access).
+  const { owned: repos, shared: sharedRepos } = splitRepos(allRepos);
   const reposLoaded = useStore((state) => state.reposLoaded);
   const reposError = useStore((state) => state.reposError);
   const fetchRepos = useStore((state) => state.fetchRepos);
@@ -545,6 +618,8 @@ const AccountPage = () => {
               )}
             </div>
           </Card>
+
+          <TeamAccessCard owned={repos} shared={sharedRepos} loaded={reposLoaded} />
 
           {/* GitHub */}
           <Card labelledBy="github-heading" className="md:col-span-3">

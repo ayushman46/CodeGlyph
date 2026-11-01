@@ -535,6 +535,8 @@ const useStore = create((set, get) => ({
       } else {
         const detail = errorMessage(error, 'This question could not be completed. Your repository and conversation are unchanged — please try again.');
         const status = Number(error?.status || error?.response?.status) || 0;
+        // A shared repository's access may have changed (removed, or now a viewer).
+        if (status === 403 || status === 404) void get().fetchRepos();
         // A partial answer stays readable; the bubble shows the failure as a
         // notice with a retry instead of mixing it into the answer text.
         update((message) => ({

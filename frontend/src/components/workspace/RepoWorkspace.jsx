@@ -13,6 +13,7 @@ import { formatCount, shortSha } from '../../lib/format';
 import { isKeywordOnly, phaseLabel, statusTone } from '../../lib/phase';
 import { downloadText, proposalPatch, slugify } from '../../lib/patch';
 import { approximatePaths } from '../../lib/proposal';
+import { canManage, editBlockedReason } from '../../lib/sharing';
 import useArtifacts, {
   PROPOSAL_PANEL_ID, artifactCardId, proposalArtifactStatus, proposalArtifactSummary,
 } from '../../store/useArtifacts';
@@ -30,6 +31,7 @@ import IngestionProgress, { IndexingLoadingState, useIndexingEta } from './Inges
 import MessageBubble from './MessageBubble';
 import ProposalNotices from './ProposalNotices';
 import RepoOverview from './RepoOverview';
+import RepoAccessButton from '../sharing/RepoAccessButton';
 import SourcesPanel from './SourcesPanel';
 
 const TABS = [['chat', 'Chat', MessageSquareText], ['overview', 'Overview', LayoutDashboard]];
@@ -649,6 +651,7 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
                   </button>
                 ))}
               </div>
+              <RepoAccessButton repo={repo} />
               <Button size="icon" variant="ghost" icon={SquarePen} aria-label="New chat" title="New chat" disabled={!messages.length || isQuerying} onClick={() => runAction(clearChat, 'Could not clear the conversation.')} />
               <Menu
                 label="Repository actions"
@@ -659,14 +662,14 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
                 )}
                 items={[
                   { label: 'Export conversation', icon: Download, disabled: !messages.length, onSelect: () => downloadText(`${slugify(repo.repo_name)}-conversation.md`, exportMarkdown(repo, messages), 'text/markdown') },
-                  repo.is_indexing
+                  canManage(repo) && (repo.is_indexing
                     ? { label: 'Stop indexing…', icon: Square, disabled: stopping, onSelect: () => onRequestDialog('stop', repo) }
-                    : { label: 'Re-index…', icon: RefreshCw, onSelect: () => onRequestDialog('reindex', repo) },
+                    : { label: 'Re-index…', icon: RefreshCw, onSelect: () => onRequestDialog('reindex', repo) }),
                   { separator: true },
                   { label: 'Coverage report', icon: PieChart, onSelect: () => onRequestDialog('coverage', repo) },
                   { label: 'Change impact', icon: GitFork, disabled: notQueryable, onSelect: () => onRequestDialog('impact', repo) },
-                  { label: 'Rename', icon: Pencil, onSelect: () => onRequestDialog('rename', repo) },
-                  { label: 'Delete repository', icon: Trash2, danger: true, onSelect: () => onRequestDialog('delete', repo) },
+                  canManage(repo) && { label: 'Rename', icon: Pencil, onSelect: () => onRequestDialog('rename', repo) },
+                  canManage(repo) && { label: 'Delete repository', icon: Trash2, danger: true, onSelect: () => onRequestDialog('delete', repo) },
                 ]}
               />
             </div>
@@ -677,9 +680,9 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
           <div className="flex shrink-0 items-start gap-3 border-b border-line bg-surface-2/70 px-4 py-2 text-ink-2 sm:px-6">
             {/* Indexing continues after keyword search is ready: the same Loading State as the indexing card, one detail line. */}
             <IndexingLoadingState repo={repo} eta={eta} brief className="min-w-0 flex-1" />
-            <button type="button" onClick={() => onRequestDialog('stop', repo)} disabled={stopping} className="-my-0.5 shrink-0 rounded-md px-2 py-1 text-[12.5px] font-medium text-ink-2 transition-colors hover:bg-surface-3 hover:text-ink disabled:opacity-50" aria-label={`Stop indexing ${repo.repo_name}`}>
+            {canManage(repo) && <button type="button" onClick={() => onRequestDialog('stop', repo)} disabled={stopping} className="-my-0.5 shrink-0 rounded-md px-2 py-1 text-[12.5px] font-medium text-ink-2 transition-colors hover:bg-surface-3 hover:text-ink disabled:opacity-50" aria-label={`Stop indexing ${repo.repo_name}`}>
               {stopping ? 'Stopping…' : 'Stop'}
-            </button>
+            </button>}
           </div>
         )}
         {finished && repo.queryable && !repo.is_indexing && (
@@ -695,7 +698,7 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
             tone={readyNoteWarning ? 'warning' : 'info'}
             icon={readyNoteWarning ? AlertTriangle : Info}
             onDismiss={() => dismissNotice(readyNoteKey)}
-            action={readyNoteWarning ? <Button size="xs" variant="secondary" icon={RefreshCw} onClick={() => onRequestDialog('reindex', repo)}>Re-index</Button> : null}
+            action={readyNoteWarning && canManage(repo) ? <Button size="xs" variant="secondary" icon={RefreshCw} onClick={() => onRequestDialog('reindex', repo)}>Re-index</Button> : null}
           >
             {readyNote}
           </Notice>
@@ -798,6 +801,7 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
             busy={isQuerying}
             disabled={notQueryable || isHistoryLoading}
             disabledReason={repo.status === 'failed' ? 'Indexing failed. Try again above to ask questions.' : repo.status === 'cancelled' && notQueryable ? 'Indexing was stopped. Start it again to ask questions.' : undefined}
+            editDisabledReason={editBlockedReason(repo)}
             onSubmit={ask}
             onStop={stopQuery}
           />

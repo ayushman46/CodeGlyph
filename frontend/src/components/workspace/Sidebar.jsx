@@ -1,8 +1,9 @@
-import { AlertTriangle, FolderGit2, RefreshCw } from 'lucide-react';
-import { useState } from 'react';
+import { AlertTriangle, FolderGit2, RefreshCw, Users } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import { formatCount } from '../../lib/format';
 import { overallProgress, phaseLabel, statusSentence } from '../../lib/phase';
+import { isShared, membersLine, sharedLine, splitRepos } from '../../lib/sharing';
 import useStore from '../../store/useStore';
 import ContextMeter, { bytesLabels } from '../ai/ContextMeter';
 import ProgressBar from '../ui/ProgressBar';
@@ -74,6 +75,41 @@ const UsageMeter = ({ usage, repos, onNavigate }) => {
   );
 };
 
+// Coming back to the tab re-reads the list at most this often, so a share
+// that was removed (or a role that changed) shows without a reload.
+const FOCUS_REFRESH_MS = 15_000;
+
+const RepoLink = ({ repo, onNavigate }) => {
+  const shared = isShared(repo);
+  const detail = repo.is_indexing || repo.status !== 'ready' ? phaseLabel(repo) : shared ? sharedLine(repo) : repo.full_name;
+  const members = shared ? '' : membersLine(repo);
+  return (
+    <NavLink
+      to={`/app/r/${encodeURIComponent(repo.repo_name)}`}
+      onClick={onNavigate}
+      className={({ isActive }) => `block rounded-xl px-2.5 py-2 transition-colors ${isActive ? 'bg-surface shadow-[var(--shadow-soft)] ring-1 ring-line' : 'hover:bg-surface-2'}`}
+    >
+      <div className="flex items-center gap-2">
+        <span className={`h-2 w-2 shrink-0 rounded-full ${dotClass(repo)}`} aria-hidden="true" />
+        <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-ink">{repo.repo_name}</span>
+        <span className="sr-only">, {statusSentence(repo)}{shared ? `, ${sharedLine(repo)}` : members ? `, ${members}` : ''}</span>
+        {members && <Users className="h-3 w-3 shrink-0 text-ink-3" aria-hidden="true" />}
+        {repo.queryable && (
+          <span className="shrink-0 font-mono text-[10.5px] text-ink-3" title={`${formatCount(repo.indexed_files || 0)} indexed files`} aria-hidden="true">
+            {formatCount(repo.indexed_files || 0)}
+          </span>
+        )}
+      </div>
+      <p className={`mt-0.5 truncate pl-4 text-[11.5px] ${repo.status === 'failed' ? 'text-danger' : 'text-ink-3'}`} aria-hidden="true">
+        {detail}
+      </p>
+      {repo.is_indexing && (
+        <div className="mt-1.5 pl-4" aria-hidden="true"><ProgressBar value={overallProgress(repo)} className="!h-1" /></div>
+      )}
+    </NavLink>
+  );
+};
+
 const Sidebar = ({ onNavigate }) => {
   const repos = useStore((state) => state.repos);
   const reposLoaded = useStore((state) => state.reposLoaded);
@@ -81,9 +117,27 @@ const Sidebar = ({ onNavigate }) => {
   const fetchRepos = useStore((state) => state.fetchRepos);
   const usage = useStore((state) => state.accountUsage);
   const [retrying, setRetrying] = useState(false);
+  const lastRefresh = useRef(Date.now());
   // With no repositories the main panel is the place to add the first one;
   // a second identical field here would only compete with it.
   const firstRun = reposLoaded && !reposError && repos.length === 0;
+  const { owned, shared } = splitRepos(repos);
+  const sharing = shared.length > 0 || owned.some((repo) => repo.member_count > 0);
+
+  useEffect(() => {
+    if (!sharing) return undefined;
+    const refresh = () => {
+      if (document.visibilityState === 'hidden' || Date.now() - lastRefresh.current < FOCUS_REFRESH_MS) return;
+      lastRefresh.current = Date.now();
+      void fetchRepos();
+    };
+    window.addEventListener('focus', refresh);
+    document.addEventListener('visibilitychange', refresh);
+    return () => {
+      window.removeEventListener('focus', refresh);
+      document.removeEventListener('visibilitychange', refresh);
+    };
+  }, [sharing, fetchRepos]);
 
   const retry = async () => {
     setRetrying(true);
@@ -103,7 +157,7 @@ const Sidebar = ({ onNavigate }) => {
       )}
       <div className={`flex items-center justify-between px-4 pb-1.5 ${firstRun ? 'pt-4' : 'pt-1'}`}>
         <h2 className="text-[11px] font-semibold uppercase tracking-wider text-ink-3">Repositories</h2>
-        {reposLoaded && repos.length > 0 && <span className="font-mono text-[11px] text-ink-3" aria-label={`${repos.length} repositories`}>{repos.length}</span>}
+        {reposLoaded && owned.length > 0 && <span className="font-mono text-[11px] text-ink-3" aria-label={`${owned.length} repositories`}>{owned.length}</span>}
       </div>
       <nav className="scroll-thin min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 pb-3" aria-label="Repositories" aria-busy={!reposLoaded || undefined}>
         {!reposLoaded && Array.from({ length: 4 }, (_, index) => <div key={index} className="skeleton mx-1 my-2 h-11" aria-hidden="true" />)}
@@ -122,33 +176,24 @@ const Sidebar = ({ onNavigate }) => {
             <p className="mt-1 text-[12px] leading-relaxed text-ink-3">Repositories you index appear here, with their progress.</p>
           </div>
         )}
-        {repos.map((repo) => (
-          <NavLink
-            key={repo.id}
-            to={`/app/r/${encodeURIComponent(repo.repo_name)}`}
-            onClick={onNavigate}
-            className={({ isActive }) => `block rounded-xl px-2.5 py-2 transition-colors ${isActive ? 'bg-surface shadow-[var(--shadow-soft)] ring-1 ring-line' : 'hover:bg-surface-2'}`}
-          >
-            <div className="flex items-center gap-2">
-              <span className={`h-2 w-2 shrink-0 rounded-full ${dotClass(repo)}`} aria-hidden="true" />
-              <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-ink">{repo.repo_name}</span>
-              <span className="sr-only">, {statusSentence(repo)}</span>
-              {repo.queryable && (
-                <span className="shrink-0 font-mono text-[10.5px] text-ink-3" title={`${formatCount(repo.indexed_files || 0)} indexed files`} aria-hidden="true">
-                  {formatCount(repo.indexed_files || 0)}
-                </span>
-              )}
+        {reposLoaded && !owned.length && shared.length > 0 && (
+          <p className="mx-2 rounded-xl border border-dashed border-line px-3 py-2.5 text-[12px] leading-relaxed text-ink-3">Repositories you index appear here.</p>
+        )}
+        {owned.map((repo) => <RepoLink key={repo.id} repo={repo} onNavigate={onNavigate} />)}
+        {shared.length > 0 && (
+          <section aria-labelledby="shared-repos-heading" className="pt-3">
+            <div className="flex items-center justify-between px-2 pb-1.5">
+              <h2 id="shared-repos-heading" className="text-[11px] font-semibold uppercase tracking-wider text-ink-3">Shared with you</h2>
+              <span className="font-mono text-[11px] text-ink-3" aria-label={`${shared.length} shared repositories`}>{shared.length}</span>
             </div>
-            <p className={`mt-0.5 truncate pl-4 text-[11.5px] ${repo.status === 'failed' ? 'text-danger' : 'text-ink-3'}`} aria-hidden="true">
-              {repo.is_indexing || repo.status !== 'ready' ? phaseLabel(repo) : repo.full_name}
-            </p>
-            {repo.is_indexing && (
-              <div className="mt-1.5 pl-4" aria-hidden="true"><ProgressBar value={overallProgress(repo)} className="!h-1" /></div>
-            )}
-          </NavLink>
-        ))}
+            <div className="space-y-0.5">
+              {shared.map((repo) => <RepoLink key={repo.id} repo={repo} onNavigate={onNavigate} />)}
+            </div>
+          </section>
+        )}
       </nav>
-      {usage && <UsageMeter usage={usage} repos={repos} onNavigate={onNavigate} />}
+      {/* Shared repositories use their owner's storage, not yours. */}
+      {usage && <UsageMeter usage={usage} repos={owned} onNavigate={onNavigate} />}
     </div>
   );
 };

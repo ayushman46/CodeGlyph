@@ -198,4 +198,18 @@ export const getPullRequestStatus = (repoName, prNumber, config = {}) => api.get
   '/github/pr-status', { params: { repo_name: repoName, pr_number: prNumber }, ...config },
 );
 
+// Sharing a repository with teammates (owner: invite links, members, roles;
+// member: leave). Invite links are opened with previewInvite/acceptInvite.
+const sharedRepoPath = (repoName) => `/repos/${encodeURIComponent(repoName)}`;
+export const getSharing = (repoName) => api.get(`${sharedRepoPath(repoName)}/sharing`);
+export const createInvite = (repoName, role, expiresInDays) => api.post(
+  `${sharedRepoPath(repoName)}/invites`, { role, expires_in_days: expiresInDays },
+);
+export const revokeInvite = (repoName, inviteId) => api.delete(`${sharedRepoPath(repoName)}/invites/${encodeURIComponent(inviteId)}`);
+export const changeMemberRole = (repoName, userId, role) => api.patch(`${sharedRepoPath(repoName)}/members/${encodeURIComponent(userId)}`, { role });
+export const removeMember = (repoName, userId) => api.delete(`${sharedRepoPath(repoName)}/members/${encodeURIComponent(userId)}`);
+export const leaveRepository = (repoName) => api.delete(`${sharedRepoPath(repoName)}/membership`);
+export const previewInvite = (token) => api.get(`/invites/${encodeURIComponent(token)}`);
+export const acceptInvite = (token) => api.post(`/invites/${encodeURIComponent(token)}/accept`);
+
 export default api;
