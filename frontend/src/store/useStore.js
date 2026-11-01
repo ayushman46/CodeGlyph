@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import {
-  ApiError, StreamUnavailableError, cancelIndexing, clearConversation, deleteRepository,
+  ApiError, StreamUnavailableError, cancelIndexing, clearConversation, continueAnswerRequest, deleteRepository,
   errorMessage, getAccountUsage, getConversation, getEditProposal, getGithubStatus, getRepos, getRepositoryFile,
   getRepositoryImpact, getRepositoryOverview, getStatuses, ingestRepo, queryRepo, reindexRepository, renameRepository,
   streamQuery,
@@ -36,6 +36,13 @@ const normalizeMessage = (message) => {
     // end_line, valid}); undefined for answers from older servers, which
     // keeps the client-side heuristics in charge of citation chips.
     answer_references: Array.isArray(message.answer_references) ? message.answer_references : undefined,
+    // Answer trust: backticked code names not found in the index ({text,
+    // names}), why no model answered, which model answered instead, and the
+    // stored id a cut-off answer (mode "truncated") is continued by.
+    unverified_identifiers: Array.isArray(message.unverified_identifiers) ? message.unverified_identifiers : undefined,
+    answer_failure: message.answer_failure || null,
+    answer_notice: message.answer_notice || null,
+    message_id: message.message_id !== undefined ? message.message_id : message.id || null,
     tool_calls: toolCalls.filter((call) => call?.tool !== 'code_edit'),
     mode: message.mode,
     latency_ms: message.latency_ms,
@@ -544,6 +551,105 @@ const useStore = create((set, get) => ({
           error: detail, error_status: status,
         }));
       }
+    } finally {
+      if (queryController === controller) queryController = null;
+      set((state) => (isCurrent(state) ? { isQuerying: false } : {}));
+    }
+  },
+
+  /**
+   * Writes the rest of a reply that stopped at the output limit (mode
+   * "truncated") into the same message; the server stores the joined answer.
+   * The reply shows its kept text and then the new text as it streams. A
+   * failure or Stop puts the stored answer back and says why
+   * (`continue_error`), so the reply is never left half-replaced.
+   *
+   * @param {string} messageId the reply's id in `messages`
+   * @param {{ modelProfile?: 'fast' | 'detailed' }} [options]
+   */
+  continueAnswer: async (messageId, { modelProfile } = {}) => {
+    const repo = get().selectedRepo;
+    const index = get().messages.findIndex((item) => item.id === messageId);
+    const message = get().messages[index];
+    if (!repo || !message || message.mode !== 'truncated' || !message.message_id || get().isQuerying) return;
+    const question = get().messages.slice(0, index).reverse().find((item) => item.role === 'user')?.content || 'Continue the answer';
+    queryController?.abort();
+    const controller = new AbortController();
+    queryController = controller;
+    const epoch = get().queryEpoch;
+    const original = { content: message.content, mode: message.mode };
+    const isCurrent = (state) => state.selectedRepo === repo && state.queryEpoch === epoch;
+    const update = (patch) => set((state) => (isCurrent(state) ? {
+      messages: state.messages.map((item) => (item.id === messageId
+        ? { ...item, ...(typeof patch === 'function' ? patch(item) : patch) }
+        : item)),
+    } : {}));
+    set({ isQuerying: true });
+    update({ streaming: true, continuing: true, continue_error: null, stage: { stage: 'generating', detail: 'Writing the rest of the answer' } });
+
+    let pending = '';
+    let flushTimer = null;
+    const flush = () => {
+      flushTimer = null;
+      if (!pending) return;
+      const chunk = pending;
+      pending = '';
+      update((item) => ({ content: item.content + chunk }));
+    };
+    let finished = false;
+    const finish = (data) => {
+      if (flushTimer) clearTimeout(flushTimer);
+      flushTimer = null;
+      pending = '';
+      finished = true;
+      update(() => ({
+        ...normalizeMessage({ ...data, id: messageId, role: 'assistant', content: data.answer, created_at: message.created_at }),
+        continuing: false,
+      }));
+    };
+    const payload = {
+      repo_name: repo,
+      question,
+      model_profile: modelProfile || (message.model_profile === 'detailed' ? 'detailed' : 'fast'),
+      workflow: message.workflow && message.workflow !== 'editing' ? message.workflow : 'general',
+      continue_from: message.message_id,
+    };
+    try {
+      let received = 0;
+      try {
+        await streamQuery(payload, {
+          signal: controller.signal,
+          onEvent: (event, data) => {
+            received += 1;
+            if (event === 'continue') {
+              // The kept text (the unfinished last sentence is rewritten).
+              if (flushTimer) clearTimeout(flushTimer);
+              flushTimer = null;
+              pending = '';
+              update({ content: data.base || '', stage: null });
+            } else if (event === 'token') {
+              pending += data.text || '';
+              if (!flushTimer) flushTimer = setTimeout(flush, 40);
+            } else if (event === 'stage') update({ stage: data });
+            else if (event === 'done') finish(data);
+            else if (event === 'error') throw new ApiError(data.detail || 'The rest of the answer could not be written.', data.status || 500);
+          },
+        });
+      } catch (error) {
+        if (!(error instanceof StreamUnavailableError) || received > 0) throw error;
+        const response = await continueAnswerRequest(payload, { signal: controller.signal });
+        finish(response.data);
+      }
+      if (!finished) throw new ApiError('The connection closed before the rest of the answer was written.');
+    } catch (error) {
+      if (flushTimer) clearTimeout(flushTimer);
+      const stopped = error?.name === 'AbortError' || error?.code === 'ERR_CANCELED' || error?.name === 'CanceledError';
+      update({
+        ...original, streaming: false, continuing: false, stage: null,
+        continue_error: stopped
+          ? 'Stopped. The answer is unchanged.'
+          : errorMessage(error, 'The rest of the answer could not be written. The answer so far is unchanged.'),
+      });
     } finally {
       if (queryController === controller) queryController = null;
       set((state) => (isCurrent(state) ? { isQuerying: false } : {}));

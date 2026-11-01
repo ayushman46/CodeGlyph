@@ -82,16 +82,40 @@ const referenceKey = (value) => String(value ?? '').trim().replace(/^`+|`+$/g, '
 const samePath = (candidate, path) => Boolean(candidate && path) && (candidate === path || candidate.endsWith(`/${path}`));
 
 /**
+ * What is wrong with a reference the server could not verify, in the words
+ * the answer shows. Only a path missing from the index is "not in the
+ * indexed snapshot"; real files outside the evidence say so instead.
+ */
+export const REFERENCE_REASONS = {
+  range_outside_evidence: 'exists in the index but was not part of this answer’s evidence',
+  lines_outside_file: 'the file exists but does not have these lines',
+  ambiguous: 'matches several files',
+  not_in_index: 'not in the indexed snapshot',
+  lookup_failed: 'could not be checked: the index lookup failed',
+};
+
+/** The label for an unverified reference (`{reason, file_lines}` from the server). */
+export const referenceReasonLabel = (item) => {
+  if (item?.reason === 'lines_outside_file' && Number(item.file_lines)) {
+    return `the file exists but has only ${Number(item.file_lines)} lines`;
+  }
+  return REFERENCE_REASONS[item?.reason] || 'not found in the indexed code';
+};
+
+/**
  * Decide how one inline-code span of an answer renders.
  *
  * With the server's `answer_references` (each `{text, file_path, start_line,
- * end_line, valid}`), only references the server verified become chips;
- * invalid ones render as unverified text and anything else as plain code.
- * Without them, a reference becomes a chip only when it resolves to one of
- * the message's citations or is a real directory path (contains `/`); bare
- * file names need a citation.
+ * end_line, valid, reason}`), references the server verified become chips;
+ * an indexed file whose lines were outside the answer's evidence becomes an
+ * `outside_evidence` chip (it still opens the file); other invalid ones
+ * render as unverified text with their `reason` (and `candidates` for a name
+ * that matches several files); anything else is plain code. Without them, a
+ * reference becomes a chip only when it resolves to one of the message's
+ * citations or is a real directory path (contains `/`); bare file names need
+ * a citation.
  *
- * @returns {{status: 'verified'|'cited'|'path'|'unverified', reference: {path: string, start: number|null, end: number|null}}|null}
+ * @returns {{status: 'verified'|'cited'|'path'|'outside_evidence'|'unverified', reference: {path: string, start: number|null, end: number|null}, reason?: string, label?: string, candidates?: string[]}|null}
  */
 export const resolveReference = (text, { citations = [], answerReferences } = {}) => {
   const reference = parseReference(text);
@@ -107,7 +131,11 @@ export const resolveReference = (text, { citations = [], answerReferences } = {}
     const start = Number(match.start_line) || reference?.start || null;
     const end = Number(match.end_line) || reference?.end || start;
     const resolved = { path: match.file_path || reference?.path || key, start, end: end && start && end < start ? start : end };
-    return { status: match.valid === true ? 'verified' : 'unverified', reference: resolved };
+    if (match.valid === true) return { status: 'verified', reference: resolved };
+    const detail = { reason: match.reason || null, label: referenceReasonLabel(match) };
+    if (Array.isArray(match.candidates) && match.candidates.length) detail.candidates = match.candidates.map(String);
+    if (match.reason === 'range_outside_evidence' && match.file_path) return { status: 'outside_evidence', reference: resolved, ...detail };
+    return { status: 'unverified', reference: resolved, ...detail };
   }
   if (!reference) return null;
   if (matchCitation(citations, reference) >= 0) return { status: 'cited', reference };
@@ -273,8 +301,13 @@ export const citationExcerpt = (citation, start, end, maxLines = 12) => {
 };
 
 /**
- * Summarise the server's reference check for one answer.
- * @returns {{ total: number, verified: number, unverified: number, repaired: number } | null}
+ * Summarise the server's reference check for one answer. `byReason` counts
+ * the unverified references by why they failed (`range_outside_evidence`,
+ * `ambiguous`, ...; `unknown` for servers that send no reason), and
+ * `inIndex` counts the references whose file exists in the index (verified
+ * ones plus indexed files whose lines were outside the evidence).
+ *
+ * @returns {{ total: number, verified: number, unverified: number, repaired: number, inIndex: number, byReason: Record<string, number> } | null}
  */
 export const summariseReferences = (answerReferences) => {
   if (!Array.isArray(answerReferences) || !answerReferences.length) return null;
@@ -282,16 +315,77 @@ export const summariseReferences = (answerReferences) => {
   let verified = 0;
   let unverified = 0;
   let repaired = 0;
+  let inIndex = 0;
+  const byReason = {};
   answerReferences.forEach((item) => {
     if (!item) return;
     const key = `${item.file_path || item.text}:${item.start_line ?? ''}-${item.end_line ?? ''}`;
     if (seen.has(key)) return;
     seen.add(key);
     if (item.valid === true) verified += 1;
-    else unverified += 1;
+    else {
+      unverified += 1;
+      const reason = item.reason || 'unknown';
+      byReason[reason] = (byReason[reason] || 0) + 1;
+    }
+    if (item.valid === true || (item.reason === 'range_outside_evidence' && item.file_path)) inIndex += 1;
     if (item.repaired) repaired += 1;
   });
-  return { total: verified + unverified, verified, unverified, repaired };
+  return { total: verified + unverified, verified, unverified, repaired, inIndex, byReason };
+};
+
+// ------------------------------------------------------------ permalinks
+
+/** The commit a message's citations were pinned to (from their GitHub permalinks), or null. */
+export const commitFromCitations = (citations = []) => {
+  for (const citation of Array.isArray(citations) ? citations : []) {
+    const match = /^https:\/\/github\.com\/[^/]+\/[^/]+\/blob\/([0-9a-f]{7,40})\//i.exec(String(citation?.github_url || ''));
+    if (match) return match[1];
+  }
+  return null;
+};
+
+/**
+ * Where an answer's references link to: the repository and the commit the
+ * answer was written against (its snapshot, else its citations' permalinks,
+ * else the repository's current commit).
+ *
+ * @returns {{ githubUrl: string, commit: string } | null}
+ */
+export const answerLinkTarget = (message, repo) => {
+  const githubUrl = message?.snapshot?.github_url || repo?.github_url || '';
+  const commit = message?.snapshot?.commit_sha || commitFromCitations(message?.citations) || repo?.commit_sha || '';
+  return parseRepository(githubUrl) && commit ? { githubUrl, commit } : null;
+};
+
+/**
+ * The answer as Markdown for pasting elsewhere: every file/line reference
+ * that resolves to an indexed file becomes a link to that file at the
+ * answer's commit (`https://github.com/<owner>/<repo>/blob/<commit>/<path>#Lx-Ly`),
+ * with the reference text kept as its label. References the server could not
+ * resolve, code blocks and other code stay as they are.
+ *
+ * @param {string} markdown
+ * @param {{ githubUrl?: string, commit?: string, citations?: object[], answerReferences?: object[] }} target
+ */
+export const markdownWithPermalinks = (markdown, { githubUrl, commit, citations = [], answerReferences } = {}) => {
+  const source = normaliseCitationMarkdown(markdown);
+  if (!githubUrl || !commit || !parseRepository(githubUrl)) return source;
+  return source.split(/(```[\s\S]*?```)/g).map((segment) => {
+    if (segment.startsWith('```')) return segment;
+    return segment.replace(/(\[?)`([^`\n]+)`(\]\()?/g, (full, open, code, close) => {
+      if (open || close) return full; // already a link label
+      const resolved = resolveReference(code, { citations, answerReferences });
+      if (!resolved || !['verified', 'cited', 'outside_evidence'].includes(resolved.status)) return full;
+      const { start, end } = resolved.reference;
+      // A bare name matched to a source links to that source's full path.
+      const path = resolved.status === 'cited'
+        ? citations[matchCitation(citations, resolved.reference)]?.file_path || resolved.reference.path
+        : resolved.reference.path;
+      const url = githubBlobUrl(githubUrl, commit, path, start, end);
+      return url ? `[\`${code}\`](${url})` : full;
+    });
+  }).join('');
 };
 
 /** Find the citation that best matches a reference in the answer text. */

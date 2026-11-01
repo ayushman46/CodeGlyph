@@ -197,5 +197,11 @@ export const pushGithubPR = (payload) => api.post('/github/push-pr', payload, { 
 export const getPullRequestStatus = (repoName, prNumber, config = {}) => api.get(
   '/github/pr-status', { params: { repo_name: repoName, pr_number: prNumber }, ...config },
 );
+/**
+ * Write the rest of a stored answer that stopped at the output limit
+ * (`payload.continue_from` is its stored id). JSON fallback for streamQuery,
+ * which sends the same payload to /query/stream.
+ */
+export const continueAnswerRequest = (payload, config = {}) => api.post('/query', payload, { timeout: 300000, ...config });
 
 export default api;

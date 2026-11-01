@@ -1,14 +1,17 @@
 import {
-  AlertTriangle, Check, CircleCheck, FileCode2, ImageOff, PencilLine, RotateCcw, Sparkles, CircleStop, WifiOff,
+  AlertTriangle, ArrowDownToLine, Check, CircleCheck, Copy, FileCode2, FileSearch, ImageOff, Info, PencilLine, RotateCcw,
+  Search, Sparkles, CircleStop, WifiOff, Zap,
 } from 'lucide-react';
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { errorMessage, searchRepository } from '../../api/client';
 import { citationsToSources, shouldPaceReply } from '../../lib/ai/streamingText';
+import { absenceTerms, markdownSection } from '../../lib/answerText';
 import {
-  basename, citationExcerpt, compactPath, formatLines, groupByDirectory, matchCitation, normaliseCitationMarkdown,
-  resolveReference, summariseReferences,
+  answerLinkTarget, basename, citationExcerpt, compactPath, formatLines, groupByDirectory, markdownWithPermalinks,
+  matchCitation, normaliseCitationMarkdown, referenceReasonLabel, resolveReference, summariseReferences,
 } from '../../lib/citations';
 import { highlightLines } from '../../lib/prism';
 import useStore from '../../store/useStore';
@@ -36,7 +39,10 @@ const STATUS_COPY = {
   verified: { tone: 'text-success', label: 'Verified against the indexed code' },
   cited: { tone: 'text-success', label: 'In this answer’s sources' },
   path: { tone: 'text-ink-3', label: 'Mentioned in the answer · not among its sources' },
+  outside_evidence: { tone: 'text-warning', label: 'Exists in the index but was not part of this answer’s evidence' },
 };
+
+const PROFILE_NAMES = { fast: 'Fast', detailed: 'Detailed' };
 
 const extensionOf = (path) => {
   const name = basename(path);
@@ -142,7 +148,9 @@ const ChipPreview = ({ id, anchor, reference, status, excerpt, loading, language
           {compactPath(reference.path, 60)}{range && <span className="text-ink-3"> · {range}</span>}
         </p>
         <p className={`mt-0.5 flex items-center gap-1 text-[11px] font-medium ${copy.tone}`}>
-          {status === 'path' ? null : <CircleCheck className="h-3 w-3" aria-hidden="true" />}
+          {status === 'path' ? null : status === 'outside_evidence'
+            ? <AlertTriangle className="h-3 w-3" aria-hidden="true" />
+            : <CircleCheck className="h-3 w-3" aria-hidden="true" />}
           {copy.label}
         </p>
       </div>
@@ -209,11 +217,17 @@ const CitationChip = ({ reference, status, label, onOpen, citation, repoName }) 
   }, [anchor]);
 
   const verified = status === 'verified' || status === 'cited';
+  const outside = status === 'outside_evidence';
   const suffix = label.slice(reference.path.length);
+  let border = 'border-dashed border-line-strong';
+  if (verified) border = 'border-line';
+  else if (outside) border = 'border-dashed border-warning/60';
   return (
     <>
       <button
         type="button"
+        data-reference-status={status}
+        title={outside ? STATUS_COPY.outside_evidence.label : undefined}
         onClick={() => {
           hide();
           onOpen();
@@ -230,11 +244,13 @@ const CitationChip = ({ reference, status, label, onOpen, citation, repoName }) 
             hide();
           }
         }}
-        aria-label={label}
+        aria-label={outside ? `${label} (exists in the index but was not part of this answer’s evidence)` : label}
         aria-describedby={anchor ? previewId : undefined}
-        className={`mx-0.5 inline-flex max-w-[min(100%,26rem)] items-center gap-1 rounded-md border bg-surface-2 px-1.5 py-[1px] align-baseline font-mono text-[0.8em] text-ink-2 transition-colors hover:border-accent/50 hover:bg-accent-soft hover:text-accent-strong ${verified ? 'border-line' : 'border-dashed border-line-strong'}`}
+        className={`mx-0.5 inline-flex max-w-[min(100%,26rem)] items-center gap-1 rounded-md border bg-surface-2 px-1.5 py-[1px] align-baseline font-mono text-[0.8em] text-ink-2 transition-colors hover:border-accent/50 hover:bg-accent-soft hover:text-accent-strong ${border}`}
       >
-        <FileCode2 className="h-3 w-3 shrink-0 opacity-70" aria-hidden="true" />
+        {outside
+          ? <AlertTriangle className="h-3 w-3 shrink-0 text-warning" aria-hidden="true" />
+          : <FileCode2 className="h-3 w-3 shrink-0 opacity-70" aria-hidden="true" />}
         {/* Narrow screens cut the path from the left so the file name and
             line range always stay visible. */}
         <span className="min-w-0 truncate text-left [direction:rtl]"><bdi dir="ltr">{compactPath(reference.path)}</bdi></span>
@@ -365,47 +381,208 @@ const ERROR_TITLES = {
 
 const errorTitle = (status) => ERROR_TITLES[status] || 'This answer could not be completed';
 
-const ReferenceCheck = ({ references }) => {
-  const summary = summariseReferences(references);
-  if (!summary) return null;
-  const missing = [];
+const SMALL_BUTTON = 'inline-flex h-6 shrink-0 items-center gap-1 rounded-md border border-line bg-surface px-1.5 text-[11.5px] font-medium text-ink-2 transition-colors hover:border-line-strong hover:text-ink';
+const ISSUE_CODE = 'max-w-full truncate rounded border border-warning/30 bg-surface px-1.5 py-px font-mono text-[11px] text-ink-2';
+
+/** One row per reference or code name that needs a second look, saying what is actually wrong. */
+const answerIssues = (references, identifiers) => {
+  const rows = [];
   const seen = new Set();
-  references.forEach((item) => {
-    if (item && item.valid !== true && !seen.has(item.text)) {
-      seen.add(item.text);
-      missing.push(item.text || item.file_path);
-    }
+  (Array.isArray(references) ? references : []).forEach((item) => {
+    if (!item || item.valid === true || seen.has(item.text)) return;
+    seen.add(item.text);
+    rows.push({ kind: 'reference', key: `r:${item.text}`, item, label: referenceReasonLabel(item) });
   });
-  if (!summary.unverified) {
-    return (
-      <p className="mt-3 flex items-center gap-1.5 text-[12px] text-ink-3">
-        <CircleCheck className="h-3.5 w-3.5 shrink-0 text-success" aria-hidden="true" />
-        {summary.verified === 1 ? 'The file reference was' : `All ${summary.verified} file references were`} checked against the indexed code
-        {summary.repaired ? ` (${summary.repaired} corrected)` : ''}.
-      </p>
-    );
-  }
+  // `CliApp` and `CliApp(Flask)` are one missing name: one row.
+  (Array.isArray(identifiers) ? identifiers : []).forEach((item) => {
+    const names = (Array.isArray(item?.names) && item.names.length ? item.names : [item?.text]).filter(Boolean);
+    const key = `n:${names.join(',')}`;
+    if (!item?.text || !names.length || seen.has(key)) return;
+    seen.add(key);
+    rows.push({ kind: 'name', key, item, label: 'not found in the indexed code' });
+  });
+  return rows;
+};
+
+/**
+ * What the server checked in this answer. File references: how many exist in
+ * the indexed code (never an all-clear: it checks where the answer points,
+ * not what it says). Then every reference or code name that needs a second
+ * look with the actual problem: lines outside this answer's evidence (opens
+ * the file), a name that matches several files (lists them), a path that is
+ * not in the index, or a code name not found anywhere in the indexed code
+ * (one click searches for it).
+ */
+const AnswerCheck = ({ references, identifiers, truncated, onOpen, onSearch }) => {
+  const summary = summariseReferences(references);
+  const issues = answerIssues(references, identifiers);
+  if (!summary && !issues.length) return null;
+  const names = issues.filter((row) => row.kind === 'name').length;
+  const refs = issues.length - names;
+  const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
   return (
-    <div className="mt-3 rounded-xl border border-warning/30 bg-warning-soft px-3.5 py-2.5 text-[12.5px] leading-snug text-ink-2">
-      <p className="flex items-start gap-2">
-        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
-        <span>
-          <span className="font-semibold text-ink">
-            {summary.unverified} of {summary.total} reference{summary.total === 1 ? '' : 's'} could not be verified.
-          </span>{' '}
-          {summary.unverified === 1 ? 'It is' : 'They are'} shown with a dotted underline and no link: the file or lines are not in the indexed snapshot, so double-check before relying on {summary.unverified === 1 ? 'it' : 'them'}.
-        </span>
-      </p>
-      {missing.length > 0 && (
-        <p className="mt-1.5 flex flex-wrap gap-1 pl-5">
-          {missing.slice(0, 6).map((text) => (
-            <code key={text} className="max-w-full truncate rounded border border-warning/30 bg-surface px-1.5 py-px font-mono text-[11px] text-ink-2">{text}</code>
-          ))}
+    <div data-slot="answer-check" className="mt-3 space-y-2">
+      {summary && (
+        <p className="flex items-start gap-1.5 text-[12px] leading-snug text-ink-3">
+          <FileSearch className="mt-px h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          <span>
+            {truncated ? 'So far, ' : ''}
+            {summary.inIndex === summary.total
+              ? `${plural(summary.total, 'file/line reference')} ${summary.total === 1 ? 'exists' : 'exist'} in the indexed code`
+              : `${summary.inIndex} of ${plural(summary.total, 'file/line reference')} exist in the indexed code`}
+            {summary.repaired ? ` (${summary.repaired} path${summary.repaired === 1 ? '' : 's'} corrected)` : ''}.
+            {' '}This checks where the answer points, not what it says about that code.
+          </span>
         </p>
+      )}
+      {issues.length > 0 && (
+        <div className="rounded-xl border border-warning/30 bg-warning-soft px-3.5 py-2.5 text-[12.5px] leading-snug text-ink-2">
+          <p className="flex items-start gap-2 font-semibold text-ink">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
+            {[refs ? plural(refs, 'reference') : '', names ? plural(names, 'code name') : ''].filter(Boolean).join(' and ')}
+            {issues.length === 1 ? ' needs' : ' need'} a second look
+          </p>
+          <ul className="mt-1.5 space-y-1.5 pl-5">
+            {issues.slice(0, 8).map(({ kind, key, item, label }) => (
+              <li key={key} className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
+                {kind === 'reference' && item.file_path && item.reason === 'range_outside_evidence' ? (
+                  <button type="button" onClick={() => onOpen({ path: item.file_path, start: item.start_line, end: item.end_line })} className={`${ISSUE_CODE} hover:border-accent/50 hover:text-accent-strong`}>
+                    {item.text}
+                  </button>
+                ) : <code className={ISSUE_CODE}>{item.text}</code>}
+                <span>{label}</span>
+                {kind === 'reference' && Array.isArray(item.candidates) && item.candidates.length > 0 && (
+                  <span className="flex flex-wrap items-center gap-1">
+                    <span className="sr-only">:</span>
+                    {item.candidates.slice(0, 6).map((path) => (
+                      <button key={path} type="button" onClick={() => onOpen({ path, start: null, end: null })} className={`${ISSUE_CODE} hover:border-accent/50 hover:text-accent-strong`}>
+                        {path}
+                      </button>
+                    ))}
+                    {Math.max(Number(item.candidate_count) || 0, item.candidates.length) > 6 && (
+                      <span className="text-ink-3">and {Math.max(Number(item.candidate_count) || 0, item.candidates.length) - 6} more</span>
+                    )}
+                  </span>
+                )}
+                {kind === 'name' && onSearch && (
+                  <button type="button" onClick={() => onSearch(item.names?.[0] || item.text)} className={SMALL_BUTTON}>
+                    <Search className="h-3 w-3" aria-hidden="true" /> Search code for {item.names?.[0] || item.text}
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </div>
   );
 };
+
+/** Exact-match code search for one name, shown under the answer (no model call). */
+const CodeSearchCheck = ({ repoName, term, onOpen, onClose }) => {
+  const [state, setState] = useState({ loading: true, results: [], error: '' });
+  useEffect(() => {
+    const controller = new AbortController();
+    setState({ loading: true, results: [], error: '' });
+    searchRepository(repoName, term, { signal: controller.signal })
+      .then((response) => setState({ loading: false, results: response.data?.results || [], error: '' }))
+      .catch((error) => {
+        if (error?.code === 'ERR_CANCELED' || error?.name === 'CanceledError') return;
+        setState({ loading: false, results: [], error: errorMessage(error, 'The search failed. Try again in a moment.') });
+      });
+    return () => controller.abort();
+  }, [repoName, term]);
+  const files = state.results.length;
+  const fileCount = new Set(state.results.map((result) => result.file_path)).size;
+  return (
+    <div data-slot="code-search-check" className="mt-2 rounded-xl border border-line bg-surface-2 px-3.5 py-2.5 text-[12.5px] text-ink-2">
+      <div className="flex items-start gap-2">
+        <Search className="mt-0.5 h-3.5 w-3.5 shrink-0 text-ink-3" aria-hidden="true" />
+        <p role="status" className="min-w-0 flex-1">
+          {state.loading && <>Searching the indexed code for <code className="font-mono">{term}</code>…</>}
+          {!state.loading && state.error}
+          {!state.loading && !state.error && (files
+            ? <>Found <code className="font-mono">{term}</code> in {files === 1 ? '1 place' : `${files} places`}{fileCount > 1 ? ` across ${fileCount} files` : ''} in the indexed code:</>
+            : <>No exact match for <code className="font-mono">{term}</code> anywhere in the indexed code.</>)}
+        </p>
+        <button type="button" onClick={onClose} className="shrink-0 rounded-md px-1.5 text-[11.5px] text-ink-3 hover:bg-surface hover:text-ink">Close</button>
+      </div>
+      {files > 0 && (
+        <ul className="mt-1.5 space-y-1 pl-5">
+          {state.results.slice(0, 8).map((result) => {
+            const match = result.matches?.[0];
+            const line = match?.line || result.start_line;
+            return (
+              <li key={`${result.file_path}:${result.start_line}`}>
+                <button
+                  type="button"
+                  onClick={() => onOpen({ path: result.file_path, start: line || null, end: line || null })}
+                  className="flex max-w-full items-baseline gap-2 rounded-md text-left hover:text-accent-strong"
+                >
+                  <span className="shrink-0 font-mono text-[11.5px]">{compactPath(result.file_path, 40)}{line ? `:${line}` : ''}</span>
+                  {match?.text && <span className="min-w-0 truncate font-mono text-[11px] text-ink-3">{match.text.trim()}</span>}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+};
+
+/** Plain text of a Markdown syntax node (a heading's title). */
+const nodeText = (node) => (node?.type === 'text' ? node.value : (node?.children || []).map(nodeText).join(''));
+
+/**
+ * An answer heading with a "Copy section" control: it copies this heading's
+ * section as Markdown, with file references as commit-pinned GitHub links.
+ */
+const SectionHeading = ({ level, node, children, getSection, ...props }) => {
+  const Tag = `h${level}`;
+  const titleId = useId();
+  const [copyState, setCopyState] = useState('idle');
+  const timer = useRef(0);
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+  const line = node?.position?.start?.line;
+  if (!getSection || !line) return <Tag {...props}>{children}</Tag>;
+  const title = nodeText(node).trim();
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(getSection(line));
+      setCopyState('copied');
+    } catch {
+      setCopyState('failed');
+    }
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => setCopyState('idle'), 1600);
+  };
+  return (
+    <Tag {...props} aria-labelledby={titleId} className="group/section">
+      <span id={titleId}>{children}</span>
+      <button
+        type="button"
+        onClick={() => void copy()}
+        aria-label={`Copy section: ${title}`}
+        className="ms-2 inline-flex translate-y-[-1px] items-center gap-1 rounded-md px-1 py-0.5 align-middle text-[11px] font-medium text-ink-3 transition-opacity hover:bg-surface-2 hover:text-ink [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/section:opacity-100 [@media(hover:hover)]:focus-visible:opacity-100"
+      >
+        {copyState === 'copied' ? <Check className="h-3 w-3" aria-hidden="true" /> : <Copy className="h-3 w-3" aria-hidden="true" />}
+        <span aria-live="polite">{copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Copy failed' : 'Copy section'}</span>
+      </button>
+    </Tag>
+  );
+};
+
+const SmallActionButton = ({ onClick, icon: Icon, children, primary = false, disabled = false }) => (
+  <button
+    type="button"
+    onClick={onClick}
+    disabled={disabled}
+    className={`inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border px-3 text-[12.5px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${primary ? 'border-ink bg-ink text-canvas hover:opacity-90' : 'border-line bg-surface text-ink hover:border-line-strong hover:bg-surface-2'}`}
+  >
+    {Icon && <Icon className="h-3.5 w-3.5" aria-hidden="true" />} {children}
+  </button>
+);
 
 // --------------------------------------------------------------- follow-ups
 
@@ -441,9 +618,12 @@ const followUps = (message) => {
 const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealChange }) => {
   const openFile = useStore((state) => state.openFile);
   const askQuestion = useStore((state) => state.askQuestion);
+  const continueAnswer = useStore((state) => state.continueAnswer);
   const ask = onAsk || askQuestion;
   const setComposerDraft = useStore((state) => state.setComposerDraft);
   const isQuerying = useStore((state) => state.isQuerying);
+  // The code name searched from this answer (a "Search code" check), if any.
+  const [searchTerm, setSearchTerm] = useState(null);
   const isUser = message.role === 'user';
   // Only a question asked now (and its reply) rises in. History renders in
   // place: a page of 30 older messages animating at once is a visible stall.
@@ -473,6 +653,31 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
   }, [onRevealChange, revealing]);
 
   const markdown = useMemo(() => (isUser ? '' : normaliseCitationMarkdown(shownText)), [isUser, shownText]);
+  // Finished: the stream ended and the paced reveal (if any) caught up.
+  const settled = !message.streaming && isSettled;
+  const canCopySections = settled && !isUser && message.mode !== 'error';
+
+  // Copying links every reference to its lines on GitHub at the answer's commit.
+  const linkTarget = useMemo(
+    () => ({ ...(answerLinkTarget(message, repo) || {}), citations, answerReferences: message.answer_references }),
+    [message, repo, citations],
+  );
+  const replyCopyText = useMemo(
+    () => (settled ? markdownWithPermalinks(message.content || '', linkTarget) : message.content || ''),
+    [settled, message.content, linkTarget],
+  );
+  // Read when a section is copied, so headings need not re-render per token.
+  const sectionSource = useRef({ markdown, linkTarget });
+  sectionSource.current = { markdown, linkTarget };
+  const getSection = useCallback(
+    (line) => markdownWithPermalinks(markdownSection(sectionSource.current.markdown, line), sectionSource.current.linkTarget),
+    [],
+  );
+  const missingNames = useMemo(() => new Map(
+    (Array.isArray(message.unverified_identifiers) ? message.unverified_identifiers : [])
+      .filter((item) => item?.text)
+      .map((item) => [String(item.text).trim(), item.names || []]),
+  ), [message.unverified_identifiers]);
 
   const openReference = useCallback((reference) => {
     const index = matchCitation(citations, reference);
@@ -496,11 +701,12 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
       if (isBlock) return <CodeBlock code={text.replace(/\n$/, '')} language={language} />;
       const resolved = resolveReference(text, { citations, answerReferences: message.answer_references });
       if (resolved?.status === 'unverified') {
+        const detail = resolved.candidates?.length ? `${resolved.label}: ${resolved.candidates.join(', ')}` : resolved.label;
         return (
-          <code {...props} className="unverified-reference" title="Unverified reference: this file or line range was not found in the indexed repository.">
+          <code {...props} className="unverified-reference" data-reference-status="unverified" title={`Unverified reference: ${detail}.`}>
             <AlertTriangle className="mr-1 inline h-3 w-3 -translate-y-px text-warning" aria-hidden="true" />
             {children}
-            <span className="sr-only"> (unverified: not found in the indexed code)</span>
+            <span className="sr-only"> (unverified: {detail})</span>
           </code>
         );
       }
@@ -518,9 +724,24 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
           />
         );
       }
+      const missing = missingNames.get(text.trim());
+      if (missing) {
+        // A code name that occurs nowhere in the indexed code.
+        return (
+          <code {...props} className="unverified-reference decoration-warning!" data-identifier-status="not-found" title={`Not found in the indexed code: ${missing.join(', ')}`}>
+            <AlertTriangle className="mr-1 inline h-3 w-3 -translate-y-px text-warning" aria-hidden="true" />
+            {children}
+            <span className="sr-only"> (not found in the indexed code)</span>
+          </code>
+        );
+      }
       return <code {...props}>{children}</code>;
     },
     pre: ({ children }) => <>{children}</>,
+    h1: (props) => <SectionHeading level={1} getSection={canCopySections ? getSection : null} {...props} />,
+    h2: (props) => <SectionHeading level={2} getSection={canCopySections ? getSection : null} {...props} />,
+    h3: (props) => <SectionHeading level={3} getSection={canCopySections ? getSection : null} {...props} />,
+    h4: (props) => <SectionHeading level={4} getSection={canCopySections ? getSection : null} {...props} />,
     a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer">{children}</a>,
     // Remote images are never fetched automatically: indexed repository text
     // is untrusted model input and an image URL could carry the conversation
@@ -541,7 +762,7 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
       </div>
     ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [citations, message.answer_references, repoName, openReference]);
+  }), [citations, message.answer_references, repoName, openReference, missingNames, canCopySections, getSection]);
 
   // The Sources disclosure: cited sections first, each opening the file
   // viewer at its lines (a modified or middle click follows the GitHub
@@ -586,8 +807,6 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
   const hasProposal = Boolean(message.edit_suggestion || message.proposal_id);
   const stoppedEmpty = message.stopped && !message.partial;
   const canRetry = Boolean(isLast && onRegenerate);
-  // Finished: the stream ended and the paced reveal (if any) caught up.
-  const settled = !message.streaming && isSettled;
   let replyStatus = 'complete';
   if (!settled) replyStatus = 'streaming';
   else if (message.interrupted || (message.stopped && message.partial)) replyStatus = 'error';
@@ -596,6 +815,28 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
   // complete with a proposal, error when it ended without one. A request
   // that failed outright or was stopped empty shows its own notice instead.
   const showArtifact = editRun && (message.streaming || hasProposal || (!isError && !stoppedEmpty));
+
+  // Answer trust: a reply cut off at the output limit, a failed model, and
+  // the other model answering instead.
+  const truncated = message.mode === 'truncated';
+  const failure = message.answer_failure;
+  const failedProfile = failure?.model_profile || message.model_profile;
+  const question = () => {
+    const messages = useStore.getState().messages;
+    const index = messages.findIndex((item) => item.id === message.id);
+    return messages.slice(0, index).reverse().find((item) => item.role === 'user')?.content || '';
+  };
+  const retryWithFast = isLast && failedProfile === 'detailed' && !isQuerying ? () => {
+    const text = question();
+    if (text) void ask(text, { workflow: message.workflow && message.workflow !== 'editing' ? message.workflow : 'general', modelProfile: 'fast' });
+  } : null;
+  const modelAnswers = !editRun && ['rag', 'partial', 'truncated', undefined].includes(message.mode);
+  // Names the answer says it did not retrieve (flagged names have their own search).
+  const flaggedNames = new Set([...missingNames.keys(), ...[...missingNames.values()].flat()]);
+  const searchTerms = settled && modelAnswers && repoName
+    ? absenceTerms(message.content || '', 6).filter((term) => !flaggedNames.has(term)).slice(0, 3)
+    : [];
+  const showCheck = settled && !isError;
 
   return (
     <div data-slot="message" data-from="assistant" className={`flex gap-3 ${entering ? 'animate-rise' : ''}`}>
@@ -606,10 +847,21 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
         {message.mode === 'retrieval_fallback' && !message.streaming && (
           <Notice
             tone="warning"
-            title="The model was unavailable"
-            action={canRetry ? <RetryButton onClick={onRegenerate} /> : null}
+            title={failure?.message || 'The model was unavailable'}
+            action={(retryWithFast || canRetry) ? (
+              <div className="flex flex-wrap gap-2">
+                {retryWithFast && <SmallActionButton onClick={retryWithFast} icon={Zap} primary>Retry with Fast</SmallActionButton>}
+                {canRetry && <RetryButton onClick={onRegenerate} />}
+              </div>
+            ) : null}
           >
-            This shows the most relevant code instead of a written answer.
+            No answer was written. This shows the most relevant code instead.
+          </Notice>
+        )}
+
+        {message.answer_notice?.message && settled && (
+          <Notice tone="neutral" icon={Info} title={`Written by the ${PROFILE_NAMES[message.answer_notice.model_profile] || 'other'} model`}>
+            {message.answer_notice.message}
           </Notice>
         )}
 
@@ -640,7 +892,7 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
           // The model-unavailable notice above offers its own Try again.
           <StreamingText
             status={replyStatus}
-            copyText={message.content || ''}
+            copyText={replyCopyText}
             onRetry={canRetry && message.mode !== 'retrieval_fallback' ? onRegenerate : undefined}
             sources={sources}
             sourcesIcon={FileCode2}
@@ -665,7 +917,50 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
           </StreamingText>
         )}
 
-        {settled && !isError && <ReferenceCheck references={message.answer_references} />}
+        {truncated && settled && (
+          <Notice
+            tone="warning"
+            title="This answer reached the length limit"
+            action={(
+              <SmallActionButton
+                onClick={() => void continueAnswer(message.id, { modelProfile: message.model_profile === 'detailed' ? 'detailed' : 'fast' })}
+                icon={ArrowDownToLine}
+                primary
+                disabled={isQuerying || !message.message_id}
+              >
+                Continue
+              </SmallActionButton>
+            )}
+          >
+            It stops before the end, so the last part is missing. Continue writes the rest into this message.
+            {message.continue_error && <span role="alert" className="mt-1 block text-danger">{message.continue_error}</span>}
+          </Notice>
+        )}
+
+        {showCheck && (
+          <AnswerCheck
+            references={message.answer_references}
+            identifiers={message.unverified_identifiers}
+            truncated={truncated}
+            onOpen={(file) => openFile(file, message.id)}
+            onSearch={repoName ? setSearchTerm : null}
+          />
+        )}
+
+        {showCheck && searchTerms.length > 0 && (
+          <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[12px] text-ink-3">
+            <span>Not in the retrieved evidence. Check the whole index:</span>
+            {searchTerms.map((term) => (
+              <button key={term} type="button" onClick={() => setSearchTerm(term)} className={SMALL_BUTTON} aria-pressed={searchTerm === term}>
+                <Search className="h-3 w-3" aria-hidden="true" /> Search code for <code className="font-mono">{term}</code>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {showCheck && searchTerm && repoName && (
+          <CodeSearchCheck repoName={repoName} term={searchTerm} onOpen={(file) => openFile(file, message.id)} onClose={() => setSearchTerm(null)} />
+        )}
 
         {showArtifact && <EditProposalCard message={message} />}
 
