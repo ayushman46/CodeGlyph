@@ -112,7 +112,11 @@ test('qualitySummary: a passing proposal', async () => {
   assert.equal(summary.reviewed, true);
   assert.equal(summary.reviewSummary, 'No issues found.');
   assert.deepEqual(summary.autofixed, [{ file_path: 'a.ts', rule: 'final_newline', lines: 1 }]);
-  assert.equal(qualityNote(summary), 'checks passed');
+  // BUG-08: nothing ran the tests, so passing static checks never read as "checks passed".
+  assert.equal(summary.testsRun, false);
+  assert.equal(qualityNote(summary), 'tests not run · static checks passed');
+  const ran = qualitySummary({ ...withQuality({ status: 'pass', checks: [check('syntax', 'pass')] }), verification: { tests_run: true } });
+  assert.equal(qualityNote(ran), 'checks passed');
 });
 
 test('qualitySummary: warnings, and a skipped self-review counts as one', async () => {
@@ -131,7 +135,7 @@ test('qualitySummary: warnings, and a skipped self-review counts as one', async 
   assert.deepEqual(summary.warnings[0].files, [{ file_path: 'readme.md', line: 264, column: null, message: 'still says `limit`: `2`' }]);
   assert.equal(summary.warnings[0].label, 'Completeness');
   assert.deepEqual(summary.reviewIssues.map((issue) => [issue.severity, issue.fixed]), [['high', true], ['medium', false]]);
-  assert.equal(qualityNote(summary), '2 warnings');
+  assert.equal(qualityNote(summary), 'tests not run · 2 warnings');
 
   // The server says pass but the self-review was skipped: at least a warning.
   const skipped = qualitySummary(withQuality({
@@ -144,7 +148,7 @@ test('qualitySummary: warnings, and a skipped self-review counts as one', async 
   assert.deepEqual(skipped.skipped.map((item) => item.id), ['style']);
   assert.equal(skipped.reviewed, false);
   assert.equal(skipped.reviewSummary, 'Self-review skipped: the model was unavailable');
-  assert.equal(qualityNote(skipped), '1 warning');
+  assert.equal(qualityNote(skipped), 'tests not run · 1 warning');
 });
 
 test('qualitySummary: failures win over the server status, and findings are capped and cleaned', async () => {
@@ -175,7 +179,78 @@ test('qualitySummary: a review skipped on purpose (small change, every check pas
   assert.equal(summary.status, 'pass');
   assert.deepEqual(summary.warnings, []);
   assert.equal(summary.reviewSkippedOnPurpose, true);
-  assert.equal(qualityNote(summary), 'checks passed');
+  assert.equal(qualityNote(summary), 'tests not run · static checks passed');
+});
+
+// ------------------------------------------------- honesty and revisions (BUG-08, BUG-16, FEAT-13)
+
+test('verificationOf: the command to run and every reproduction case; older proposals fall back to their steps', async () => {
+  const { verificationOf } = await import('./proposal.js');
+  const stored = verificationOf({
+    validation: ['Run `python -m pytest tests/test_requests.py`', 'Check the case from #7634: `requests.Request("POST", "http://x", files={1: b"x"}).prepare()`'],
+    verification: {
+      tests_run: false, command: 'python -m pytest tests/test_requests.py', suite_command: 'python -m pytest tests',
+      command_source: 'the test target in the Makefile', test_files: ['tests/test_requests.py'],
+      cases: [{ code: 'requests.Request("POST", "http://x", files={1: b"x"}).prepare()', note: "AttributeError: 'int' object", covered: false }, { note: 'no code' }],
+    },
+  });
+  assert.equal(stored.testsRun, false);
+  assert.equal(stored.command, 'python -m pytest tests/test_requests.py');
+  assert.equal(stored.source, 'the test target in the Makefile');
+  assert.deepEqual(stored.cases.map((item) => item.code), ['requests.Request("POST", "http://x", files={1: b"x"}).prepare()']);
+  assert.equal(stored.steps.length, 2);
+  // A stored proposal from before verification existed: tests were not run either.
+  const older = verificationOf(withQuality({ status: 'pass', checks: [] }));
+  assert.equal(older.testsRun, false);
+  assert.equal(older.command, '');
+  const fromSteps = verificationOf({ ...withQuality({ status: 'pass', checks: [] }), validation: ['Review the diff', 'python -m pytest tests/ -x -k "multipart or form"'] });
+  assert.equal(fromSteps.command, 'python -m pytest tests/ -x -k "multipart or form"');
+  assert.equal(verificationOf({ ...withQuality({ status: 'pass', checks: [] }), validation: ['Run `npm test` and check the output'] }).command, 'npm test');
+  // A legacy proposal without quality renders as before.
+  assert.equal(verificationOf({ id: 'p', files: [] }), null);
+});
+
+test('reviewLine never says "No problems found" without saying how', async () => {
+  const { reviewLine } = await import('./proposal.js');
+  const clean = 'Self-review: no problems found by reading the diff (nothing was run).';
+  assert.equal(reviewLine({ reviewed: true, reviewSummary: 'No problems found' }), clean);
+  assert.equal(reviewLine({ reviewed: true, reviewSummary: 'No issues found.' }), clean);
+  assert.equal(reviewLine({ reviewed: true, reviewSummary: '' }), clean);
+  assert.equal(reviewLine({ reviewed: true, reviewSummary: 'No problems found by reading the diff (nothing was run)' }),
+    'Self-review: No problems found by reading the diff (nothing was run)');
+  assert.equal(reviewLine({ reviewed: true, reviewSummary: 'Fixed 1 of 2 issues' }), 'Self-review: Fixed 1 of 2 issues');
+  assert.equal(reviewLine({ reviewed: false, reviewSummary: 'the model was unavailable' }), 'Self-review skipped: the model was unavailable');
+  assert.equal(reviewLine({ reviewed: false, reviewSummary: '' }), 'Self-review skipped.');
+});
+
+test('buildPrBody: a body of only template comments is replaced, and "Fixes issue #N" becomes "Fixes #N"', async () => {
+  const { buildPrBody, withClosingReference } = await import('./proposal.js');
+  const comments = '<!--\nReplace this comment with a description of the change.\n-->\n\n<!--\nfixes #<issue number>\n-->';
+  const body = buildPrBody({ pr_body: comments, summary: 'Name the endpoint.', validation: ['pytest'] });
+  assert.doesNotMatch(body, /<!--/);
+  assert.match(body, /^## Summary\n\nName the endpoint\.\n\n## Testing\n- \[ \] pytest/);
+  const confirmed = { issue_reference: 7634, issue_confirmed: true };
+  assert.equal(withClosingReference('## Summary\n\nFixes GitHub issue #7634 where x.', confirmed), '## Summary\n\nFixes #7634 where x.');
+  assert.equal(withClosingReference('Fixes #76345', confirmed), 'Fixes #7634\n\nFixes #76345');
+  assert.equal(withClosingReference('Closes: #7634', confirmed), 'Closes: #7634');
+  assert.equal(withClosingReference('Fixes psf/requests#7634', { ...confirmed, issue_repository: 'psf/requests' }), 'Fixes psf/requests#7634');
+  // An unconfirmed issue is only referenced; the body is left alone.
+  assert.equal(withClosingReference('See issue #12.', { issue_reference: 12, issue_confirmed: false }), 'See issue #12.');
+  assert.match(buildPrBody({ ...confirmed, pr_body: '## Summary\nFixes issue #7634.' }), /^## Summary\nFixes #7634\./);
+});
+
+test('revisionOf names the revised proposal and what happened to its files', async () => {
+  const { revisionOf } = await import('./proposal.js');
+  assert.equal(revisionOf({}), null);
+  assert.equal(revisionOf({ revision_of: { title: 'x' } }), null);
+  assert.deepEqual(revisionOf({
+    revision_of: {
+      id: 'p1', title: 'Fix names', kept_files: ['a.py', ''], dropped_files: ['t.py'], added_files: [],
+      not_reapplied: [{ file_path: 'b.py', reason: 'no longer applies' }, { reason: 'x' }],
+    },
+  }), {
+    id: 'p1', title: 'Fix names', kept: ['a.py'], dropped: ['t.py'], added: [], notReapplied: [{ file_path: 'b.py', reason: 'no longer applies' }],
+  });
 });
 
 test('qualitySummary: unverified review suggestions are kept apart and never warn a file', async () => {

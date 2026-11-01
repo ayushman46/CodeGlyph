@@ -132,6 +132,65 @@ export const failingToolCalls = [
   { tool: 'code_edit', input: { proposal_id: FAILING_PROPOSAL_ID }, result_summary: 'fix: validate the delay input' },
 ];
 
+// ------------------------------------------- tests not run / revisions (BUG-08, BUG-16, FEAT-13)
+
+export const REVISED_PROPOSAL_ID = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+export const ISSUE_CASE = 'requests.Request("POST", "http://x", files={1: b"x"}).prepare()';
+const modelsBefore = 'def _encode_files(files, data):\n    for k, v in files:\n        fn = guess_filename(v) or k\n        rf = RequestField(name=k, data=v, filename=fn)\n';
+const modelsAfter = modelsBefore.replace('or k\n', 'or str(k)\n').replace('name=k,', 'name=str(k),');
+
+/**
+ * A revision of an earlier proposal for psf/requests#7634: every static check
+ * passed, the self-review found nothing, and nothing was run. The stored PR
+ * body still says "Fixes issue #7634", which closes nothing on GitHub.
+ */
+export const revisedProposal = {
+  id: REVISED_PROPOSAL_ID,
+  title: 'Convert non-string form field names and file names',
+  summary: 'Use str() for field names and the filename fallback.',
+  pr_body: '## Summary\n\nFixes issue #7634 where non-string names fail.\n\n## How to verify\n\n- Run `python -m pytest tests/test_requests.py`',
+  validation: [
+    'Run `python -m pytest tests/test_requests.py`, then the whole suite with `python -m pytest tests`',
+    `Check the case from #7634: \`${ISSUE_CASE}\` (the issue reports: AttributeError: 'int' object has no attribute 'translate')`,
+  ],
+  issue_reference: '7634',
+  issue_confirmed: true,
+  files: [
+    {
+      file_path: 'src/requests/models.py', action: 'modify', summary: 'Convert names and the filename fallback',
+      changes: [{ old: '        fn = guess_filename(v) or k\n        rf = RequestField(name=k, data=v, filename=fn)', new: '        fn = guess_filename(v) or str(k)\n        rf = RequestField(name=str(k), data=v, filename=fn)' }],
+      before: modelsBefore, after: modelsAfter, base_blob_sha: 'sha-models', additions: 2, deletions: 2, language: 'python', source: 'github',
+      syntax: { status: 'pass', checker: 'ast', errors: [] },
+    },
+  ],
+  stats: { files: 1, additions: 2, deletions: 2 },
+  quality: {
+    status: 'pass',
+    checks: [
+      { id: 'syntax', label: 'Syntax', status: 'pass', detail: '1 file parsed (ast 1); no errors', files: [] },
+      { id: 'style', label: 'Style', status: 'pass', detail: "Added lines follow the file's style", files: [] },
+      { id: 'tests', label: 'Tests touched', status: 'pass', detail: 'tests were not run (CI runs them on the pull request)', files: [] },
+      { id: 'review', label: 'Self-review', status: 'pass', detail: 'No problems found by reading the diff (nothing was run)', files: [] },
+    ],
+    reviewed: true,
+    review_summary: 'No problems found by reading the diff (nothing was run)',
+    review_issues: [],
+    autofixed: [],
+    style: {},
+  },
+  verification: {
+    tests_run: false, command: 'python -m pytest tests/test_requests.py', suite_command: 'python -m pytest tests',
+    command_source: 'the test target in the Makefile', test_files: [], issue: '#7634',
+    cases: [{ code: ISSUE_CASE, note: "AttributeError: 'int' object has no attribute 'translate'", covered: false }],
+  },
+  revision_of: {
+    id: '11111111-2222-3333-4444-555555555555', title: 'Fix non-string form field names',
+    kept_files: ['src/requests/models.py'], dropped_files: [], not_reapplied: [], added_files: [],
+  },
+  conventions: { pr_template_path: null, commit_style: 'unknown', commit_style_source: '', contributing_path: null, agent_instructions_path: null, dco_required: false, notes: [] },
+  commit_message: 'Convert non-string form field names and file names',
+};
+
 const checkRun = (name, conclusion) => ({
   name, source: 'check_run', status: 'completed', conclusion,
   url: `https://github.com/calcom/cal.com/actions/runs/1/job/${name.length}`,

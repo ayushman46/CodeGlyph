@@ -20,16 +20,17 @@ import {
   PR_BODY_LIMIT, approximatePaths, buildPrBody, commitMessageFor, fileQuality, findingText, issueLabel, proposalIdFor,
   qualityFailure, qualitySummary, rememberPullRequest, titleConventionHint,
 } from '../../lib/proposal';
-import ProposalNotices, { PullRequestChecks, QualitySummary } from './ProposalNotices';
+import ProposalNotices, { PullRequestChecks, QualitySummary, RevisionNote } from './ProposalNotices';
 
 const randomSuffix = () => Math.random().toString(36).slice(2, 7);
 const uid = () => (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${randomSuffix()}`);
 
-// A file's quality gates in the file list: icon, tone and spoken label.
+// A file's quality gates in the file list: icon, tone and spoken label. A
+// pass is static (syntax, style, imports): nothing was run.
 const FILE_QUALITY = {
   fail: { icon: CircleX, className: 'text-danger', label: 'Checks failed' },
   warn: { icon: AlertTriangle, className: 'text-warning', label: 'Warnings' },
-  pass: { icon: CircleCheck, className: 'text-success', label: 'Checks passed' },
+  pass: { icon: CircleCheck, className: 'text-success', label: 'Static checks passed' },
 };
 
 const CONVENTION_LABELS = {
@@ -639,6 +640,7 @@ const PullRequestReview = ({ review }) => {
               </div>
             </div>
             <div className="scroll-thin min-h-0 flex-1 overflow-auto p-3 sm:p-4">
+              <RevisionNote proposal={proposal} className="mb-3" />
               <ProposalNotices proposal={proposal} refreshedPaths={refreshedPaths} className="mb-3" />
               {proposal?.issue_reference && <p className="mb-2 text-[12px] text-ink-3">{issueLabel(proposal)}</p>}
               {selected?.summary && <p className="mb-3 text-[13px] leading-relaxed text-ink-2">{selected.summary}</p>}
