@@ -36,6 +36,7 @@ from agent.nemotron import (
 )
 from api import query_router
 from api.answer_trust import (
+    annotate_history_names,
     answer_check_entry,
     answer_code_names,
     continuation_base,
@@ -425,6 +426,24 @@ class IdentifierLookupTests(answers.DatabaseTestCase):
         self.assertEqual(self.check("Uses `send_request`."), [{"text": "send_request", "names": ["send_request"]}])
         self.assertEqual(self.check("Uses `send_request_headers`."), [])
 
+    def test_earlier_answers_are_marked_with_the_names_they_invented(self):
+        # The question was asked before and that answer invented subclasses;
+        # replayed as history they were repeated as fact.
+        history = [
+            {"role": "user", "content": "Does anything subclass Flask?"},
+            {"role": "assistant", "content": "Yes: `BlueprintApp(Flask)` and `CliApp`, near `_set_timeout`."},
+            {"role": "assistant", "content": "Only `_send_single_request`."},
+        ]
+        run(annotate_history_names(self.store, answers.REPO_ID, history))
+        self.assertEqual(history[1]["unverified_names"], ["BlueprintApp", "CliApp"])
+        self.assertNotIn("unverified_names", history[2])
+        self.assertNotIn("unverified_names", history[0])
+        messages = build_answer_messages("Does anything subclass Flask?", "ctx", history)
+        self.assertIn("[Checked after this answer: `BlueprintApp`, `CliApp` occur nowhere in the indexed code, so this "
+                      "answer was wrong about them. Do not repeat them.]", messages[2]["content"])
+        self.assertEqual(messages[3]["content"], "Only `_send_single_request`.")
+        self.assertIn("Earlier answers in this conversation can be wrong.", messages[0]["content"])
+
     def test_names_in_the_evidence_need_no_lookup_and_a_failed_lookup_flags_nothing(self):
         evidence = [{"file_path": "x.py", "content": "def made_up_name(): pass"}]
         self.assertEqual(self.check("Calls `made_up_name`.", evidence), [])
@@ -447,8 +466,8 @@ class ReferenceReasonTests(answers.DatabaseTestCase):
 
     def test_outside_evidence_ambiguous_missing_and_past_the_end_are_told_apart(self):
         evidence = [answers.chunk("lib/router.js", 1, "a\nb\nc")]
-        answer = ("See `package.json:L92-L98`, `view.js`, `lib/router.js:L1-L2`, `lib/missing.js:L3` "
-                  "and `package.json:L140-L150`.")
+        answer = ("See `package.json:L92-L98`, `view.js`, `lib/router.js:L1-L2`, `lib/missing.js:L3`, "
+                  "`package.json:L140-L150` and `package.json:L95-L120`.")
         _, refs = run(validate_answer_references(self.store, answers.REPO_ID, answer, evidence))
         by_text = {item["text"]: item for item in refs}
         outside = by_text["package.json:L92-L98"]
@@ -459,6 +478,25 @@ class ReferenceReasonTests(answers.DatabaseTestCase):
         self.assertEqual(by_text["lib/missing.js:L3"]["reason"], "not_in_index")
         past_end = by_text["package.json:L140-L150"]
         self.assertEqual((past_end["reason"], past_end["file_lines"]), ("lines_outside_file", 99))
+        # Starts inside the file but runs past its end.
+        self.assertEqual(by_text["package.json:L95-L120"]["reason"], "lines_outside_file")
+
+    def test_an_exact_indexed_path_wins_over_same_named_files_deeper_down(self):
+        # express: `index.js` is the root entry file, not one of 29 examples/*/index.js.
+        files = {"index.js": "module.exports = require('./lib/express');", "test/fixtures/deep/server.js": "x"}
+        files.update({f"examples/demo{n}/{name}": "app.listen(3000)" for n in range(10) for name in ("index.js", "server.js")})
+        run(answers.seed_files(self.store, files))
+        _, refs = run(validate_answer_references(self.store, answers.REPO_ID, "Entry: `index.js`. Demo: `demo3/index.js`.", []))
+        self.assertEqual([(item["valid"], item["file_path"]) for item in refs],
+                         [(True, "index.js"), (True, "examples/demo3/index.js")])
+        _, refs = run(validate_answer_references(self.store, answers.REPO_ID, "See `view.js` and `server.js`.", []))
+        self.assertEqual(refs[0]["candidates"], ["lib/view.js", "test/view.js"])
+        ambiguous = refs[1]
+        self.assertEqual((ambiguous["reason"], ambiguous["candidate_count"]), ("ambiguous", 11))
+        # Shallowest first, so the deep fixture is cut by the cap of 8.
+        self.assertEqual(ambiguous["candidates"][:2], ["examples/demo0/server.js", "examples/demo1/server.js"])
+        self.assertEqual(len(ambiguous["candidates"]), 8)
+        self.assertNotIn("test/fixtures/deep/server.js", ambiguous["candidates"])
 
 
 # ---------------------------------------------------------------------------

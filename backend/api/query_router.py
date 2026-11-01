@@ -22,6 +22,7 @@ from agent.code_edit import create_edit_ticket, edit_file_paths
 from agent.editor import EditRequest, run_code_edit
 from agent.nemotron import AnswerRestart, LLMProviderError, TruncatedAnswer
 from api.answer_trust import (
+    annotate_history_names,
     answer_check_entry,
     continuation_base,
     describe_answer_failure,
@@ -660,8 +661,10 @@ async def validate_answer_references(
             reason, ambiguous_files = "ambiguous", candidates
         else:
             in_index = (indexed or {}).get(path) if indexed is not None else None
-            if in_index and len(in_index) == 1:
-                resolved = in_index[0]
+            # `index.js` is the root index.js even when examples/*/index.js exist.
+            exact_in_index = [item for item in in_index or [] if item.lower() == path.lower()]
+            if in_index and (len(in_index) == 1 or len(exact_in_index) == 1):
+                resolved = exact_in_index[0] if exact_in_index else in_index[0]
             elif in_index and len(in_index) > 1:
                 reason, ambiguous_files = "ambiguous", in_index
             else:
@@ -695,16 +698,19 @@ async def validate_answer_references(
             "repaired": bool(repaired and valid),
         }
         if ambiguous_files:
-            result["candidates"] = sorted(dict.fromkeys(ambiguous_files))[:8]
+            # Shallowest first: the files a reader most likely meant.
+            ranked = sorted(dict.fromkeys(ambiguous_files), key=lambda item: (item.count("/"), item))
+            result["candidates"], result["candidate_count"] = ranked[:8], len(ranked)
         results.append(result)
     # An indexed file referenced outside the evidence: lines past its end do
-    # not exist at all, which is a different problem from unshown lines.
+    # not exist at all (`index.js:L1-L99` for an 11-line file), which is a
+    # different problem from lines that exist but were not shown.
     outside = [item for item in results if item["reason"] == "range_outside_evidence" and item["file_path"]]
     if outside and repo_id:
         line_counts = await _indexed_line_counts(store, repo_id, [item["file_path"] for item in outside])
         for item in outside:
             last_line = line_counts.get(item["file_path"])
-            if last_line and item["start_line"] and item["start_line"] > last_line:
+            if last_line and item["start_line"] and (item["end_line"] or item["start_line"]) > last_line:
                 item["reason"], item["file_lines"] = "lines_outside_file", last_line
     if replacements:
         pieces, cursor = [], 0
@@ -872,6 +878,8 @@ async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool) -
             # History improves continuity but is not required to answer.
             logger.warning("Conversation history unavailable for repository %s: %s", repo["id"], type(error).__name__)
             history = []
+        if workflow != "editing":
+            await annotate_history_names(store, repo["id"], history)
         retrieval_query, boost_paths = build_retrieval_query(question, history)
         yield "stage", {"stage": "retrieving", "detail": "Searching the indexed code"}
         chunks = await retrieve_context(

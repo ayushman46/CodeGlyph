@@ -57,6 +57,7 @@ Citations are the most important part of the answer:
 - When the user asks where something lives, name the exact folder and file, for example "in `apps/web/lib/auth/` — `apps/web/lib/auth/session.ts:L10-L58`".
 - Never invent files, folders, symbols, endpoints, relationships, or line numbers. Use the repository map only to describe structure; facts about behaviour must come from the evidence.
 - Before you write a function, method, class, subclass, import, or variable name in backticks, check that the exact name appears in the evidence. Never name a method, subclass, or import you did not see there. Every backticked name is looked up in the indexed code, and names that are not found are flagged to the user.
+- Earlier answers in this conversation can be wrong. Never repeat a name, file, or claim from them unless the current evidence shows it.
 - Every line range you write must lie inside the lines shown for that file in the evidence. If the code you need (a definition, a caller, a test) is not in the evidence, name the file without a line range, or say it was not retrieved; never guess a range. Every reference is checked against the evidence and unverifiable ones are flagged to the user.
 - Copy the full path from the evidence header. Two files can share a name in different folders; never shorten or re-root a path.
 - Only state that A calls, triggers, or uses B when the evidence shows the call. Do not infer call chains from names.
@@ -90,6 +91,13 @@ The selected workflow is **{plan.get('label', workflow)}**. Its focus is: {workf
     for message in (conversation_history or [])[-10:]:
         role = message.get("role")
         content = str(message.get("content") or "").strip()
+        names = [str(name) for name in message.get("unverified_names") or []][:12]
+        if role == "assistant" and content and names:
+            # An earlier answer's invented names would otherwise be repeated.
+            content += (
+                "\n\n[Checked after this answer: " + ", ".join(f"`{name}`" for name in names)
+                + " occur nowhere in the indexed code, so this answer was wrong about them. Do not repeat them.]"
+            )
         if role in {"user", "assistant"} and content:
             messages.append({"role": role, "content": content})
     repo_map_section = f"<repository-map>\n{repo_map_text}\n</repository-map>\n\n" if repo_map_text else ""
@@ -99,7 +107,8 @@ The selected workflow is **{plan.get('label', workflow)}**. Its focus is: {workf
         notes.append(
             "Terms from the question that do not occur anywhere in the indexed repository: "
             + ", ".join(absent_terms)
-            + ". If one names a technology, product, file, or feature, say that it was not found anywhere in the indexed code."
+            + ". If one names a technology, product, file, or feature, say that it was not found anywhere in the indexed code. "
+            "Ignore ordinary words from the question; do not mention them."
         )
     if plan.get("missing_files"):
         notes.append("Requested files that are not in the index: " + ", ".join(map(str, plan["missing_files"][:5])) + ".")

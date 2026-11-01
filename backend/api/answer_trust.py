@@ -177,6 +177,32 @@ async def find_unverified_identifiers(store, repo_id: str | None, answer: str, e
     return flagged[:_MAX_FLAGS]
 
 
+async def annotate_history_names(store, repo_id: str | None, history: list[dict]) -> None:
+    """Note, on each earlier answer, the code names it used that occur nowhere in the indexed code.
+
+    Earlier answers are replayed to the model as conversation context, and a
+    name an earlier answer invented (Flask "subclasses" ``BlueprintApp`` and
+    ``CliApp``) was repeated as fact when the question was asked again. The
+    names of every earlier answer are looked up in one statement and stored
+    as ``unverified_names``, which the prompt shows next to that answer.
+    """
+    answers = [item for item in history if item.get("role") == "assistant" and item.get("content")]
+    if not answers or not repo_id:
+        return
+    names_by_answer = [
+        list(dict.fromkeys(name for entry in answer_code_names(item["content"]) for name in entry["names"]))
+        for item in answers
+    ]
+    every_name = list(dict.fromkeys(name for names in names_by_answer for name in names))[:_MAX_NAMES]
+    missing = await _names_missing_from_index(store, repo_id, every_name)
+    if not missing:
+        return
+    for item, names in zip(answers, names_by_answer):
+        flagged = [name for name in names if name in missing]
+        if flagged:
+            item["unverified_names"] = flagged[:12]
+
+
 # ---------------------------------------------------------------------------
 # Continuing an answer that stopped at the output limit
 # ---------------------------------------------------------------------------
