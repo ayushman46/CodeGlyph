@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { absenceTerms, markdownSection, withoutInterruptionNote } from './answerText.js';
+import { absenceTerms, markdownSection, splitSearchMatches, withoutInterruptionNote } from './answerText.js';
 
 const ANSWER = [
   '## Direct answer',
@@ -51,6 +51,38 @@ test('absenceTerms finds the code names an answer says it did not retrieve', () 
   assert.deepEqual(absenceTerms(text, 5), ['_encode_files', 'to_key_val_list', 'Command.invoke']);
   assert.deepEqual(absenceTerms('`flask` handles it. Everything was retrieved.'), []);
   assert.deepEqual(absenceTerms("I couldn't find `make_response` in the evidence."), ['make_response']);
+});
+
+test('splitSearchMatches counts only the whole name in the same case as found', () => {
+  // The search matches prefixes and ignores case: httpx's docs only mention
+  // http11.send_request_headers, so `send_request` is not found there.
+  const results = [
+    { file_path: 'docs/advanced/extensions.md', start_line: 1, matches: [{ line: 1, text: 'Calls `http11.send_request_headers` during a request.' }] },
+    { file_path: 'httpx/_client.py', start_line: 580, matches: [
+      { line: 581, text: '    def Send_Request(self):' },
+      { line: 590, text: '    response = self.send_request(request)' },
+    ] },
+  ];
+  const split = splitSearchMatches(results, 'send_request');
+  assert.equal(split.name, 'send_request');
+  assert.deepEqual(split.exact, [{ file_path: 'httpx/_client.py', line: 590, text: '    response = self.send_request(request)' }]);
+  assert.deepEqual(split.partial.map((match) => match.line), [1, 581]);
+  assert.deepEqual(split.longerNames, ['send_request_headers', 'Send_Request']);
+
+  const partialOnly = splitSearchMatches(results.slice(0, 1), 'send_request');
+  assert.deepEqual([partialOnly.exact.length, partialOnly.partial.length], [0, 1]);
+  assert.deepEqual(splitSearchMatches([], 'send_request'), { name: 'send_request', exact: [], partial: [], longerNames: [] });
+});
+
+test('splitSearchMatches matches the last part of a dotted name', () => {
+  const results = [{ file_path: 'src/click/core.py', start_line: 900, matches: [
+    { line: 912, text: '    def invoke(self, ctx: Context) -> t.Any:' },
+    { line: 930, text: '        return self.invoke_without_command' },
+  ] }];
+  const split = splitSearchMatches(results, 'Command.invoke');
+  assert.equal(split.name, 'invoke');
+  assert.deepEqual(split.exact.map((match) => match.line), [912]);
+  assert.deepEqual(split.longerNames, ['invoke_without_command']);
 });
 
 test('withoutInterruptionNote removes only the server note that ends a stopped answer', () => {

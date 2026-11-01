@@ -8,7 +8,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { errorMessage, searchRepository } from '../../api/client';
 import { citationsToSources, shouldPaceReply } from '../../lib/ai/streamingText';
-import { absenceTerms, markdownSection, withoutInterruptionNote } from '../../lib/answerText';
+import { absenceTerms, markdownSection, splitSearchMatches, withoutInterruptionNote } from '../../lib/answerText';
 import {
   answerLinkTarget, basename, citationExcerpt, compactPath, formatLines, groupByDirectory, markdownWithPermalinks,
   matchCitation, normaliseCitationMarkdown, referenceReasonLabel, resolveReference, summariseReferences,
@@ -478,7 +478,12 @@ const AnswerCheck = ({ references, identifiers, truncated, onOpen, onSearch }) =
   );
 };
 
-/** Exact-match code search for one name, shown under the answer (no model call). */
+/**
+ * Code search for one name, shown under the answer (no model call). The
+ * search matches prefixes and ignores case, so only lines with the whole name
+ * in the same case count as found (the rule behind "not found in the indexed
+ * code"); lines with longer names that contain it are listed as partial.
+ */
 const CodeSearchCheck = ({ repoName, term, onOpen, onClose }) => {
   const [state, setState] = useState({ loading: true, results: [], error: '' });
   useEffect(() => {
@@ -492,8 +497,14 @@ const CodeSearchCheck = ({ repoName, term, onOpen, onClose }) => {
       });
     return () => controller.abort();
   }, [repoName, term]);
-  const files = state.results.length;
-  const fileCount = new Set(state.results.map((result) => result.file_path)).size;
+  const { name, exact, partial, longerNames } = useMemo(() => splitSearchMatches(state.results, term), [state.results, term]);
+  const shown = exact.length ? exact : partial;
+  const places = exact.length;
+  const fileCount = new Set(exact.map((match) => match.file_path)).size;
+  const searched = name && name !== term
+    ? <><code className="font-mono">{name}</code> (the last part of <code className="font-mono">{term}</code>)</>
+    : <code className="font-mono">{term}</code>;
+  const code = (text) => <code key={text} className="font-mono">{text}</code>;
   return (
     <div data-slot="code-search-check" className="mt-2 rounded-xl border border-line bg-surface-2 px-3.5 py-2.5 text-[12.5px] text-ink-2">
       <div className="flex items-start gap-2">
@@ -501,30 +512,30 @@ const CodeSearchCheck = ({ repoName, term, onOpen, onClose }) => {
         <p role="status" className="min-w-0 flex-1">
           {state.loading && <>Searching the indexed code for <code className="font-mono">{term}</code>…</>}
           {!state.loading && state.error}
-          {!state.loading && !state.error && (files
-            ? <>Found <code className="font-mono">{term}</code> in {files === 1 ? '1 place' : `${files} places`}{fileCount > 1 ? ` across ${fileCount} files` : ''} in the indexed code:</>
-            : <>No exact match for <code className="font-mono">{term}</code> anywhere in the indexed code.</>)}
+          {!state.loading && !state.error && (places
+            ? <>Found {searched} in {places === 1 ? '1 place' : `${places} places`}{fileCount > 1 ? ` across ${fileCount} files` : ''} in the indexed code:</>
+            : partial.length
+              ? <>No exact match for {searched}. The search found only other names that contain it{longerNames.length
+                ? <>, such as {longerNames.flatMap((text, index) => (index ? [', ', code(text)] : [code(text)]))}</>
+                : ''}:</>
+              : <>No match for {searched} anywhere in the indexed code.</>)}
         </p>
         <button type="button" onClick={onClose} className="shrink-0 rounded-md px-1.5 text-[11.5px] text-ink-3 hover:bg-surface hover:text-ink">Close</button>
       </div>
-      {files > 0 && (
-        <ul className="mt-1.5 space-y-1 pl-5">
-          {state.results.slice(0, 8).map((result) => {
-            const match = result.matches?.[0];
-            const line = match?.line || result.start_line;
-            return (
-              <li key={`${result.file_path}:${result.start_line}`}>
-                <button
-                  type="button"
-                  onClick={() => onOpen({ path: result.file_path, start: line || null, end: line || null })}
-                  className="flex max-w-full items-baseline gap-2 rounded-md text-left hover:text-accent-strong"
-                >
-                  <span className="shrink-0 font-mono text-[11.5px]">{compactPath(result.file_path, 40)}{line ? `:${line}` : ''}</span>
-                  {match?.text && <span className="min-w-0 truncate font-mono text-[11px] text-ink-3">{match.text.trim()}</span>}
-                </button>
-              </li>
-            );
-          })}
+      {!state.loading && !state.error && shown.length > 0 && (
+        <ul className="mt-1.5 space-y-1 pl-5" aria-label={places ? 'Exact matches' : 'Partial matches'}>
+          {shown.slice(0, 8).map((match, index) => (
+            <li key={`${match.file_path}:${match.line}:${index}`}>
+              <button
+                type="button"
+                onClick={() => onOpen({ path: match.file_path, start: match.line, end: match.line })}
+                className="flex max-w-full items-baseline gap-2 rounded-md text-left hover:text-accent-strong"
+              >
+                <span className="shrink-0 font-mono text-[11.5px]">{compactPath(match.file_path, 40)}{match.line ? `:${match.line}` : ''}</span>
+                {match.text && <span className="min-w-0 truncate font-mono text-[11px] text-ink-3">{match.text.trim()}</span>}
+              </button>
+            </li>
+          ))}
         </ul>
       )}
     </div>

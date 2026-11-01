@@ -112,8 +112,11 @@ test('code names and references the index does not back are flagged with the act
       { text: 'lib/gone.js:L3', file_path: null, start_line: 3, end_line: 3, valid: false, reason: 'not_in_index' },
     ],
   })]]);
+  // The search matches prefixes, as the real one does: only a longer name comes back.
   await page.route('**/api/repos/cal.com/search**', (route) => route.fulfill({
-    status: 200, contentType: 'application/json', body: JSON.stringify({ query: 'send_request', results: [], message: 'No matches' }),
+    status: 200, contentType: 'application/json', body: JSON.stringify({ query: 'send_request', results: [
+      { file_path: 'docs/advanced/extensions.md', start_line: 1, end_line: 2, matches: [{ line: 1, text: 'Calls `http11.send_request_headers` during a request.' }] },
+    ] }),
   }));
   await page.goto('/app/r/cal.com');
   await ask(page, 'List every call site of _set_timeout and show its definition.');
@@ -136,7 +139,10 @@ test('code names and references the index does not back are flagged with the act
   await expect(page.getByRole('complementary', { name: 'File package.json' }).first()).toBeVisible();
 
   await check.getByRole('button', { name: 'Search code for send_request' }).click();
-  await expect(page.locator('[data-slot="code-search-check"]')).toContainText('No exact match for send_request anywhere in the indexed code.');
+  const search = page.locator('[data-slot="code-search-check"]');
+  await expect(search).toContainText('No exact match for send_request. The search found only other names that contain it, such as send_request_headers:');
+  await expect(search).not.toContainText('Found send_request');
+  await expect(search.getByRole('list', { name: 'Partial matches' }).getByRole('button', { name: /extensions\.md:1/ })).toBeVisible();
 });
 
 test('an answer that says it did not retrieve a name offers a one-click code search', async ({ page }) => {

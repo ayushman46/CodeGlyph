@@ -1,8 +1,9 @@
 /**
  * Reading an answer's Markdown: the section under a heading (for "Copy
  * section"), the code names an answer says it did not find (for a one-click
- * "Search code" that checks the claim against the index), and the server's
- * note on an answer that stopped partway.
+ * "Search code" that checks the claim against the index), which search
+ * results match such a name exactly, and the server's note on an answer that
+ * stopped partway.
  */
 
 import { looksLikePath } from './citations.js';
@@ -74,6 +75,52 @@ export const absenceTerms = (markdown, limit = 3) => {
     });
   });
   return terms.slice(0, limit);
+};
+
+const IDENTIFIER_TOKEN = /[A-Za-z_$][\w$]*/g;
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Splits code search results for `term` into exact and partial matches. The
+ * search matches prefixes and ignores case, so a search for `send_request`
+ * also returns `send_request_headers`. An exact match is the name as a whole
+ * identifier in the same case, the rule the server uses before it flags a
+ * name as not found in the indexed code. For a dotted name
+ * (`Command.invoke`) the last part is matched, since code rarely spells out
+ * the dotted form.
+ *
+ * @param {Array<{file_path: string, start_line?: number, matches?: Array<{line: number, text: string}>}>} results
+ * @param {string} term
+ * @returns {{ name: string, exact: object[], partial: object[], longerNames: string[] }}
+ *   `exact` and `partial` hold `{file_path, line, text}` per matching line;
+ *   `longerNames` are up to three identifiers that contain the name.
+ */
+export const splitSearchMatches = (results, term) => {
+  const name = String(term || '').trim().replace(/\(\)$/, '').split(/\.|::/).pop() || '';
+  const whole = name ? new RegExp(`(?<![\\w$])${escapeRegExp(name)}(?![\\w$])`) : null;
+  const lowered = name.toLowerCase();
+  const exact = [];
+  const partial = [];
+  const longerNames = [];
+  (Array.isArray(results) ? results : []).forEach((result) => {
+    const lines = Array.isArray(result?.matches) && result.matches.length
+      ? result.matches
+      : [{ line: result?.start_line || null, text: '' }];
+    lines.forEach((match) => {
+      const entry = { file_path: result.file_path, line: match.line || null, text: String(match.text || '') };
+      if (whole && whole.test(entry.text)) {
+        exact.push(entry);
+        return;
+      }
+      partial.push(entry);
+      for (const [token] of entry.text.matchAll(IDENTIFIER_TOKEN)) {
+        if (token !== name && token.toLowerCase().includes(lowered) && !longerNames.includes(token) && longerNames.length < 3) {
+          longerNames.push(token);
+        }
+      }
+    });
+  });
+  return { name, exact, partial, longerNames };
 };
 
 // The note the server appends to an answer whose model failed partway
