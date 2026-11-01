@@ -88,8 +88,8 @@ test('an invite sentence says the role and the last day it works', () => {
 });
 
 test('a shared answer\'s unavailable message is not repeated under its heading', () => {
-  const server = "This shared answer isn't available. The link may be incomplete, or the person who shared it stopped sharing it.";
-  assert.equal(detailUnder('This shared answer isn’t available', server), 'The link may be incomplete, or the person who shared it stopped sharing it.');
+  const server = "This shared answer isn't available. The link may be incomplete, or the answer is no longer shared.";
+  assert.equal(detailUnder('This shared answer isn’t available', server), 'The link may be incomplete, or the answer is no longer shared.');
   assert.equal(detailUnder('Title', 'Something else happened.'), 'Something else happened.');
   assert.equal(detailUnder('Title', '', 'Fallback.'), 'Fallback.');
 });

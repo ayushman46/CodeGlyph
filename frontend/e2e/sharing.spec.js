@@ -83,7 +83,7 @@ const mockSharing = async (page, { repos = [repo({ access_role: 'owner', shared:
     }
     if (path === `/shared-answers/${TOKEN}`) {
       if (state.answerRevoked) {
-        return json(route, { detail: 'This shared answer isn\'t available. The link may be incomplete, or the person who shared it stopped sharing it.' }, 404, { 'x-error-code': 'answer_unavailable' });
+        return json(route, { detail: 'This shared answer isn\'t available. The link may be incomplete, or the answer is no longer shared.' }, 404, { 'x-error-code': 'answer_unavailable' });
       }
       return json(route, SHARED_ANSWER);
     }
@@ -262,6 +262,6 @@ test('a shared answer shows the question, the answer and commit-pinned sources; 
   state.answerRevoked = true;
   await page.reload();
   await expect(page.getByRole('heading', { name: 'This shared answer isn’t available' })).toBeVisible();
-  await expect(page.getByText('The link may be incomplete, or the person who shared it stopped sharing it.', { exact: true })).toBeVisible();
+  await expect(page.getByText('The link may be incomplete, or the answer is no longer shared.', { exact: true })).toBeVisible();
   await expect(page.getByText(/This shared answer isn.t available/)).toHaveCount(1);
 });

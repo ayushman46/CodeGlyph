@@ -437,7 +437,7 @@ ANSWER_PATH = "/shared/answer/"
 # Active answer links per person.
 MAX_ACTIVE_ANSWER_SHARES = 200
 _ANSWER_UNAVAILABLE = (
-    "This shared answer isn't available. The link may be incomplete, or the person who shared it stopped sharing it."
+    "This shared answer isn't available. The link may be incomplete, or the answer is no longer shared."
 )
 _COMMIT_IN_URL = re.compile(r"/blob/([0-9a-f]{7,40})/")
 _CITATION_FIELDS = ("file_path", "start_line", "end_line", "github_url", "language", "cited_in_answer")
