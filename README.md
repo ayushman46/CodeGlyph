@@ -165,7 +165,7 @@ All routes require a Supabase bearer token except health/readiness and the GitHu
 | GET | `/api/repos/{repo}/overview` | Languages, folder map, key files, suggested questions |
 | GET | `/api/repos/{repo}/search?q=` | Instant code search |
 | GET | `/api/repos/{repo}/file?path=` | One file at the indexed commit |
-| GET | `/api/repos/{repo}/impact?file_path=&depth=&symbol=` | Files that import a file (`depth` 1-3), the affected test files, test functions for `symbol`, and what it imports. A path matching several files returns `ambiguous` with `candidates` |
+| GET | `/api/repos/{repo}/impact?file_path=&depth=&symbol=` | Files that import a file (`depth` 1-3), the affected test files, test functions for `symbol`, and what it imports. A path matching several files returns `ambiguous` with `candidates` (`candidates_complete: false` when there are too many to list) |
 | GET | `/api/repos/{repo}/impact/suggestions` | The most imported files (also upgrades an import graph built by an older resolver, from the index) |
 | POST | `/api/repos/{repo}/reindex`, `/api/repos/{repo}/cancel-indexing` | Refresh or stop indexing |
 | PATCH / DELETE | `/api/repos/{repo}` | Rename or delete |

@@ -184,7 +184,15 @@ async def repository_impact(
         await assert_turso_schema()
         store = get_turso_store()
         repo = await owned_repo(store, current_user.id, repo_name)
-        matches = await impact.resolve_target(store, repo, target_query)
+        matches, complete = await impact.resolve_target(store, repo, target_query)
+        if not matches and not complete:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"More than {impact.PATH_SCAN_LIMIT:,} indexed paths look like {target_query}. "
+                    "Type more of the path, such as the folder it is in."
+                ),
+            )
         if not matches:
             raise HTTPException(
                 status_code=404,
@@ -201,7 +209,9 @@ async def repository_impact(
             "github_url": repo.get("github_url"),
             "graph": graph,
         }
-        if len(matches) > 1:
+        if len(matches) > 1 or not complete:
+            # An incomplete list (the scan limit was reached) is never
+            # analysed, even with one match: there may be others.
             shown = matches[:impact.CANDIDATE_LIMIT]
             counts = await impact.dependent_counts(store, str(repo["id"]), shown)
             return {
@@ -209,14 +219,16 @@ async def repository_impact(
                 "ambiguous": True,
                 "candidates": [{"file_path": path, "dependent_count": counts.get(path, 0)} for path in shown],
                 "candidate_count": len(matches),
+                "candidates_complete": complete,
                 "target_file": None,
                 "target_files": [],
                 "dependents": [],
                 "dependent_files": [],
                 "dependent_count": 0,
                 "summary": (
-                    f"{len(matches):,} indexed files match {target_query}. Choose one to see its impact; "
-                    "nothing is analysed until you do."
+                    f"{'' if complete else 'At least '}{len(matches):,} indexed "
+                    f"{'file matches' if len(matches) == 1 else 'files match'} {target_query}. "
+                    "Choose one to see its impact; nothing is analysed until you do."
                 ),
             }
         report = await impact.analyse_impact(store, repo, matches[0], depth=depth, symbol=symbol_name, limit=limit)

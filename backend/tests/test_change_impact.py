@@ -65,6 +65,34 @@ class SymbolTests(unittest.TestCase):
         self.assertEqual([(item["name"], item["line"], item["kind"]) for item in found],
                          [(".sendStatus(statusCode) › should send the status code", 3, "reference")])
 
+    def test_one_line_tests_and_dotted_titles(self):
+        text = (
+            "describe('math', () => {\n"
+            "  test('product of two numbers', () => expect(multiply(2, 3)).toBe(6))\n"
+            "  test('product with zero', () => {\n"
+            "    expect(multiply(0, 3)).toBe(0)\n"
+            "  })\n"
+            "  test('multiply is listed in the title only', () => {})\n"
+            "})\n"
+        )
+        found = [(item["name"], item["kind"], item["reference_line"]) for item in impact.find_symbol_tests(text, "test/math.test.js", "multiply")]
+        self.assertEqual(found, [
+            ("math › product of two numbers", "reference", 2),
+            ("math › product with zero", "reference", 4),
+            # The title names it but the body never calls it.
+            ("math › multiply is listed in the title only", "name", None),
+        ])
+        dotted = impact.find_symbol_tests(
+            "it('sendStatus should set res.statusCode', function () {\n  res.status(201)\n})\n", "test/res.js", "sendStatus",
+        )
+        self.assertEqual([(item["name"], item["kind"]) for item in dotted], [("sendStatus should set res.statusCode", "name")])
+        # A one-line Python test, and a fixture parameter named after the symbol.
+        python = impact.find_symbol_tests(
+            "def test_one(): assert make_response()\ndef test_two(make_response):\n    pass\n", "tests/test_x.py", "make_response",
+        )
+        self.assertEqual([(item["name"], item["kind"], item["reference_line"]) for item in python],
+                         [("test_one", "reference", 1), ("test_two", "reference", 2)])
+
     def test_symbol_words_drop_generic_verbs(self):
         self.assertEqual(impact.symbol_words("make_response"), ["response"])
         self.assertEqual(impact.symbol_words("acceptsCharsets"), ["accepts", "charsets"])
@@ -80,6 +108,23 @@ class SymbolTests(unittest.TestCase):
         self.assertFalse(impact.is_test_file("tests/test_apps/cliapp/app.py"))
         self.assertFalse(impact.is_test_file("test/support/utils.js"))
         self.assertFalse(impact.is_test_file("src/flask/testing.py"))
+        self.assertFalse(impact.is_test_file("cypress/support/commands.js"))
+        self.assertFalse(impact.is_test_file("tests/testserver/server.py"))
+        self.assertFalse(impact.is_test_file("tests/utils.py"))
+
+    def test_test_files_next_to_code_and_unittest_names_count(self):
+        # A test named as one counts in any folder; helper folders only matter
+        # inside a test tree, for files that are tests only by their folder.
+        for path in (
+            "src/utils/date.test.ts", "src/utils/__tests__/format.spec.ts", "packages/core/src/data/store.test.ts",
+            "lib/helpers/url.test.js", "src/mocks/server.test.ts", "tests/unit/utils/formatDate.test.ts",
+            "src/utils/__tests__/format.js",
+            # unittest and Django defaults.
+            "polls/tests.py", "tests/testapi.py", "tests/api/testviews.py", "pkg/client_test.py",
+        ):
+            self.assertTrue(impact.is_test_file(path), path)
+        for path in ("test/helpers/index.ts", "test/fixtures/app.js", "tests/__init__.py", "src/click/testing.py"):
+            self.assertFalse(impact.is_test_file(path), path)
 
 
 class TargetMatchingTests(unittest.TestCase):
@@ -97,6 +142,11 @@ class TargetMatchingTests(unittest.TestCase):
         self.assertEqual(impact.match_target_paths("src/flask", self.PATHS), ["src/flask/__init__.py"])
         self.assertEqual(impact.match_target_paths("readme.md", self.PATHS), ["README.md"])
         self.assertEqual(impact.match_target_paths("nothing.py", self.PATHS), [])
+        self.assertEqual(impact.match_target_paths("app.py", self.PATHS, suffix=False), [])
+
+    def test_patterns_escape_like_wildcards(self):
+        self.assertEqual(impact.target_patterns("httpx/_Client", suffix=False)[:2], ["httpx/\\_client", "httpx/\\_client.%"])
+        self.assertTrue(all(item.startswith("%/") for item in impact.target_patterns("app.py", suffix=True)))
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +246,37 @@ class ImpactEndpointTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as missing:
             await self.call("lib/nothing", name="express")
         self.assertEqual(missing.exception.status_code, 404)
+
+    async def test_an_exact_path_resolves_however_many_paths_share_its_name(self):
+        files = {f"packages/a{index:02d}/src/index.ts": "export {};\n" for index in range(6)}
+        files.update({
+            "packages/zeta/src/index.ts": "export {};\n",
+            "httpx/_client.py": "class Client: pass\n",
+            "httpx/xclient.py": "x = 1\n",
+            **{f"pkg{index}/lib/request.test.js": "x\n" for index in range(4)},
+        })
+        await self.add_repo(files, name="mono")
+        with patch.object(impact, "PATH_SCAN_LIMIT", 3):
+            exact = await self.call("packages/zeta/src/index.ts", name="mono")
+            self.assertEqual(exact["target_file"], "packages/zeta/src/index.ts")
+            self.assertEqual((await self.call("zeta/src/index.ts", name="mono"))["target_file"], "packages/zeta/src/index.ts")
+            self.assertEqual((await self.call("httpx._client", name="mono"))["target_file"], "httpx/_client.py")
+            # Seven files end in /index.ts: more than the scan reads, so the
+            # list is marked incomplete and nothing is analysed.
+            many = await self.call("index.ts", name="mono")
+            self.assertTrue(many["ambiguous"])
+            self.assertFalse(many["candidates_complete"])
+            self.assertEqual(len(many["candidates"]), 3)
+            self.assertTrue(many["summary"].startswith("At least 3 indexed files match index.ts."))
+            # Paths that only look alike (lib/request.test.js) fill the scan:
+            # the answer asks for more of the path instead of "no file".
+            with self.assertRaises(HTTPException) as vague:
+                await self.call("lib/request", name="mono")
+            self.assertEqual(vague.exception.status_code, 422)
+            self.assertIn("Type more of the path", vague.exception.detail)
+        complete = await self.call("index.ts", name="mono")
+        self.assertTrue(complete["candidates_complete"])
+        self.assertEqual(complete["candidate_count"], 7)
 
     async def test_indirect_dependents_by_depth_and_affected_tests(self):
         await self.add_repo({

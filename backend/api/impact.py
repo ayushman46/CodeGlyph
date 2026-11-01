@@ -43,17 +43,24 @@ _TEXT_PAGE_ROWS = 200
 _TEST_SCAN_FILES = 200
 _TEST_FUNCTION_LIMIT = 300
 CANDIDATE_LIMIT = 50
-_PATH_SCAN_LIMIT = 5000
+PATH_SCAN_LIMIT = 5000
 # How long a request waits for an outdated graph to be rebuilt before it
 # answers from the old graph (the rebuild carries on in the background).
 REBUILD_WAIT_SECONDS = 20.0
 
 _SYMBOL = re.compile(r"^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$")
-_PY_TEST_FILE = re.compile(r"(?:^|/)(?:test_[^/]*|[^/]*_test)\.py$")
-_TEST_HELPER_DIR = re.compile(
-    r"(?:^|/)(?:support|helpers?|fixtures?|__fixtures__|mocks?|__mocks__|utils?|data|snapshots?|__snapshots__)/",
-    re.IGNORECASE,
-)
+# pytest (``test_*.py``, ``*_test.py``) and unittest/Django (``test*.py``,
+# ``tests.py``) defaults; a bare ``test*.py`` only counts inside a test folder,
+# so library modules such as ``src/flask/testing.py`` stay out.
+_PY_TEST_FILE = re.compile(r"(?:^|/)(?:test_[^/]*|[^/]*_test|tests?)\.py$")
+_PY_UNITTEST_FILE = re.compile(r"(?:^|/)tests?/(?:[^/]+/)*test[^/]*\.py$")
+# A test file's own marker (``date.test.ts``, ``app.spec.js``, ``url-test.js``).
+_JS_TEST_NAME = re.compile(r"[._-](?:test|tests|spec|specs|e2e-spec|e2e)\.[a-z0-9]+$", re.IGNORECASE)
+_TEST_ROOT_DIRS = frozenset({"__tests__", "test", "tests", "e2e", "playwright", "cypress", "testing", "spec", "specs"})
+_TEST_HELPER_DIRS = frozenset({
+    "support", "helper", "helpers", "fixture", "fixtures", "__fixtures__", "mock", "mocks", "__mocks__",
+    "util", "utils", "data", "snapshot", "snapshots", "__snapshots__",
+})
 _PY_TEST_DEF = re.compile(r"^\s*(?:async\s+)?def\s+(test\w*)\s*\(")
 _PY_TEST_CLASS = re.compile(r"^\s*class\s+(Test\w*)\b")
 _JS_TEST_CALL = re.compile(
@@ -91,13 +98,24 @@ def _stage_filter(staging_prefix: str | None, column: str = "id") -> tuple[str, 
 
 
 def is_test_file(path: str) -> bool:
-    """A file a test runner collects (not a fixture, helper or conftest)."""
+    """A file a test runner collects (not a fixture, helper or conftest).
+
+    A JS/TS file named as a test (``src/utils/date.test.ts``) always counts;
+    one that is a test only by its folder is a helper when it sits in a
+    helper folder inside the test tree (``test/support/utils.js``).
+    """
     extension = posixpath.splitext(path)[1].lower()
     if extension in {".py", ".pyi"}:
-        return bool(_PY_TEST_FILE.search(path))
+        if posixpath.basename(path) in {"conftest.py", "__init__.py"}:
+            return False
+        return bool(_PY_TEST_FILE.search(path) or _PY_UNITTEST_FILE.search(path))
     if not scans_imports(path) or not is_test_path(path):
         return False
-    return not _TEST_HELPER_DIR.search(path)
+    if _JS_TEST_NAME.search(path):
+        return True
+    folders = [part.lower() for part in path.split("/")[:-1]]
+    root = next((index for index, part in enumerate(folders) if part in _TEST_ROOT_DIRS), None)
+    return root is None or not any(part in _TEST_HELPER_DIRS for part in folders[root + 1:])
 
 
 def normalise_symbol(raw: str | None) -> str | None:
@@ -128,13 +146,14 @@ def _name_match(name: str, symbol: str, words: list[str]) -> str | None:
     return None
 
 
-def match_target_paths(query: str, paths: Iterable[str]) -> list[str]:
+def match_target_paths(query: str, paths: Iterable[str], *, suffix: bool = True) -> list[str]:
     """The indexed files a typed path names, from the best tier that matches.
 
     Tiers: the exact path; the path without its extension (``lib/request``),
     or a package directory (``src/flask`` for ``src/flask/__init__.py``);
     then the same forms as a suffix after a ``/`` (``app.py`` matches every
-    ``*/app.py``). More than one result means the caller must choose.
+    ``*/app.py``; left out when ``suffix`` is false). More than one result
+    means the caller must choose.
     """
     paths = list(dict.fromkeys(paths))
     lowered = query.lower()
@@ -157,19 +176,25 @@ def match_target_paths(query: str, paths: Iterable[str]) -> list[str]:
 
     variants = {path: forms(path) for path in paths}
     whole = [path for path, names in variants.items() if lowered in names]
-    if whole:
+    if whole or not suffix:
         return sorted(whole)
-    suffix = "/" + lowered
-    return sorted(path for path, names in variants.items() if any(name.endswith(suffix) for name in names))
+    ending = "/" + lowered
+    return sorted(path for path, names in variants.items() if any(name.endswith(ending) for name in names))
 
 
-def _search_needle(query: str) -> str:
-    """A lowercase fragment every matching path contains (for a cheap SQL filter)."""
-    base = posixpath.basename(query.lower())
-    stem, extension = posixpath.splitext(base)
-    if extension in SOURCE_EXTENSIONS or extension in {".pyi", ".json", ".md"}:
-        return stem or base
-    return base
+def _like_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def target_patterns(query: str, *, suffix: bool) -> list[str]:
+    """SQL LIKE patterns for the forms ``match_target_paths`` accepts.
+
+    Whole forms (``q``, ``q.ext``, ``q/__init__.ext``, ``q/index.ext``), or
+    the same after any folder when ``suffix`` is true. They over-match a
+    little (``q.test.js``), which ``match_target_paths`` then drops.
+    """
+    base = ("%/" if suffix else "") + _like_escape(query.lower())
+    return [base, base + ".%", base + "/" + _like_escape("__init__") + ".%", base + "/index.%"]
 
 
 # ---------------------------------------------------------------------------
@@ -303,24 +328,40 @@ async def ensure_current_graph(store, repo: dict, wait_seconds: float = REBUILD_
 # ---------------------------------------------------------------------------
 
 
-async def resolve_target(store, repo: dict, query: str) -> list[str]:
-    """Indexed paths the typed ``query`` names (one, several, or none)."""
+async def resolve_target(store, repo: dict, query: str) -> tuple[list[str], bool]:
+    """Indexed paths the typed ``query`` names, and whether that list is complete.
+
+    An exact path is looked up directly. The other tiers are read with
+    patterns that match only their own forms, whole forms first, so the
+    scan limit is reached only when thousands of files really match (a
+    bare ``index.ts``); the list is then marked incomplete.
+    """
     stage_sql, stage_args = _stage_filter(repo.get("staging_prefix"))
+    exact = await store.fetch_one(
+        f"SELECT file_path FROM chunks WHERE repo_id = ? AND file_path = ?{stage_sql} LIMIT 1",
+        [repo["id"], query, *stage_args],
+    )
+    if exact:
+        return [query], True
     attempts = [query]
     if "/" not in query and "." in query and posixpath.splitext(query)[1].lower() not in SOURCE_EXTENSIONS:
         # A Python module path: ``flask.app`` or ``httpx._client``.
         attempts.append(query.replace(".", "/"))
     for attempt in attempts:
-        needle = _search_needle(attempt)
-        rows = await store.fetch_all(
-            f"SELECT DISTINCT file_path FROM chunks WHERE repo_id = ? AND instr(lower(file_path), ?) > 0{stage_sql} "
-            "ORDER BY file_path LIMIT ?",
-            [repo["id"], needle, *stage_args, _PATH_SCAN_LIMIT],
-        )
-        matches = match_target_paths(attempt, (str(row["file_path"]) for row in rows))
-        if matches:
-            return matches
-    return []
+        for suffix in (False, True):
+            patterns = target_patterns(attempt, suffix=suffix)
+            clauses = " OR ".join("lower(file_path) LIKE ? ESCAPE '\\'" for _ in patterns)
+            rows = await store.fetch_all(
+                f"SELECT DISTINCT file_path FROM chunks WHERE repo_id = ? AND ({clauses}){stage_sql} "
+                "ORDER BY file_path LIMIT ?",
+                [repo["id"], *patterns, *stage_args, PATH_SCAN_LIMIT + 1],
+            )
+            complete = len(rows) <= PATH_SCAN_LIMIT
+            paths = [str(row["file_path"]) for row in rows[:PATH_SCAN_LIMIT]]
+            matches = match_target_paths(attempt, paths, suffix=suffix)
+            if matches or not complete:
+                return matches, complete
+    return [], True
 
 
 async def most_imported_files(store, repo: dict, count: int = 6) -> list[dict]:
@@ -417,7 +458,8 @@ def find_symbol_tests(text: str, path: str, symbol: str) -> list[dict]:
     only the test's name contains the symbol's distinctive words (for
     ``make_response``: tests named ``*response*``; ``matched`` says which). Scopes come from
     indentation, so a reference inside a nested helper counts for the test
-    that defines it.
+    that defines it. The declaration line counts too (a one-line test), but
+    a JS title is a name, not a use, so only the code after it is searched.
     """
     python = posixpath.splitext(path)[1].lower() in {".py", ".pyi"}
     reference = _reference_pattern(symbol)
@@ -433,11 +475,13 @@ def find_symbol_tests(text: str, path: str, symbol: str) -> list[dict]:
         stripped = line.strip()
         if not stripped:
             continue
+        code = line
         if not inside_string:
             indent = len(line) - len(line.lstrip())
             while stack and stack[-1][0] >= indent:
                 stack.pop()
             declared = None
+            short = ""
             if python:
                 class_match = _PY_TEST_CLASS.match(line)
                 if class_match:
@@ -446,7 +490,8 @@ def find_symbol_tests(text: str, path: str, symbol: str) -> list[dict]:
                 def_match = _PY_TEST_DEF.match(line)
                 if def_match:
                     owner = next((item[2] for item in reversed(stack) if item[1] == "class"), None)
-                    declared = f"{owner}.{def_match.group(1)}" if owner else def_match.group(1)
+                    short = def_match.group(1)
+                    declared = f"{owner}.{short}" if owner else short
                     stack.append((indent, "test", declared, number))
             else:
                 call = _JS_TEST_CALL.match(line)
@@ -456,16 +501,19 @@ def find_symbol_tests(text: str, path: str, symbol: str) -> list[dict]:
                     if kind == "test":
                         group = next((item[2] for item in reversed(stack) if item[1] == "group"), None)
                         declared = f"{group} › {title}" if group else title
+                        short = title
                     stack.append((indent, kind, declared or title, number))
+                    code = line[call.end():]
             if declared is not None:
-                matched = _name_match(declared.rsplit(".", 1)[-1].rsplit("›", 1)[-1], symbol, words)
+                # Only the test's own name: the method (not ``Class.``), or the
+                # title (not its groups), so dots in a title do not split it.
+                matched = _name_match(short, symbol, words)
                 if matched:
                     found[(declared, number)] = {
                         "file_path": path, "name": declared, "line": number, "kind": "name",
                         "matched": matched, "reference_line": None, "references": 0,
                     }
-                continue
-        if not reference.search(line):
+        if not reference.search(code):
             continue
         test = next((item for item in reversed(stack) if item[1] == "test"), None)
         if test is None:
