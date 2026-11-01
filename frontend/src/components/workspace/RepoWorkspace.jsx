@@ -13,7 +13,7 @@ import { formatCount, shortSha } from '../../lib/format';
 import { isKeywordOnly, phaseLabel, statusTone } from '../../lib/phase';
 import { downloadText, proposalPatch, slugify } from '../../lib/patch';
 import { approximatePaths } from '../../lib/proposal';
-import { canManage, editBlockedReason } from '../../lib/sharing';
+import { canManage, editBlockedReason, ownerName } from '../../lib/sharing';
 import useArtifacts, {
   PROPOSAL_PANEL_ID, artifactCardId, proposalArtifactStatus, proposalArtifactSummary,
 } from '../../store/useArtifacts';
@@ -99,13 +99,19 @@ const Notice = ({ tone = 'info', icon: Icon = Info, children, action, onDismiss,
   );
 };
 
-/** Failed or stopped first index: what happened and what to do next. */
+/**
+ * Failed or stopped first index: what happened and what to do next. Without
+ * `onRetry` (a member of a shared repository) it says who can start it again.
+ */
 const IndexingProblem = ({ repo, onRetry, retrying, onDelete }) => {
   const failed = repo.status === 'failed';
   const repository = parseRepository(repo.github_url);
   const detail = failed
     ? repo.message || 'The indexing worker could not finish this repository.'
-    : 'Nothing was made searchable. Start again whenever you are ready; it fetches the latest commit.';
+    : `Nothing was made searchable.${onRetry ? ' Start again whenever you are ready; it fetches the latest commit.' : ''}`;
+  const advice = !onRetry
+    ? `Ask ${ownerName(repo)} to start indexing again. Only the owner can.`
+    : failed ? failureAdvice(repo.message) : '';
   return (
     <section className={`rounded-2xl border p-5 sm:p-6 ${failed ? 'border-danger/30 bg-surface' : 'border-line bg-surface'}`} aria-labelledby="indexing-problem-title">
       <div className="flex items-start gap-3">
@@ -115,15 +121,15 @@ const IndexingProblem = ({ repo, onRetry, retrying, onDelete }) => {
         <div className="min-w-0">
           <h2 id="indexing-problem-title" className="text-[15px] font-semibold text-ink">{failed ? 'Indexing failed' : 'Indexing was stopped'}</h2>
           <p className="mt-1 text-sm leading-relaxed text-ink-2">{detail}</p>
-          {failed && <p className="mt-2 text-[13px] leading-relaxed text-ink-3">{failureAdvice(repo.message)}</p>}
+          {advice && <p className="mt-2 text-[13px] leading-relaxed text-ink-3">{advice}</p>}
         </div>
       </div>
       <div className="mt-5 flex flex-wrap items-center gap-2 sm:pl-12">
-        <Button variant="primary" size="sm" icon={RefreshCw} loading={retrying} onClick={onRetry}>{failed ? 'Try again' : 'Start indexing again'}</Button>
+        {onRetry && <Button variant="primary" size="sm" icon={RefreshCw} loading={retrying} onClick={onRetry}>{failed ? 'Try again' : 'Start indexing again'}</Button>}
         {repository && (
           <Button variant="secondary" size="sm" href={`https://github.com/${repository.fullName}`} target="_blank" rel="noreferrer" iconRight={ExternalLink}>Open on GitHub</Button>
         )}
-        <Button variant="danger-ghost" size="sm" icon={Trash2} onClick={onDelete}>Delete</Button>
+        {onDelete && <Button variant="danger-ghost" size="sm" icon={Trash2} onClick={onDelete}>Delete</Button>}
       </div>
     </section>
   );
@@ -580,11 +586,13 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
   const readyNoteKey = `${repo.id}:${readyNote}`;
   const readyNoteWarning = /unavailable|fail|timed out|warning|stopped|could not/i.test(readyNote);
 
-  const problemPanel = (
-    <IndexingProblem repo={repo} onRetry={retry} retrying={retrying} onDelete={() => onRequestDialog('delete', repo)} />
-  );
+  // Retrying, deleting and stopping are the owner's alone (the server refuses members).
+  const askOwner = canManage(repo) ? '' : `Ask ${ownerName(repo)} to start it again.`;
+  const problemPanel = canManage(repo)
+    ? <IndexingProblem repo={repo} onRetry={retry} retrying={retrying} onDelete={() => onRequestDialog('delete', repo)} />
+    : <IndexingProblem repo={repo} />;
   const progressPanel = (
-    <IngestionProgress repo={repo} onStop={repo.is_indexing ? () => onRequestDialog('stop', repo) : null} stopping={stopping} />
+    <IngestionProgress repo={repo} onStop={repo.is_indexing && canManage(repo) ? () => onRequestDialog('stop', repo) : null} stopping={stopping} />
   );
 
   // A conversation renders in the Message Scroller; progress, loading,
@@ -800,7 +808,7 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
             ref={composerRef}
             busy={isQuerying}
             disabled={notQueryable || isHistoryLoading}
-            disabledReason={repo.status === 'failed' ? 'Indexing failed. Try again above to ask questions.' : repo.status === 'cancelled' && notQueryable ? 'Indexing was stopped. Start it again to ask questions.' : undefined}
+            disabledReason={repo.status === 'failed' ? `Indexing failed. ${askOwner || 'Try again above to ask questions.'}` : repo.status === 'cancelled' && notQueryable ? `Indexing was stopped. ${askOwner || 'Start it again to ask questions.'}` : undefined}
             editDisabledReason={editBlockedReason(repo)}
             onSubmit={ask}
             onStop={stopQuery}

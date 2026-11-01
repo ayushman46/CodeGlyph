@@ -181,6 +181,43 @@ test('a viewer sees the repository under Shared with you, can ask, and cannot us
   await expect(commands.getByRole('option', { name: /Rename repository|Delete repository|Re-index/ })).toHaveCount(0);
 });
 
+// The owner's first index, still running or stopped/failed, seen by `role`.
+const indexing = (role, overrides = {}) => ({
+  ...(role === 'owner' ? repo({ access_role: 'owner', shared: false }) : sharedAs(role)),
+  status: 'chunking', index_phase: 'chunking', job_status: 'processing', is_indexing: true, queryable: false,
+  chunk_count: 0, semantic_progress: 0, commit_sha: null, message: 'Reading source files (120 of 900 changed files).',
+  ...overrides,
+});
+
+test('only the owner gets a Stop button while the first index runs', async ({ page }) => {
+  await mockApi(page);
+  const state = await mockSharing(page, { repos: [indexing('viewer')] });
+  await page.goto('/app/r/cal.com');
+  await expect(page.getByText('Reading source files (120 of 900 changed files).')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Stop indexing cal.com' })).toHaveCount(0);
+  state.repos = [indexing('owner')];
+  await page.reload();
+  await expect(page.getByText('Reading source files (120 of 900 changed files).')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Stop indexing cal.com' })).toBeVisible();
+});
+
+test('a member of a repository whose indexing failed is told to ask the owner instead of Try again or Delete', async ({ page }) => {
+  await mockApi(page);
+  const failed = { status: 'failed', index_phase: 'failed', job_status: 'failed', is_indexing: false, message: 'GitHub archive download timed out.' };
+  const state = await mockSharing(page, { repos: [indexing('editor', failed)] });
+  await page.goto('/app/r/cal.com');
+  await expect(page.getByRole('heading', { name: 'Indexing failed' })).toBeVisible();
+  await expect(page.getByText('Ask ann@example.com to start indexing again. Only the owner can.')).toBeVisible();
+  await expect(page.getByRole('button', { name: /Try again|Start indexing again/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Delete', exact: true })).toHaveCount(0);
+  await expect(page.getByText('Indexing failed. Ask ann@example.com to start it again.')).toBeVisible();
+  // The owner still gets both.
+  state.repos = [indexing('owner', failed)];
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Try again' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Delete', exact: true })).toBeVisible();
+});
+
 test('a member leaves a shared repository and is told how to come back', async ({ page }) => {
   await mockApi(page);
   const state = await mockSharing(page, { repos: [sharedAs('viewer')] });
