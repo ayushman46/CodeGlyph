@@ -93,10 +93,14 @@ The selected workflow is **{plan.get('label', workflow)}**. Its focus is: {workf
         content = str(message.get("content") or "").strip()
         names = [str(name) for name in message.get("unverified_names") or []][:12]
         if role == "assistant" and content and names:
-            # An earlier answer's invented names would otherwise be repeated.
+            # An earlier answer's invented names would otherwise be repeated
+            # as fact. Neutral on purpose: the answer may have proposed a new
+            # name, and the user may ask about one of these names next.
+            single = len(names) == 1
             content += (
                 "\n\n[Checked after this answer: " + ", ".join(f"`{name}`" for name in names)
-                + " occur nowhere in the indexed code, so this answer was wrong about them. Do not repeat them.]"
+                + (" occurs" if single else " occur") + " nowhere in the indexed code; never present "
+                + ("it" if single else "them") + " as existing code.]"
             )
         if role in {"user", "assistant"} and content:
             messages.append({"role": role, "content": content})

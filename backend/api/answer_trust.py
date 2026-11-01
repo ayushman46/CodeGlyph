@@ -61,9 +61,33 @@ _KNOWN_NAMES = frozenset({
     "PurePath", "PosixPath", "HTTPStatus", "ABCMeta", "ContextVar", "TracebackType", "ModuleType",
     "FunctionType", "MethodType", "MappingProxyType", "NoneType", "TestCase", "MagicMock", "AsyncMock",
     "setUp", "tearDown", "assertEqual", "assertRaises", "assertTrue", "assertFalse", "assertIn",
-    "async_generator", "contextmanager", "dataclass", "abstractmethod", "staticmethod", "classmethod",
+    "async_generator", "contextmanager", "dataclass", "abstractmethod", "staticmethod", "classmethod", "TYPE_CHECKING",
 })
 _BUILTIN_NAMES = frozenset(name for name in dir(builtins) if not name.startswith("_"))
+# A dotted name called through one of these (``asyncio.create_task``,
+# ``Promise.allSettled``, ``fs.readFileSync``) is standard-library, platform
+# or well-known third-party code, not a repository symbol, so it is not looked
+# up, unless the repository indexes a module or folder of that name (Flask's
+# ``flask/json/``).
+_PLATFORM_MODULES = frozenset({
+    # Python standard library
+    "abc", "argparse", "array", "ast", "asyncio", "atexit", "base64", "binascii", "bisect", "builtins", "calendar",
+    "codecs", "collections", "concurrent", "configparser", "contextlib", "contextvars", "copy", "csv", "ctypes",
+    "dataclasses", "datetime", "decimal", "difflib", "email", "enum", "errno", "fnmatch", "fractions", "functools",
+    "gc", "getpass", "glob", "gzip", "hashlib", "heapq", "hmac", "html", "http", "importlib", "inspect", "io",
+    "ipaddress", "itertools", "json", "locale", "logging", "math", "mimetypes", "multiprocessing", "numbers",
+    "operator", "os", "pathlib", "pickle", "platform", "pprint", "queue", "random", "re", "secrets", "select",
+    "selectors", "shlex", "shutil", "signal", "socket", "sqlite3", "ssl", "statistics", "string", "struct",
+    "subprocess", "sys", "tarfile", "tempfile", "textwrap", "threading", "time", "timeit", "traceback", "types",
+    "typing", "unicodedata", "unittest", "urllib", "uuid", "warnings", "weakref", "xml", "zipfile", "zlib",
+    # JavaScript globals and Node.js core modules
+    "Array", "Atomics", "BigInt", "Buffer", "Date", "Error", "Intl", "JSON", "Map", "Math", "Number", "Object",
+    "Promise", "Proxy", "Reflect", "RegExp", "Set", "String", "Symbol", "WebAssembly", "child_process", "console",
+    "crypto", "dns", "document", "events", "fs", "globalThis", "https", "navigator", "net", "path", "performance",
+    "process", "readline", "stream", "url", "util", "window",
+    # Well-known third-party libraries
+    "np", "numpy", "pd", "pandas", "pytest", "React", "ReactDOM",
+})
 
 
 def _looks_like_repo_symbol(part: str) -> bool:
@@ -96,12 +120,14 @@ def answer_code_names(answer: str) -> list[dict]:
     Returns ``{text, names}``: the exact backticked text and the symbol-like
     parts to look up. ``self._set_timeout(request)`` checks ``_set_timeout``;
     ``BaseClient.send_request`` checks both parts. File references, shell
-    commands and expressions are skipped.
+    commands and expressions are skipped. A name called through a
+    standard-library module or platform global (``asyncio.create_task``) also
+    carries ``module``, which the lookup checks first.
     """
     from api.query_router import parse_reference
 
     visible = _FENCED.sub(" ", str(answer or ""))
-    found: dict[str, list[str]] = {}
+    found: dict[str, dict] = {}
     for match in _INLINE_CODE.finditer(visible):
         text = match.group(1).strip()
         if not text or text in found or parse_reference(text):
@@ -110,14 +136,87 @@ def answer_code_names(answer: str) -> list[dict]:
         name = _RECEIVER.sub("", name)
         if not _DOTTED_NAME.fullmatch(name):
             continue
-        parts = [part for part in _NAME_SEPARATOR.split(name) if _looks_like_repo_symbol(part)]
+        segments = _NAME_SEPARATOR.split(name)
+        parts = [part for part in segments if _looks_like_repo_symbol(part)]
         if parts:
-            found[text] = list(dict.fromkeys(parts))
-    return [{"text": text, "names": names} for text, names in found.items()]
+            found[text] = {"text": text, "names": list(dict.fromkeys(parts))}
+            if len(segments) > 1 and segments[0] in _PLATFORM_MODULES:
+                found[text]["module"] = segments[0]
+    return list(found.values())
+
+
+# A sentence that says something was not retrieved or not found. Mirrors
+# absenceTerms() in frontend/src/lib/answerText.js, plus "does not exist" and
+# "there is no", which answers written before the BUG-06 wording used.
+_ABSENCE = re.compile(
+    r"\b(?:did\s+not|didn't|could\s+not|couldn't)\s+(?:retrieve|find|see)\b"
+    r"|\b(?:was|were|is|are)\s+not\s+(?:retrieved|in\s+the\s+(?:retrieved\s+)?evidence|shown\s+in\s+the\s+evidence)\b"
+    r"|\bnot\s+(?:part\s+of|included\s+in)\s+the\s+(?:retrieved\s+)?evidence\b"
+    r"|\b(?:evidence|retrieved\s+(?:code|lines|files))\s+(?:does|do)\s+not\s+(?:include|contain|show)\b"
+    r"|\bno\s+(?:evidence|retrieved\s+code)\s+(?:of|for|shows)\b"
+    r"|\bnot\s+found\s+(?:in|anywhere\s+in)\s+the\s+(?:retrieved\s+evidence|evidence|indexed\s+code)\b"
+    r"|\b(?:does|do)\s+not\s+exist\b|\bthere\s+(?:is|are)\s+no\b",
+    re.IGNORECASE,
+)
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+(?=[A-Z`*_(])")
+
+
+def names_presented_as_existing(answer: str) -> set[str]:
+    """Backticked texts that appear in at least one sentence not saying they are missing."""
+    presented: set[str] = set()
+    for line in _FENCED.sub(" ", str(answer or "")).split("\n"):
+        for sentence in _SENTENCE_BREAK.split(line):
+            if not _ABSENCE.search(sentence):
+                presented.update(match.group(1).strip() for match in _INLINE_CODE.finditer(sentence))
+    return presented
 
 
 def _word_pattern(name: str) -> re.Pattern[str]:
     return re.compile(rf"(?<![\w$]){re.escape(name)}(?![\w$])")
+
+
+_MODULE_FILE_EXTENSIONS = ("py", "pyi", "js", "mjs", "cjs", "ts", "tsx", "jsx")
+
+
+async def _indexed_modules(store, repo_id: str, modules: list[str], known_paths: str = "") -> set[str]:
+    """The ``modules`` the repository has as a folder or source file of that name.
+
+    Paths already in the evidence (``known_paths``) are checked first, the
+    rest in one statement. When the lookup fails, only the evidence counts:
+    names called through the other modules are then not looked up, which
+    can miss a flag but never adds a wrong one.
+    """
+    suffix = "|".join(_MODULE_FILE_EXTENSIONS)
+    found = {
+        module for module in modules
+        if re.search(rf"(?:^|/){re.escape(module)}(?:/|\.(?:{suffix})$)", known_paths, re.MULTILINE)
+    }
+    rest = [module for module in modules if module not in found]
+    if not rest:
+        return found
+    parts, args = [], []
+    for module in rest:
+        patterns = [f"*/{module}/*", *(f"*/{module}.{extension}" for extension in _MODULE_FILE_EXTENSIONS)]
+        parts.append(
+            "SELECT ? AS name WHERE EXISTS (SELECT 1 FROM chunks c WHERE c.repo_id = ? AND ("
+            + " OR ".join(["('/' || c.file_path) GLOB ?"] * len(patterns)) + ") LIMIT 1)"
+        )
+        args.extend([module, repo_id, *patterns])
+    try:
+        rows = await store.fetch_all(" UNION ALL ".join(parts), args)
+    except Exception as error:
+        logger.debug("Module lookup unavailable (%s)", type(error).__name__)
+        return found
+    return found | {str(row.get("name") or "") for row in rows or [] if isinstance(row, dict)}
+
+
+async def _repository_names(store, repo_id: str, candidates: list[dict], known_paths: str = "") -> list[dict]:
+    """Drop names called through a standard-library module or platform global the repository does not have."""
+    modules = list(dict.fromkeys(item["module"] for item in candidates if item.get("module")))
+    if not modules:
+        return candidates
+    indexed = await _indexed_modules(store, repo_id, modules, known_paths)
+    return [item for item in candidates if not item.get("module") or item["module"] in indexed]
 
 
 async def _names_missing_from_index(store, repo_id: str, names: list[str]) -> set[str] | None:
@@ -160,12 +259,14 @@ async def find_unverified_identifiers(store, repo_id: str | None, answer: str, e
         return []
     evidence = "\n".join(str(chunk.get("content") or "") for chunk in evidence_chunks if not chunk.get("_synthetic"))
     evidence_paths = "\n".join(str(chunk.get("file_path") or "") for chunk in evidence_chunks)
-    unknown: list[str] = []
-    for item in candidates:
-        for name in item["names"]:
-            pattern = _word_pattern(name)
-            if name not in unknown and not pattern.search(evidence) and not pattern.search(evidence_paths):
-                unknown.append(name)
+
+    shown = {
+        name: bool(_word_pattern(name).search(evidence) or _word_pattern(name).search(evidence_paths))
+        for item in candidates for name in item["names"]
+    }
+    candidates = [item for item in candidates if not all(shown[name] for name in item["names"])]
+    candidates = await _repository_names(store, repo_id, candidates, evidence_paths)
+    unknown = list(dict.fromkeys(name for item in candidates for name in item["names"] if not shown[name]))
     missing = await _names_missing_from_index(store, repo_id, unknown[:_MAX_NAMES])
     if not missing:
         return []
@@ -185,13 +286,22 @@ async def annotate_history_names(store, repo_id: str | None, history: list[dict]
     ``CliApp``) was repeated as fact when the question was asked again. The
     names of every earlier answer are looked up in one statement and stored
     as ``unverified_names``, which the prompt shows next to that answer.
+    Names the answer only mentioned as missing ("I did not retrieve
+    `validate_token`") are left out: that answer was right about them.
     """
     answers = [item for item in history if item.get("role") == "assistant" and item.get("content")]
     if not answers or not repo_id:
         return
+    candidates_by_answer = []
+    for item in answers:
+        presented = names_presented_as_existing(item["content"])
+        entries = answer_code_names(item["content"])
+        candidates_by_answer.append([entry for entry in entries if entry["text"] in presented])
+    every_entry = [entry for entries in candidates_by_answer for entry in entries]
+    kept = {entry["text"] for entry in await _repository_names(store, repo_id, every_entry)}
     names_by_answer = [
-        list(dict.fromkeys(name for entry in answer_code_names(item["content"]) for name in entry["names"]))
-        for item in answers
+        list(dict.fromkeys(name for entry in entries if entry["text"] in kept for name in entry["names"]))
+        for entries in candidates_by_answer
     ]
     every_name = list(dict.fromkeys(name for names in names_by_answer for name in names))[:_MAX_NAMES]
     missing = await _names_missing_from_index(store, repo_id, every_name)

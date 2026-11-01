@@ -444,6 +444,16 @@ class IdentifierShapeTests(unittest.TestCase):
             "sendRequest": ["sendRequest"],
         })
 
+    def test_names_called_through_a_standard_module_carry_that_module(self):
+        names = answer_code_names(
+            "Use `asyncio.create_task`, `subprocess.check_output()`, `Promise.allSettled`, `Reflect.ownKeys` "
+            "or `BaseClient.send_request`."
+        )
+        self.assertEqual([(item["text"], item.get("module")) for item in names], [
+            ("asyncio.create_task", "asyncio"), ("subprocess.check_output()", "subprocess"),
+            ("Promise.allSettled", "Promise"), ("Reflect.ownKeys", "Reflect"), ("BaseClient.send_request", None),
+        ])
+
 
 class IdentifierLookupTests(answers.DatabaseTestCase):
     def setUp(self):
@@ -454,6 +464,7 @@ class IdentifierLookupTests(answers.DatabaseTestCase):
             answers.chunk("httpx/_main.py", 1, HTTPX_SEND.rstrip("\n")),
             answers.chunk("docs/advanced/extensions.md", 1, HTTPX_DOCS.rstrip("\n")),
             answers.chunk("tests/test_apps/cliapp/app.py", 1, 'from flask import Flask\n\ntestapp = Flask("testapp")'),
+            answers.chunk("src/flask/json/provider.py", 1, "class DefaultJSONProvider:\n    def dumps(self, obj):\n        pass"),
         ]))
 
     def check(self, answer, evidence=()):
@@ -475,6 +486,17 @@ class IdentifierLookupTests(answers.DatabaseTestCase):
         self.assertEqual(self.check("Uses `send_request`."), [{"text": "send_request", "names": ["send_request"]}])
         self.assertEqual(self.check("Uses `send_request_headers`."), [])
 
+    def test_standard_library_and_platform_calls_are_not_flagged(self):
+        answer = ("Start with `asyncio.create_task`, `time.perf_counter()`, `logging.getLogger`, "
+                  "`importlib.import_module`, `Promise.allSettled` and `Number.isInteger`.")
+        self.assertEqual(self.check(answer), [])
+        # Unless the repository has a module of that name: Flask's own json package.
+        self.assertEqual(self.check("`json.made_up_helper` and `asyncio.made_up_helper`."),
+                         [{"text": "json.made_up_helper", "names": ["made_up_helper"]}])
+        # A module in the evidence paths needs no lookup.
+        evidence = [{"file_path": "pkg/time.py", "content": "def tick(): pass"}]
+        self.assertEqual(self.check("`time.made_up_clock`.", evidence), [{"text": "time.made_up_clock", "names": ["made_up_clock"]}])
+
     def test_earlier_answers_are_marked_with_the_names_they_invented(self):
         # The question was asked before and that answer invented subclasses;
         # replayed as history they were repeated as fact.
@@ -488,10 +510,28 @@ class IdentifierLookupTests(answers.DatabaseTestCase):
         self.assertNotIn("unverified_names", history[2])
         self.assertNotIn("unverified_names", history[0])
         messages = build_answer_messages("Does anything subclass Flask?", "ctx", history)
-        self.assertIn("[Checked after this answer: `BlueprintApp`, `CliApp` occur nowhere in the indexed code, so this "
-                      "answer was wrong about them. Do not repeat them.]", messages[2]["content"])
+        # Neutral: the earlier answer may have proposed a new name on purpose.
+        self.assertIn("[Checked after this answer: `BlueprintApp`, `CliApp` occur nowhere in the indexed code; never "
+                      "present them as existing code.]", messages[2]["content"])
+        self.assertNotIn("wrong", messages[2]["content"])
         self.assertEqual(messages[3]["content"], "Only `_send_single_request`.")
         self.assertIn("Earlier answers in this conversation can be wrong.", messages[0]["content"])
+
+    def test_names_an_earlier_answer_said_were_missing_are_not_noted(self):
+        # That answer was right about `validate_token`; `refresh_session` it presented as code.
+        history = [
+            {"role": "assistant", "content": "`validate_token` was not found anywhere in the indexed code. "
+                                             "I did not retrieve `TokenStore`. Sessions renew in `refresh_session`."},
+            {"role": "assistant", "content": "I did not retrieve `rotate_keys`. Still, `rotate_keys` runs nightly."},
+            {"role": "assistant", "content": "Call `asyncio.create_task` from `_set_timeout`."},
+        ]
+        run(annotate_history_names(self.store, answers.REPO_ID, history))
+        self.assertEqual(history[0]["unverified_names"], ["refresh_session"])
+        self.assertEqual(history[1]["unverified_names"], ["rotate_keys"])
+        self.assertNotIn("unverified_names", history[2])
+        content = build_answer_messages("And validate_token?", "ctx", history[:1])[1]["content"]
+        self.assertTrue(content.endswith("[Checked after this answer: `refresh_session` occurs nowhere in the indexed "
+                                         "code; never present it as existing code.]"))
 
     def test_names_in_the_evidence_need_no_lookup_and_a_failed_lookup_flags_nothing(self):
         evidence = [{"file_path": "x.py", "content": "def made_up_name(): pass"}]
