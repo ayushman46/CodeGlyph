@@ -12,6 +12,7 @@ It is built for the first hours in an unfamiliar codebase: new engineers onboard
 - **Accurate retrieval.** File-level semantic search, keyword search with prefix matching and path weighting, path-aware ranking for component questions, the import graph for impact questions, and follow-up awareness for short questions like "where is it called?".
 - **Code editing and pull requests.** Describe a change or paste a GitHub issue URL. The agent plans the change across files (call sites, types, styles, tests, new files when needed), reads the current files from GitHub, writes exact search/replace hunks, validates every hunk against the real file, and shows the result inline in the chat. The review screen has unified and split diffs, in-place editing with a live diff, a prefilled pull request, `.patch` download, and one-click PR creation (a branch in the repository, or a fork when you lack write access). Nothing is pushed without your review.
 - **Exploration tools.** Repository overview (languages, folder map, key files, suggested questions), instant code search, and change-impact analysis.
+- **Team access.** Share an indexed repository with teammates through an invite link (viewer or editor, expiring in 1, 7 or 30 days) so nobody indexes it again. Viewers ask, search and browse; editors can also use Edit & PR with their own GitHub account; only the owner renames, re-indexes, deletes or shares it. Members ask against the owner's index (it counts only toward the owner's storage), keep their own conversations, and appear under **Shared with you**. The owner sees and revokes active links and changes or removes members; removal takes effect on the member's next request.
 - Light and dark themes, a command palette (`⌘K` / `Ctrl+K`), keyboard-first chat, and a responsive layout down to phone width.
 
 ## Architecture
@@ -178,10 +179,18 @@ All routes require a Supabase bearer token except health/readiness and the GitHu
 | POST | `/api/github/push-pr`, `/api/github/disconnect` | Create the branch, commit and PR / disconnect |
 | GET | `/api/account/usage` | Indexed-source usage and quota |
 | POST | `/api/create-order`, `/api/verify-payment` | Team plan checkout (Razorpay) |
+| GET | `/api/repos/{repo}/sharing` | Owner: members and active invite links |
+| POST / DELETE | `/api/repos/{repo}/invites`, `/api/repos/{repo}/invites/{id}` | Owner: create an invite link (`role`, `expires_in_days`; the token is returned once) / revoke it |
+| PATCH / DELETE | `/api/repos/{repo}/members/{user_id}` | Owner: change a member's role / remove them |
+| DELETE | `/api/repos/{repo}/membership` | Member: leave a shared repository |
+| GET / POST | `/api/invites/{token}`, `/api/invites/{token}/accept` | Preview an invite link / join (410 when expired or revoked) |
+
+Repository routes accept the owner's repository name or a member's name for a shared one (`access_role`, `shared` and `owner_label` say which). Non-members get 404; a member whose role does not allow an action gets 403.
 
 ## Security
 
 - Supabase validates every session; verified sessions are cached briefly (bounded by token expiry). Every query is scoped to the authenticated user.
+- Shared repositories are checked on the server for every repository route (owner, editor or viewer). Invite tokens are 256-bit random values stored only as SHA-256 hashes; a member removed by the owner cannot rejoin with a link created before the removal.
 - Repository content, issues and conversation history are treated as untrusted data in every prompt.
 - GitHub tokens are encrypted at rest; the OAuth state is single-use and short-lived. PR creation requires a signed, short-lived ticket scoped to the user, repository and exact file set, plus the reviewed blob SHA of every modified file.
 - Archive extraction rejects path traversal, links and devices, bounds download size and time, and never uses `tar.extract`.
