@@ -1653,3 +1653,213 @@ def fts_phrase(text: str) -> str:
     """An FTS5 phrase query for the words of ``text`` (unicode61 tokens), or ""."""
     tokens = re.findall(r"[0-9A-Za-z]+", text.lower())
     return '"' + " ".join(tokens[:24]) + '"' if len(tokens) >= 2 else ""
+
+
+# ===========================================================================
+# G8: verification (nothing is run here; the cases to check by hand)
+# ===========================================================================
+
+_FENCE_OPEN = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})[ \t]*([^\s`]*)[^\n]*$")
+# Fenced blocks in these languages are data or output, never a case to run.
+_DATA_LANGUAGES = frozenset({
+    "json", "jsonc", "json5", "yaml", "yml", "toml", "ini", "cfg", "conf", "text", "txt", "plain", "plaintext", "log",
+    "output", "diff", "patch", "xml", "html", "csv", "md", "markdown", "rst", "pytb", "traceback", "stacktrace",
+})
+_SHELL_LANGUAGES = frozenset({"sh", "bash", "shell", "zsh", "console", "shell-session", "shellsession", "terminal"})
+_OUTPUT_LINE = re.compile(
+    r"^\s*(?:Traceback \(most recent call last\)|File \"|During handling of|The above exception|"
+    r"[A-Za-z_][\w.]*(?:Error|Exception|Warning)\b\s*(?::|$)|at \S+ \(|\^+\s*$|~+\s*$)"
+)
+_SETUP_LINE = re.compile(
+    r"^\s*(?:import\s|from\s+\S+\s+import\s|(?:const|let|var)\s+[\w{}\s,]+=\s*(?:await\s+)?(?:require|import)\(|"
+    r"require\(|package\s+\w|using\s|#include\b|use\s+[\w:]+;|"
+    r"(?:\$\s*)?(?:pip3?|python3?\s+-m\s+pip|npm|yarn|pnpm|bun|poetry|uv|cargo|go)\s+(?:install|add|i|get|sync)\b)"
+)
+_COMMENT_LINE = re.compile(r"^\s*(?:#(?!!)|//|/\*|\*/|--\s|;;)")
+_ASSIGNED_NAME = re.compile(r"^\s*(?:(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=(?!=)")
+_INLINE_CALL = re.compile(r"^[A-Za-z_$][\w$.]*\(.*\)(?:\.[A-Za-z_$][\w$]*\(.*\))*;?$")
+_OUTCOME_WORDS = re.compile(
+    r"\b(?:fails?|failed|failing|raises?|raised|errors?|crash(?:es|ed)?|throws?|thrown|exception|hangs?|breaks?|"
+    r"returns?|returned|works?|worked|succeeds?|wrong|incorrect(?:ly)?|unexpected(?:ly)?|instead of|expected)\b",
+    re.IGNORECASE,
+)
+REPRODUCTION_CASE_LIMIT = 12
+_CASE_CHARACTERS = 300
+
+
+def _code_scan(line: str, *, slashes: bool = True) -> tuple[int, int | None]:
+    """(open minus closed brackets, index of a trailing ``#`` comment) outside string literals.
+
+    ``slashes`` also ends the code at `` //`` (not in Python, where it divides).
+    """
+    depth, quote, escaped = 0, "", False
+    for index, character in enumerate(line):
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+            continue
+        if character in "\"'`":
+            quote = character
+        elif character in "([{":
+            depth += 1
+        elif character in ")]}":
+            depth -= 1
+        elif (character == "#" or (slashes and line.startswith("//", index))) and index and line[index - 1] in " \t" \
+                and line[:index].strip():
+            return depth, index
+    return depth, None
+
+
+def _fenced_blocks(text: str) -> list[tuple[str, str]]:
+    """(language, code) for every fenced block of Markdown text."""
+    blocks: list[tuple[str, str]] = []
+    lines = str(text or "").replace("\r\n", "\n").split("\n")
+    index = 0
+    while index < len(lines):
+        opened = _FENCE_OPEN.match(lines[index])
+        index += 1
+        if not opened:
+            continue
+        fence, language = opened.group(1), opened.group(2).lower()
+        body: list[str] = []
+        while index < len(lines) and not lines[index].strip().startswith(fence):
+            body.append(lines[index])
+            index += 1
+        index += 1
+        blocks.append((language, "\n".join(body)))
+    return blocks
+
+
+def _statements(code: str, language: str) -> list[dict]:
+    """Top-level statements of a code block, each with the comment that follows it (the reported result)."""
+    raw = code.split("\n")
+    if any(re.match(r"^\s*>>>\s?", line) for line in raw):
+        # A REPL transcript: prompt lines are code; an error in the output
+        # after one is its reported result.
+        statements: list[dict] = []
+        for line in raw:
+            prompt = re.match(r"^\s*(>>>|\.\.\.)\s?(.*)$", line)
+            if prompt and prompt.group(1) == "..." and statements:
+                statements[-1]["code"] += "\n" + prompt.group(2)
+            elif prompt and prompt.group(2).strip() and not _SETUP_LINE.match(prompt.group(2)):
+                statements.append({"code": prompt.group(2).strip(), "note": ""})
+            elif not prompt and statements and not statements[-1]["note"] and _OUTPUT_LINE.match(line) \
+                    and not line.lstrip().startswith(("Traceback", "File ")):
+                statements[-1]["note"] = line.strip()
+        return [statement for statement in statements if statement["code"].strip()]
+    if any(re.match(r"^\s*\$\s+\S", line) for line in raw):
+        raw = [re.sub(r"^\s*\$\s+", "", line) for line in raw if re.match(r"^\s*\$\s+\S", line)]
+    statements: list[dict] = []
+    pending: list[str] = []
+    depth = 0
+    for line in raw:
+        if not pending:
+            if not line.strip():
+                continue
+            if _COMMENT_LINE.match(line):
+                note = re.sub(r"^\s*(?:#|//|/\*|--|;;)\s*", "", line).rstrip("*/ ").strip()
+                if statements and note and not statements[-1]["note"]:
+                    statements[-1]["note"] = note
+                continue
+            if _SETUP_LINE.match(line) or _OUTPUT_LINE.match(line):
+                continue
+        change, comment_at = _code_scan(line, slashes=language not in {"python", "py", "python3", "pycon", "ipython"})
+        note = ""
+        if comment_at is not None:
+            note = re.sub(r"^(?:#|//)\s*", "", line[comment_at:]).strip()
+            line = line[:comment_at].rstrip()
+        pending.append(line)
+        depth += change
+        if depth > 0 or line.rstrip().endswith("\\"):
+            continue
+        text = "\n".join(pending).strip()
+        pending, depth = [], 0
+        if text:
+            statements.append({"code": text, "note": note})
+    if pending and "\n".join(pending).strip():
+        statements.append({"code": "\n".join(pending).strip(), "note": ""})
+    return statements
+
+
+def _is_script(statements: list[dict]) -> bool:
+    """True when a statement assigns a name a later one uses: one script, not separate cases."""
+    for index, statement in enumerate(statements):
+        match = _ASSIGNED_NAME.match(statement["code"])
+        if not match:
+            continue
+        name = re.escape(match.group(1))
+        if any(re.search(rf"(?<![\w$.]){name}(?![\w$])", later["code"]) for later in statements[index + 1:]):
+            return True
+    return False
+
+
+def reproduction_cases(text: str, *, limit: int = REPRODUCTION_CASE_LIMIT) -> list[dict]:
+    """The cases an issue quotes to reproduce it, as ``{code, note}`` (at most ``limit``).
+
+    Every fenced code block that is not data or output (JSON, tracebacks,
+    version listings) is split into statements; each statement is a case and
+    the comment after it ("# AttributeError: ...", "# works") is its note.
+    A block whose statements build on each other (``s = Session()`` then
+    ``s.get(...)``) is one case. Imports, installs and comments are not
+    cases. Without such a block, inline code spans that are complete calls
+    with literal arguments count, in a sentence that says what they do ("...
+    raises", "... works"). Nothing here is run.
+    """
+    cases: list[dict] = []
+    seen: set[str] = set()
+
+    def add(code: str, note: str = "") -> None:
+        clean = code.strip()
+        key = re.sub(r"\s+", "", clean)
+        if not clean or key in seen or len(cases) >= limit:
+            return
+        seen.add(key)
+        cases.append({"code": clean[:_CASE_CHARACTERS], "note": note.strip()[:200]})
+
+    for language, code in _fenced_blocks(text):
+        lines = [line for line in code.split("\n") if line.strip()]
+        if language in _DATA_LANGUAGES or not lines:
+            continue
+        repl = any(line.lstrip().startswith(">>>") for line in lines)
+        if not repl and any(line.lstrip().startswith("Traceback (most recent call last)") for line in lines):
+            continue
+        if all(_OUTPUT_LINE.match(line) or _COMMENT_LINE.match(line) for line in lines):
+            continue
+        statements = _statements(code, language)
+        if not statements:
+            continue
+        if _is_script(statements):
+            notes = [statement["note"] for statement in statements if statement["note"]]
+            add("\n".join(statement["code"] for statement in statements), notes[-1] if notes else "")
+            continue
+        for statement in statements:
+            add(re.sub(r"\s*\n\s*", " ", statement["code"]), statement["note"])
+    if cases:
+        return cases
+    prose = re.sub(r"(?ms)^[ \t]{0,3}(`{3,}|~{3,}).*?^[ \t]{0,3}\1[^\n]*$", "", str(text or ""))
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", prose):
+        # Only a call the sentence says fails (or works) is a case, not one it merely mentions.
+        if not _OUTCOME_WORDS.search(sentence):
+            continue
+        for match in re.finditer(r"(?<!`)`([^`\n]{6,300})`(?!`)", sentence):
+            span = match.group(1).strip()
+            if "..." in span or "…" in span or not _INLINE_CALL.match(span):
+                continue
+            if re.search(r"\d|['\"{\[]", span[span.index("("):]):
+                add(span)
+    return cases
+
+
+def _comparable(text: str) -> str:
+    """Code with whitespace removed and quotes unified, for "is this case already listed?"."""
+    return re.sub(r"\s+", "", str(text or "")).replace("'", '"').rstrip(";")
+
+
+def case_covered(code: str, steps: list[str]) -> bool:
+    """Whether a verification step already runs this case (quotes and spacing ignored)."""
+    needle = _comparable(code)
+    return bool(needle) and any(needle in _comparable(step) for step in steps)

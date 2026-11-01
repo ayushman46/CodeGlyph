@@ -19,6 +19,14 @@ created. The flow is:
    step 5), completeness signals, then one self-review whose fixes are
    re-checked. PR title, body and commit message follow the repository's
    conventions. ``proposal.quality`` reports every check honestly.
+7. Verify: nothing is executed here. ``proposal.verification`` says so and
+   names the repository's own test command and every reproduction case the
+   issue quotes, which also become "How to verify" steps.
+
+A follow-up request in the same conversation ("also handle int keys") revises
+the previous proposal: its changes are re-applied to the current files, the
+model edits that result, and every file is diffed against the repository
+again, so blob SHAs and the editing ticket cover the final change.
 
 Big changes are scoped up front: a rename is counted exactly across the
 index, files beyond the model's limit are renamed by an exact codemod, and a
@@ -51,7 +59,9 @@ from agent.code_edit import (
     line_change_counts,
     normalise_repository_path,
     parse_model_object,
+    reapply_change,
     unescape_hunks,
+    unified_diff_text,
 )
 from agent.completeness import (
     IndexedRepoFiles,
@@ -67,6 +77,7 @@ from agent.quality import (
     JS_TS_EXTENSIONS,
     _relative_candidates,
     autofix_style,
+    case_covered,
     check_imports,
     check_syntax_many,
     describe_style,
@@ -77,6 +88,7 @@ from agent.quality import (
     is_test_path,
     js_imports,
     public_profile,
+    reproduction_cases,
     style_profile,
     style_warnings,
     summarize_syntax,
@@ -86,6 +98,7 @@ from agent.quality import (
 from agent.review import (
     ATTRIBUTION_LINE_DISTANCE,
     EVIDENCE_LINE_DISTANCE,
+    NO_PROBLEMS_FOUND,
     apply_review_hunks,
     build_review_messages,
     finding_number,
@@ -139,6 +152,26 @@ lines show shows first last before after field value values set sets get gets pl
 your you function component instead rename renamed move moved fix fixes fixed bug issue
 """.split())
 _MAX_NEW_FILES = 3
+# A follow-up that amends the proposal already in the conversation ("also
+# handle int keys", "drop the test change", "revise the patch") instead of
+# asking for a separate change. "Start over" opts out.
+_REVISION_CUE = re.compile(
+    r"^\s*(?:(?:ok(?:ay)?|great|thanks|thank you|good|nice|looks good)[,.!]?\s+)?"
+    r"(?:also|and(?:\s+also)?|plus|additionally|but|now|then|instead|however|in addition|actually)\b"
+    r"|\b(?:also|as well|too|additionally|in addition|on top of (?:that|this|it)|revise|amend)\b"
+    r"|\bthe\s+(?:proposal|patch|diff)\b"
+    r"|\b(?:this|that|your)\s+(?:proposal|patch|diff|pr|pull request|change|fix)\b"
+    r"|\b(?:the\s+)?(?:previous|last|earlier|current|same)\s+(?:proposal|patch|diff|pr|pull request|change|fix|edit)\b"
+    r"|\b(?:drop|keep|undo|revert)\s+(?:the|that|this|those|these|your)\b",
+    re.IGNORECASE,
+)
+_FRESH_START = re.compile(
+    r"\b(?:start (?:over|again|fresh)|from scratch|(?:a |an )?(?:new|separate|fresh) (?:proposal|patch|pr|pull request)|"
+    r"ignore (?:the|that|your) (?:previous|last|earlier))\b",
+    re.IGNORECASE,
+)
+# The previous proposal's diff shown to the model for a revision (characters).
+_REVISION_DIFF_CHARACTERS = 16_000
 # Related files shown to the self-review as windows of their current content.
 # Stale mentions come first, so with three of them (ky's retry limit: readme,
 # JSDoc, test constant) the impacted test that would fail CI still fits.
@@ -505,6 +538,87 @@ def rename_identifiers(text: str, renames: list[tuple[str, str]]) -> str:
     return text
 
 
+def wants_revision(question: str) -> bool:
+    """Whether an Edit & PR request amends the proposal already in the conversation."""
+    text = str(question or "")
+    return bool(_REVISION_CUE.search(text)) and not _FRESH_START.search(text)
+
+
+def _issue_mentions(text: str) -> set[str]:
+    """Issue numbers a request names (issue URLs and "issue 12" / "fixes #12")."""
+    found = {match.group(3) for match in _ISSUE_URL.finditer(text or "")}
+    found |= {match.group(1) for match in _ISSUE_NUMBER.finditer(text or "")}
+    return found
+
+
+async def previous_proposal_for(store: Any, repo_id: str, user_id: str, question: str,
+                                history: list[dict]) -> dict | None:
+    """The proposal a follow-up request revises, or None.
+
+    Only a proposal of this conversation counts: the newest assistant reply
+    that produced one (its ``code_edit`` call) and whose text is among the
+    assistant messages of ``history``, which the caller already scoped to the
+    conversation. The request must read as an amendment (``wants_revision``)
+    and must not name a different issue. The proposal is read for this user
+    and repository only. Returns ``{id, title, summary, question, files,
+    issue_reference, issue_confirmed, issue_repository}``.
+    """
+    if not wants_revision(question):
+        return None
+    replies = [str(entry.get("content") or "").strip() for entry in history or []
+               if isinstance(entry, dict) and entry.get("role") == "assistant"]
+    replies = [text for text in replies if text]
+    if not replies:
+        return None
+    rows = await store.fetch_all(
+        "SELECT content, tool_calls, created_at FROM chat_messages WHERE repo_id = ? AND user_id = ? AND role = 'assistant' "
+        "AND tool_calls LIKE '%code_edit%' ORDER BY created_at DESC, id DESC LIMIT 20",
+        [repo_id, user_id],
+    )
+    for row in rows:
+        content = str(row.get("content") or "").strip()
+        if not any(content.startswith(text) for text in replies):
+            continue
+        calls = row.get("tool_calls")
+        try:
+            calls = json.loads(calls) if isinstance(calls, str) else calls
+        except ValueError:
+            continue
+        proposal_id = next((str((call.get("input") or {}).get("proposal_id") or "") for call in calls or []
+                            if isinstance(call, dict) and call.get("tool") == "code_edit"), "")
+        if not proposal_id:
+            continue
+        stored = await store.fetch_one(
+            "SELECT payload_json FROM edit_proposals WHERE id = ? AND user_id = ? AND repo_id = ?",
+            [proposal_id, user_id, repo_id],
+        )
+        if not stored:
+            return None
+        try:
+            proposal = json.loads(stored["payload_json"])
+        except (TypeError, ValueError):
+            return None
+        asked = await store.fetch_one(
+            "SELECT content FROM chat_messages WHERE repo_id = ? AND user_id = ? AND role = 'user' AND created_at <= ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            [repo_id, user_id, row.get("created_at")],
+        )
+        reference = str(proposal.get("issue_reference") or "")
+        named = _issue_mentions(question)
+        if named and named != {reference}:
+            return None  # a different issue is a separate change
+        files = [item for item in proposal.get("files") or [] if isinstance(item, dict) and item.get("file_path")]
+        if not files:
+            return None
+        return {
+            "id": str(proposal.get("id") or proposal_id), "title": str(proposal.get("title") or ""),
+            "summary": str(proposal.get("summary") or ""), "question": str((asked or {}).get("content") or ""),
+            "files": files, "issue_reference": reference or None, "issue_confirmed": bool(proposal.get("issue_confirmed")),
+            "issue_repository": str(proposal.get("issue_repository") or ""),
+        }
+    return None
+
+
 def _references(text: str, name: str) -> bool:
     return bool(re.search(rf"(?<![\w$]){re.escape(name)}(?![\w$])", text or ""))
 
@@ -565,6 +679,17 @@ class CodeEditor:
         self._renames: list[tuple[str, str]] = []
         # Why only the rename codemod made the change (the reply was unusable), or "".
         self._rename_fallback = ""
+        # The referenced issue's own text, for the reproduction cases it quotes.
+        self.issue_body = ""
+        # The proposal this request revises (previous_proposal_for), and per
+        # previous file: the current file it is rebased on and the content
+        # the revision starts from (the previous change re-applied to it).
+        self.previous: dict | None = None
+        self.revision_bases: dict[str, dict] = {}
+        self.revision_starts: dict[str, str] = {}
+        # Previous files whose change could not be carried over, with the reason.
+        self.revision_lost: dict[str, str] = {}
+        self.revision_dropped: list[str] = []
 
     def _issue_link(self, number: str) -> str:
         """GitHub's closing reference; a bare #N always means this repository."""
@@ -572,9 +697,22 @@ class CodeEditor:
 
     # ------------------------------------------------------------------ steps
 
+    def _issue_source(self) -> str:
+        """The text naming the issue: the request, or for a revision that names none, the previous request."""
+        question = self.request.question
+        if self.previous and not _issue_mentions(question):
+            earlier = self.previous.get("question") or ""
+            if _issue_mentions(earlier):
+                return earlier
+            reference = self.previous.get("issue_reference")
+            if reference:
+                where = self.previous.get("issue_repository") or f"{self.owner}/{self.name}"
+                return f"https://github.com/{where}/issues/{reference}"
+        return question
+
     async def _issue_context(self) -> tuple[str, str | None]:
         """Fetch a referenced GitHub issue so its text becomes acceptance criteria."""
-        question = self.request.question
+        question = self._issue_source()
         owner, name, number = self.owner, self.name, None
         url_match = _ISSUE_URL.search(question)
         if url_match:
@@ -591,6 +729,7 @@ class CodeEditor:
         if not issue:
             return "", str(number)
         self.issue_confirmed = True
+        self.issue_body = str(issue.get("body") or "")
         self.tool_calls.append({
             "tool": "read_github_issue", "input": {"issue": f"{owner}/{name}#{number}"},
             "result_summary": issue["title"],
@@ -981,6 +1120,7 @@ Rules:
         user = (
             f"Change request:\n{request_text}\n\n"
             + rename_note
+            + self._revision_note()
             + (f"Planned approach:\n{approach}\n\n" if approach else "")
             + (f"New files you may create: {', '.join(new_files)}\n\n" if new_files else "")
             + (f"Repository conventions:\n{conventions_text}\n\n" if conventions_text else "")
@@ -992,6 +1132,177 @@ Rules:
             + "Files you may modify (complete current content):\n\n" + "\n\n".join(sections)
         )
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    # ------------------------------------------------------ revisions (G9)
+
+    def _revision_request_text(self, question: str) -> str:
+        """The change request of a revision: what the previous proposal did, then what to add."""
+        previous = self.previous or {}
+        paths = ", ".join(item["file_path"] for item in previous.get("files") or [])
+        earlier = re.sub(r"\s+", " ", previous.get("question") or "").strip()[:1500]
+        return (
+            f"Revise the previous proposal \"{previous.get('title') or 'Proposed change'}\", which changes {paths}.\n"
+            + (f"Earlier request: {earlier}\n" if earlier else "")
+            + (f"Earlier proposal: {previous['summary'].strip()[:800]}\n" if previous.get("summary") else "")
+            + f"\nRevision request: {question}"
+        )
+
+    def _revision_note(self) -> str:
+        """For a revision: the previous proposal's diff, already applied to the FILE sections."""
+        if not self.previous or not self.revision_starts:
+            return ""
+        diffs, used = [], 0
+        for path, start in self.revision_starts.items():
+            base = self.revision_bases[path]
+            diff = unified_diff_text(base["content"], start, path, is_new=base["created"])
+            if not diff:
+                continue
+            if used + len(diff) > _REVISION_DIFF_CHARACTERS:
+                diffs.append(f"[... the previous diff of {path} is not shown in full ...]")
+                break
+            used += len(diff)
+            diffs.append(diff)
+        lost = "".join(f"- {reason}\n" for reason in self.revision_lost.values())
+        return (
+            "This request revises the previous proposal. The FILE sections below ALREADY CONTAIN the previous "
+            "proposal's changes (its diff against the repository is shown here). Keep every earlier change unless the "
+            "revision request asks to change or drop it; write hunks only for what this revision adds or changes (to "
+            "drop an earlier change, write a hunk that restores the original lines from the diff). The title, summary "
+            "and pr_body must describe the whole change: the earlier changes plus this revision.\n\n"
+            + (f"Earlier changes that no longer apply to the current files and were left out:\n{lost}\n" if lost else "")
+            + "Previous proposal's diff:\n" + "\n".join(diffs) + "\n\n"
+        )
+
+    async def _prepare_revision(self, loaded: dict[str, LoadedFile]) -> None:
+        """Rebase the previous proposal on the current files and start the model from it.
+
+        Each previously modified file is re-applied to the file just read
+        (``reapply_change``, exact matches only); a file whose earlier change no
+        longer applies starts from its current content and is reported. Files
+        the previous proposal created start from their proposed content. The
+        model's FILE sections then show the previous proposal's result.
+        """
+        if not self.previous:
+            return
+        for item in self.previous["files"]:
+            path = item["file_path"]
+            if item.get("action") == "create":
+                after = item.get("after")
+                if not isinstance(after, str) or not after:
+                    self.revision_lost[path] = f"The earlier new file {path} has no stored content, so it is not part of this revision."
+                    continue
+                self.revision_bases[path] = {"content": "", "sha": None, "source": "generated", "exact": True, "created": True}
+                self.revision_starts[path] = after
+                if path not in loaded and len(loaded) < max(1, int(settings.editing_max_files)):
+                    loaded[path] = LoadedFile(path, after, None, "generated")
+                continue
+            current = loaded.get(path) or self.mechanical.get(path)
+            if current is None:
+                # _load_many reported why (not_loaded); nothing to rebase on.
+                continue
+            start = None
+            before, after = item.get("before"), item.get("after")
+            if isinstance(before, str) and isinstance(after, str):
+                start = reapply_change(before, after, current.content)
+            if start is None and item.get("changes"):
+                try:
+                    start = apply_hunks(current.content, item["changes"])
+                except CodeEditValidationError:
+                    start = None
+            self.revision_bases[path] = {"content": current.content, "sha": current.base_blob_sha, "source": current.source,
+                                         "exact": current.exact, "created": False}
+            if start is None:
+                self.revision_lost[path] = (f"The earlier change to {path} no longer applies to the current file, so this "
+                                            "revision starts from the current file.")
+                start = current.content
+            self.revision_starts[path] = start
+            if path in loaded:
+                loaded[path] = LoadedFile(path, start, current.base_blob_sha, current.source, current.exact)
+        kept = [path for path in self.revision_starts if path not in self.revision_lost]
+        self.tool_calls.append({
+            "tool": "revise_proposal", "input": {"proposal": self.previous["title"] or self.previous["id"], "files": kept},
+            "result_summary": (f"Starting from the previous proposal: {len(kept)} file{'s' if len(kept) != 1 else ''} keep "
+                               "their earlier changes" + (f"; {len(self.revision_lost)} could not be re-applied"
+                                                         if self.revision_lost else ""))[:400],
+            "status": "warn" if self.revision_lost else "ok",
+        })
+
+    def _rebased(self, item: dict, base: dict) -> dict | None:
+        """A file entry against the current repository file (or as a new file); None when it no longer changes anything."""
+        after = item.get("after")
+        if not isinstance(after, str):
+            return item
+        if base["created"]:
+            if not after.strip():
+                return None
+            item.update({"action": "create", "before": "", "changes": [], "base_blob_sha": None, "source": "generated",
+                         "additions": line_change_counts("", after)[0], "deletions": 0})
+            return item
+        before = base["content"]
+        if after.replace("\r\n", "\n") == before.replace("\r\n", "\n"):
+            return None
+        changes = hunks_for(before, after)
+        try:
+            final = apply_hunks(before, changes)
+        except CodeEditValidationError:
+            return None
+        additions, deletions = line_change_counts(before, final)
+        item.update({"action": "modify", "before": before, "after": final, "changes": changes, "base_blob_sha": base["sha"],
+                     "source": base["source"], "additions": additions, "deletions": deletions})
+        return item
+
+    def _rebase_revision(self, files: list[dict]) -> list[dict]:
+        """The revision's files against the repository: earlier changes kept, this request's added.
+
+        A previous file the model did not touch keeps its earlier change; one
+        it touched is diffed against the current file, so its hunks include
+        the earlier change. A file whose final content equals the current file
+        (the request dropped its change) leaves the proposal.
+        """
+        if not self.previous:
+            return files
+        by_path = {item["file_path"]: item for item in files}
+        result: list[dict] = []
+        dropped: list[str] = []
+        for previous in self.previous["files"]:
+            path = previous["file_path"]
+            base, start = self.revision_bases.get(path), self.revision_starts.get(path)
+            if base is None or start is None:
+                continue
+            item = by_path.pop(path, None)
+            if item is None:
+                if path in self.revision_lost:
+                    continue
+                item = {"file_path": path, "action": "modify", "summary": str(previous.get("summary") or "Updated")[:600],
+                        "changes": [], "before": base["content"], "after": start, "base_blob_sha": base["sha"],
+                        "additions": 0, "deletions": 0, "language": language_for(path), "source": base["source"]}
+                if previous.get("mechanical"):
+                    item["mechanical"] = True
+            rebased = self._rebased(item, base)
+            if rebased is None:
+                dropped.append(path)
+                continue
+            result.append(rebased)
+        self.revision_dropped = dropped
+        result.extend(by_path.values())
+        if not result:
+            raise CodeEditValidationError("The revision removes every change of the previous proposal, so there is nothing to propose.")
+        return result
+
+    def _revision_summary(self, files: list[dict]) -> dict | None:
+        """``proposal.revision_of``: which proposal this revises and what happened to its files."""
+        if not self.previous:
+            return None
+        paths = {item["file_path"] for item in files}
+        kept = [item["file_path"] for item in self.previous["files"]
+                if item["file_path"] in paths and item["file_path"] not in self.revision_lost]
+        return {
+            "id": self.previous["id"], "title": self.previous["title"], "kept_files": kept,
+            "dropped_files": list(self.revision_dropped),
+            "not_reapplied": [{"file_path": path, "reason": reason} for path, reason in self.revision_lost.items()],
+            "added_files": [item["file_path"] for item in files
+                            if item["file_path"] not in {entry["file_path"] for entry in self.previous["files"]}],
+        }
 
     def _too_large(self, files: list[str], *, reason: str, limit: int, definitions: list[str],
                    renames: list[tuple[str, str]] | None = None, symbols: dict | None = None,
@@ -1934,7 +2245,7 @@ Rules:
         return ""
 
     async def _self_review(self, request_text: str, files: list[dict], checks: dict, completeness: dict,
-                           title: str, renames: list | None = None) -> dict:
+                           title: str, renames: list | None = None, *, cases: list[dict] | None = None) -> dict:
         """One review call; returns the review outcome and the (possibly updated) checks."""
         renames = list(renames or [])
         outcome = {"reviewed": False, "summary": "", "issues": [], "pr": {}, "checks": checks, "touched": set(),
@@ -1943,7 +2254,8 @@ Rules:
         if not getattr(settings, "editing_self_review", True):
             outcome["skipped"] = "self-review is turned off (EDITING_SELF_REVIEW)"
             return outcome
-        trivial = self._trivial_reason(files, checks, completeness, renames)
+        # Cases quoted in the issue are traced only by the review: never skip it then.
+        trivial = "" if cases else self._trivial_reason(files, checks, completeness, renames)
         if trivial:
             outcome.update({"skipped": trivial, "trivial": True})
             return outcome
@@ -1959,6 +2271,7 @@ Rules:
         messages = build_review_messages(
             request_text=request_text, conventions_text=conventions_text,
             findings=[self._finding_line(finding) for finding in findings], files=files, related=related,
+            cases=cases,
         )
         timeout = float(getattr(settings, "editing_review_timeout_seconds", 45))
         review_started = time.monotonic()
@@ -2345,7 +2658,7 @@ Rules:
         unverified = [issue for issue in issues if not issue["verified"]]
         fixed = [issue for issue in verified if issue["fixed"]]
         if not issues:
-            return "No problems found"
+            return NO_PROBLEMS_FOUND
         parts = []
         if verified:
             parts.append(f"Fixed {len(fixed)} of {len(verified)} issue{'s' if len(verified) != 1 else ''}")
@@ -2358,11 +2671,26 @@ Rules:
     async def run(self) -> dict:
         request = self.request
         self.started = time.monotonic()
+        try:
+            self.previous = await previous_proposal_for(
+                request.store, str(request.repo.get("id") or ""), request.user_id, request.question,
+                request.conversation_history,
+            )
+        except Exception:
+            logger.warning("Could not look up the proposal to revise", exc_info=True)
+            self.previous = None
         issue_text, issue_reference = await self._issue_context()
         request_text = request.question.strip()
+        if self.previous:
+            request_text = self._revision_request_text(request_text)
         if issue_text:
             request_text += "\n\nAcceptance criteria from the referenced issue:\n" + issue_text
         issue_reference = issue_reference or request.evidence_plan.get("issue_reference")
+        # The cases the issue quotes are never run here: they are traced by the
+        # review and listed under "How to verify".
+        cases = reproduction_cases(self.issue_body) if self.issue_body else []
+        previous_paths = [item["file_path"] for item in (self.previous or {}).get("files") or []
+                          if item.get("action") != "create"]
 
         explicit = [path for path in request.evidence_plan.get("requested_files") or [] if path]
         # Paths ending a sentence ("... and src/a.ts.") are missed by the
@@ -2387,8 +2715,9 @@ Rules:
         # as existing leads the candidates; an unknown name stops here.
         self._definitions = await self._anchor_definitions(renames)
         ranked = _editing_candidate_paths(request.evidence_chunks, explicit, max(1, settings.editing_max_files))
-        candidates = [path for path in dict.fromkeys([*self._definitions, *ranked]) if not is_overview_file(path)]
-        candidates = candidates[: max(1, settings.editing_max_files)]
+        # A revision starts from the files the previous proposal changed.
+        candidates = [path for path in dict.fromkeys([*previous_paths, *self._definitions, *ranked]) if not is_overview_file(path)]
+        candidates = candidates[: max(1, settings.editing_max_files, len(previous_paths))]
         if not candidates:
             raise CodeEditValidationError(
                 "I could not find the code this change applies to. Name the file (for example src/components/Header.tsx) or describe the feature more specifically."
@@ -2410,8 +2739,9 @@ Rules:
         proposed_modify = _string_list(plan.get("files_to_modify"))
         proposed_create = _string_list(plan.get("files_to_create"))
         known = await self._indexed_paths([*proposed_modify, *candidates, *neighbours])
+        known.update(previous_paths)
         modify_paths: list[str] = []
-        for path in [*proposed_modify, *explicit]:
+        for path in [*previous_paths, *proposed_modify, *explicit]:
             try:
                 clean = normalise_repository_path(path)
             except CodeEditValidationError:
@@ -2466,7 +2796,10 @@ Rules:
                         f"one proposal changes at most {mechanical_limit} files for a rename ({limit} written by the model, "
                         "the rest by the exact rename codemod)."),
             )
-        if not renames and len(modify_paths) > limit:
+        # A revision's earlier files beyond the limit are carried over as they
+        # are (not shown to the model); only the files this request adds count.
+        added_count = len([path for path in modify_paths if path not in previous_paths])
+        if not renames and len(modify_paths) > limit and added_count + min(len(previous_paths), limit) > limit:
             raise self._too_large(
                 modify_paths, limit=limit, definitions=definitions,
                 reason=f"This change needs {len(modify_paths)} files; the limit is {limit} for one proposal.",
@@ -2485,7 +2818,10 @@ Rules:
         self._model_paths = list(model_paths)
         scope_input = {"files": len(modify_paths), "limit": limit, "mechanical": len(mechanical_paths),
                        "symbols": dict(self.symbol_counts)}
-        if mechanical_paths:
+        if mechanical_paths and not renames:
+            scope_summary = (f"{len(modify_paths)} files: {len(model_paths)} shown to the model, "
+                             f"{len(mechanical_paths)} carried over from the previous proposal")
+        elif mechanical_paths:
             scope_summary = (f"{len(modify_paths)} files: {len(model_paths)} edited by the model, "
                              f"{len(mechanical_paths)} by the rename codemod")
         else:
@@ -2500,12 +2836,13 @@ Rules:
             scope_summary += f"; {self.unindexed:,} files are not indexed, so usages there were not checked"
 
         creatable: set[str] = set()
+        previously_created = {item["file_path"] for item in (self.previous or {}).get("files") or [] if item.get("action") == "create"}
         for path in proposed_create[:_MAX_NEW_FILES]:
             try:
                 clean = normalise_repository_path(path)
             except CodeEditValidationError:
                 continue
-            if clean not in known:
+            if clean not in known and clean not in previously_created:
                 creatable.add(clean)
         self._creatable = creatable
         self.tool_calls.append({
@@ -2548,10 +2885,16 @@ Rules:
                 loaded[path] = outcome
             else:
                 self.mechanical[path] = outcome
+        await self._prepare_revision(loaded)
         if not loaded:
             reasons = " ".join(self.not_loaded.values())
             raise CodeEditValidationError(reasons or "The target files could not be read from GitHub or the index.")
         self.ranking_text = "\n".join([request.question, str(plan.get("approach") or ""), " ".join(symbols)])
+        if self.previous:
+            # A large file's partial view must include what the previous proposal changed.
+            earlier = " ".join(str(change.get("new") or "") for item in self.previous["files"]
+                               for change in item.get("changes") or [] if isinstance(change, dict))
+            self.ranking_text += "\n" + earlier[:4000]
         explicit_clean: list[str] = []
         for path in explicit:
             try:
@@ -2587,6 +2930,9 @@ Rules:
                 await self._mark_existing_creates(payload, known)
                 files = self._validate(payload, loaded, creatable, known)
                 files.extend(self._mechanical_files(renames) if renames else [])
+                # A revision's hunks were written against the previous
+                # proposal's result: diff every file against the repository.
+                files = self._rebase_revision(files)
                 if not renames:
                     # The request did not say "rename", but the patch renames
                     # an exported definition: every user of the old name is
@@ -2692,10 +3038,10 @@ Rules:
         # "Fixes #N" closes the issue on merge. Use it for an issue that was
         # read from GitHub, or when the user explicitly asked to fix/close/
         # resolve the referenced issue; otherwise only link it ("Refs").
-        closes_issue = bool(issue_link) and (self.issue_confirmed or bool(_CLOSING_INTENT.search(request.question)))
+        closes_issue = bool(issue_link) and (self.issue_confirmed or bool(_CLOSING_INTENT.search(self._issue_source())))
         draft_title = str(payload.get("title") or "").strip()
         edit_paths = [item["file_path"] for item in files]
-        review = await self._self_review(request_text, files, checks, completeness, draft_title, renames)
+        review = await self._self_review(request_text, files, checks, completeness, draft_title, renames, cases=cases)
         checks = review["checks"]
         if review.get("completeness") is not None:
             completeness = review["completeness"]
@@ -2733,22 +3079,24 @@ Rules:
         if conventional:
             title = repo_conventions.conventional_title(title, kind)
         summary = repo_conventions.strip_meta_text(str(payload.get("summary") or "")).strip()[:1200]
-        validation = [repo_conventions.normalise_command(item, self.conventions)[:300]
-                      for item in _string_list(payload.get("validation"))][:12]
-        verify_steps = validation or ([f"Run `{self.conventions['test_command']}`"] if self.conventions.get("test_command") else
-                                      ["Review the diff and run the repository's tests"])
+        model_steps = [repo_conventions.normalise_command(item, self.conventions)[:300]
+                       for item in _string_list(payload.get("validation"))][:12]
+        # Nothing is run here: say which command runs the tests and list
+        # every case the issue quotes that the steps do not already run.
+        verification = self._verification(files, model_steps, cases, issue_link)
+        validation = verification.pop("steps")
+        verify_steps = validation or ["Review the diff and run the repository's tests"]
         # Files the review changed or added are described from the final diff.
         review_changed = bool(review.get("touched")) or [item["file_path"] for item in files] != edit_paths
+        issue_line = f"{'Fixes' if closes_issue else 'Refs'} {issue_link}" if issue_link else ""
         pr_body, _body_source = repo_conventions.finalize_pr_body(
             repo_conventions.normalise_command(str(payload.get("pr_body") or ""), self.conventions),
             template=str(self.conventions.get("pr_template") or ""), summary=summary or title,
-            files=files, validation=verify_steps, regenerate_changes=review_changed,
+            files=files, validation=verify_steps, regenerate_changes=review_changed, issue_line=issue_line,
         )
-        # Match the exact reference: a substring test treats "#42" as already
-        # linking issue #4, and "other/repo#4" as linking this repository's #4.
-        if issue_link and not re.search(rf"(?<![\w./-]){re.escape(issue_link)}(?!\d)", pr_body, re.IGNORECASE):
-            keyword = "Fixes" if closes_issue else "Refs"
-            pr_body = f"{keyword} {issue_link}\n\n{pr_body}".strip()
+        # GitHub closes the issue only for "Fixes #N" itself ("Fixes issue #N"
+        # closes nothing), and the reference must be exact: "#42" is not #4.
+        pr_body = repo_conventions.ensure_issue_reference(pr_body, issue_link, closes=closes_issue)
         pr_body = pr_body[:repo_conventions.PR_BODY_LIMIT]
         commit_message = repo_conventions.commit_message(title, files)
 
@@ -2773,6 +3121,11 @@ Rules:
             "validation": validation,
             "issue_reference": issue_reference,
             "issue_confirmed": bool(issue_reference and self.issue_confirmed),
+            "issue_repository": self.issue_repository,
+            # What was not run, and how to check it (G8).
+            "verification": verification,
+            # The proposal this one revises, or None (G9).
+            "revision_of": self._revision_summary(files),
             "unchanged_files": unchanged_files,
             "incomplete": incomplete,
             "approximate_files": approximate,
@@ -2817,6 +3170,49 @@ Rules:
 
     # ------------------------------------------------------- quality report
 
+    def _runs_tests(self, step: str) -> bool:
+        """Whether a verification step already runs the repository's tests."""
+        command = str(self.conventions.get("test_command") or "")
+        runner = str(self.conventions.get("test_runner") or "")
+        lowered = step.lower()
+        if command and command.lower() in lowered:
+            return True
+        words = {"pytest": ("pytest", "py.test"), "go": ("go test",), "cargo": ("cargo test",),
+                 "node": tuple(f"{manager} {verb}test" for manager in ("npm", "yarn", "pnpm", "bun") for verb in ("", "run "))}
+        return any(word in lowered for word in words.get(runner, ()))
+
+    def _verification(self, files: list[dict], steps: list[str], cases: list[dict], issue_link: str) -> dict:
+        """``proposal.verification`` plus the final "How to verify" steps (popped by the caller as ``steps``).
+
+        Tests are never run here (``tests_run`` is always False). The command
+        comes from the repository's own setup (conventions.test_setup),
+        narrowed to the changed test files when its runner takes paths. Every
+        reproduction case the issue quotes becomes a step unless a step
+        already runs it.
+        """
+        test_paths = [item["file_path"] for item in files if is_test_path(item["file_path"])]
+        suite = str(self.conventions.get("test_command") or "")
+        command = repo_conventions.targeted_test_command(self.conventions, test_paths) or suite
+        final = list(steps)
+        if command and not any(self._runs_tests(step) for step in steps):
+            final.insert(0, f"Run `{command}`" + (f", then the whole suite with `{suite}`" if suite and suite != command else ""))
+        listed = []
+        for case in cases:
+            covered = case_covered(case["code"], steps)
+            listed.append({**case, "covered": covered})
+            if covered:
+                continue
+            code = case["code"]
+            if "\n" in code:
+                code = " ".join(line.strip() for line in code.split("\n") if line.strip())
+            final.append(f"Check the case from {issue_link or 'the issue'}: {_code_span(code)}"
+                         + (f" (the issue reports: {case['note']})" if case.get("note") else ""))
+        return {
+            "tests_run": False, "command": command, "suite_command": suite,
+            "command_source": str(self.conventions.get("test_command_source") or ""),
+            "test_files": test_paths[:20], "cases": listed, "issue": issue_link, "steps": final[:24],
+        }
+
     def _quality(self, files: list[dict], checks: dict, completeness: dict, review: dict, renames: list,
                  *, title: str, conventional: bool) -> dict:
         syntax_status, syntax_detail = summarize_syntax(checks["syntax"])
@@ -2843,7 +3239,7 @@ Rules:
         if review["reviewed"]:
             unfixed = [issue for issue in verified if not issue["fixed"]]
             review_status = "warn" if unfixed else "pass"
-            review_summary = review["summary"] or "No problems found"
+            review_summary = review["summary"] or NO_PROBLEMS_FOUND
             review_detail = review_summary
             fixed_list = [issue for issue in verified if issue["fixed"]]
             if fixed_list:
@@ -2955,7 +3351,7 @@ Rules:
             summary = f"Skipped: {review['skipped']}"
             status = "skipped"
         elif not issues:
-            summary = "No problems found" + (
+            summary = NO_PROBLEMS_FOUND + (
                 f"; {unverified} unverified suggestion{'s' if unverified != 1 else ''} not applied" if unverified else "")
             status = "ok"
         else:
@@ -2982,6 +3378,17 @@ def format_proposal_markdown(proposal: dict) -> str:
     stats = proposal.get("stats") or {}
     quality = proposal.get("quality") if isinstance(proposal.get("quality"), dict) else None
     lines: list[str] = []
+    revision = proposal.get("revision_of") if isinstance(proposal.get("revision_of"), dict) else None
+    if revision:
+        kept = revision.get("kept_files") or []
+        lines.append(f"> **Revises the previous proposal \"{revision.get('title') or 'Proposed change'}\".** "
+                     + (f"Its changes to {', '.join(f'`{path}`' for path in kept)} are kept and this request's changes are added."
+                        if kept else "This request's changes replace its changes."))
+        for path in revision.get("dropped_files") or []:
+            lines.append(f"> - `{path}`: the earlier change was dropped, as asked.")
+        for item in revision.get("not_reapplied") or []:
+            lines.append(f"> - {item.get('reason') or item.get('file_path')}")
+        lines.append("")
     if quality and quality.get("status") == "fail":
         failing = [check for check in quality.get("checks") or [] if check.get("status") == "fail"]
         labels = ", ".join(_FAILING_LABELS.get(check["id"], check["id"]) for check in failing) or "failed checks"
@@ -3012,7 +3419,7 @@ def format_proposal_markdown(proposal: dict) -> str:
         lines.extend(["", "## Not changed"])
         lines.extend(f"- `{item['file_path']}`: {item.get('reason') or ''}" for item in unchanged)
     if quality:
-        lines.extend(["", "## Checks"])
+        lines.extend(["", "## Static checks (nothing was run)"])
         for check in quality.get("checks") or []:
             mark = {"pass": "passed", "warn": "warning", "fail": "failed", "skipped": "skipped"}.get(check.get("status"), check.get("status"))
             if check.get("id") == "tests" and check.get("status") == "pass":
@@ -3022,6 +3429,16 @@ def format_proposal_markdown(proposal: dict) -> str:
                 for entry in (check.get("files") or [])[:4]:
                     where = f"{entry['file_path']}:{entry['line']}" if entry.get("line") else entry["file_path"]
                     lines.append(f"  - `{where}` {entry['message']}")
+    verification = proposal.get("verification") if isinstance(proposal.get("verification"), dict) else None
+    if verification and not verification.get("tests_run"):
+        command = verification.get("command") or ""
+        source = verification.get("command_source") or ""
+        lines.extend(["", "## Tests not run", "", (
+            f"Nothing in this proposal was executed. Run `{command}`" + (f" (from {source})" if source else "")
+            + " before merging." if command else
+            "Nothing in this proposal was executed, and no test command was found in the repository's setup files. "
+            "Run its tests before merging."
+        )])
     if proposal.get("validation"):
         lines.extend(["", "## How to verify"])
         lines.extend(f"- {step}" for step in proposal["validation"])
