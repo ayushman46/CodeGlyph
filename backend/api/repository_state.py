@@ -9,8 +9,12 @@ every endpoint reports the same thing.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import re
+import statistics
+import time
 from datetime import UTC, datetime
 from typing import Any, NoReturn
 
@@ -19,6 +23,8 @@ from fastapi import HTTPException
 from database import DatabaseConfigurationError, explain_database_error
 from ingest.cloner import RepositoryValidationError, parse_github_repository
 from ingest.pipeline import ACTIVE_REPOSITORY_STATUSES, INDEX_PHASES_IN_PROGRESS, is_initial_run
+
+logger = logging.getLogger(__name__)
 
 _ACTIVE_JOB = {"queued", "processing"}
 
@@ -77,6 +83,11 @@ _STORAGE_MESSAGE_REWRITES = (
      "A temporary server problem interrupted indexing."),
 )
 _OPERATOR_JARGON = ("Turso", "TURSO_", "AUTO_MIGRATE", "EMBEDDING_DIMENSION", "Traceback", "turso/")
+# The worker reports embedding progress batch by batch in its message, against
+# the best known total (sections still being chunked included). The stored
+# ``semantic_progress`` is only refreshed per buffer and divides by the rows
+# written so far, so the two disagreed ("semantic 66%" next to "258 of 465").
+_SEMANTIC_COUNTS = re.compile(r"Building the semantic index: ([\d,]+) of ([\d,]+) code sections")
 
 REPOSITORY_SELECT = (
     "SELECT r.id, r.repo_name, r.github_url, r.status AS repo_status, r.chunk_count, r.error_message, "
@@ -282,6 +293,40 @@ def describe_index_state(view: dict[str, Any], row: dict[str, Any], now: datetim
     }
 
 
+def semantic_sections(view: dict[str, Any], message: Any) -> dict[str, int] | None:
+    """Sections embedded so far and the total, while a first index embeds.
+
+    Read from the worker's progress message, the one source that is updated
+    every batch and counts sections still being chunked. A refresh reports
+    the new rows against the whole index there, so it keeps the stored
+    percentage instead.
+    """
+    if not view["is_indexing"] or view["refreshing"] or view["status"] not in {"searchable", "embedding"}:
+        return None
+    match = _SEMANTIC_COUNTS.search(str(message or ""))
+    if not match:
+        return None
+    embedded = int(match.group(1).replace(",", ""))
+    total = int(match.group(2).replace(",", ""))
+    if total <= 0:
+        return None
+    return {"embedded": min(embedded, total), "total": total}
+
+
+def searchable_files(view: dict[str, Any]) -> int:
+    """Files answers and code search can use right now.
+
+    ``indexed_files`` is written when a run finishes (and reset to 0 while the
+    next run selects files); ``keyword_files`` follows the published sections
+    during a first index and keeps the current index's count during a refresh.
+    """
+    if not view["queryable"]:
+        return 0
+    if view["is_indexing"]:
+        return view["keyword_files"] or view["indexed_files"]
+    return view["indexed_files"] or view["keyword_files"]
+
+
 def present_repository(row: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
     """Translate a joined repository row into the public API shape."""
     phase = str(row.get("index_phase") or row.get("repo_status") or "queued")
@@ -364,15 +409,144 @@ def present_repository(row: dict[str, Any], now: datetime | None = None) -> dict
             and (staged_refresh or row.get("commit_sha") or row.get("indexed_at"))
         ),
     }
+    sections = semantic_sections(view, row.get("error_message"))
+    if sections:
+        # One number everywhere: the label, the step and the detail line all
+        # read embedded / total (rounded half up, as the UI rounds).
+        view["semantic_progress"] = (sections["embedded"] * 200 + sections["total"]) // (2 * sections["total"])
+    view["semantic_sections"] = sections
+    view["searchable_files"] = searchable_files(view)
+    # Filled in by ``attach_queue_positions`` for a job waiting for a worker.
+    view["queue"] = None
     # ``message`` is the stored text in plain language (stale progress from a
     # finished run removed); ``error_message`` keeps the stored value as is.
     view.update(describe_index_state(view, row, now))
     return view
 
 
+# ---------------------------------------------------------------------------
+# Queue position for a job waiting for a worker
+# ---------------------------------------------------------------------------
+
+_QUEUE_SCAN_LIMIT = 500
+_DURATION_SAMPLE = 20
+_DURATIONS_TTL_SECONDS = 60.0
+_durations_cache: tuple[float, list[float]] | None = None
+
+
+async def recent_job_durations(store) -> list[float]:
+    """Seconds the most recent completed indexing runs took (cached briefly)."""
+    global _durations_cache
+    now = time.monotonic()
+    if _durations_cache and now - _durations_cache[0] < _DURATIONS_TTL_SECONDS:
+        return _durations_cache[1]
+    rows = await store.fetch_all(
+        "SELECT m.metrics_json FROM ingestion_metrics m JOIN ingestion_jobs j ON j.id = m.job_id "
+        "WHERE j.status = 'completed' ORDER BY m.updated_at DESC LIMIT ?",
+        [_DURATION_SAMPLE],
+    )
+    durations: list[float] = []
+    for row in rows:
+        try:
+            total_ms = float(json.loads(row.get("metrics_json") or "{}").get("total_ms") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if total_ms > 0:
+            durations.append(total_ms / 1000)
+    _durations_cache = (now, durations)
+    return durations
+
+
+def estimate_queue_wait(running_elapsed: list[float], queued_ahead: int, durations: list[float]) -> float | None:
+    """Seconds until a waiting job starts, from how long recent runs took.
+
+    Each running job is expected to take the typical (median) run time; one
+    already past it gets a tenth of it, never zero. Queued jobs ahead take a
+    typical run each, shared across the workers that are busy now.
+    """
+    if not durations:
+        return None
+    typical = statistics.median(durations)
+    remaining = sum(max(typical - elapsed, typical * 0.1, 5.0) for elapsed in running_elapsed)
+    workers = max(1, len(running_elapsed))
+    return (remaining + queued_ahead * typical) / workers
+
+
+def queue_label(ahead: int, wait_seconds: float | None) -> str:
+    """"2 repositories ahead of yours · usually starts in about 3 min"."""
+    if ahead <= 0:
+        return "Next in line for an indexing worker"
+    text = f"{ahead} {'repository' if ahead == 1 else 'repositories'} ahead of yours"
+    if wait_seconds is None:
+        return text
+    minutes = max(1, math.ceil(wait_seconds / 60))
+    if minutes >= 90:
+        hours = round(minutes / 60)
+        return f"{text} · usually starts in about {hours} hour{'s' if hours != 1 else ''}"
+    return f"{text} · usually starts in about {minutes} min"
+
+
+async def attach_queue_positions(store, views: list[dict[str, Any]], now: datetime | None = None) -> None:
+    """Add ``queue`` (place in line and an estimated start) to waiting jobs.
+
+    Jobs are claimed by priority, then age (``claim_next_ingestion_job``), so
+    the ones ahead are every running job plus every queued job that sorts
+    earlier. Only counts are exposed, never other workspaces' repositories.
+    """
+    waiting = [view for view in views if view.get("status") == "queued" and view.get("job_status") == "queued"]
+    if not waiting:
+        return
+    now = now or datetime.now(UTC)
+    jobs = await store.fetch_all(
+        "SELECT j.repo_id, j.status, j.created_at, j.claimed_at, j.heartbeat_at, COALESCE(m.priority, 20) AS priority "
+        "FROM ingestion_jobs j LEFT JOIN ingestion_job_meta m ON m.job_id = j.id "
+        "WHERE j.status IN ('queued', 'processing') LIMIT ?",
+        [_QUEUE_SCAN_LIMIT],
+    )
+    running_elapsed = []
+    for job in jobs:
+        if job.get("status") == "processing":
+            started = _parse_time(job.get("claimed_at"))
+            running_elapsed.append(max(0.0, (now - started).total_seconds()) if started else 0.0)
+    order = {
+        str(job["repo_id"]): (_int(job.get("priority")), str(job.get("created_at") or ""))
+        for job in jobs if job.get("status") == "queued"
+    }
+    durations = await recent_job_durations(store)
+    for view in waiting:
+        mine = order.get(str(view["id"]))
+        if mine is None:
+            continue
+        queued_ahead = sum(1 for repo_id, key in order.items() if key < mine and repo_id != str(view["id"]))
+        ahead = len(running_elapsed) + queued_ahead
+        wait = estimate_queue_wait(running_elapsed, queued_ahead, durations) if ahead else None
+        view["queue"] = {
+            "ahead": ahead,
+            "running": len(running_elapsed),
+            "position": ahead + 1,
+            "estimated_wait_seconds": int(round(wait)) if wait is not None else None,
+            "estimate_runs": len(durations) if wait is not None else 0,
+            "label": queue_label(ahead, wait),
+            "estimate_note": (
+                f"Estimate based on how long the last {len(durations)} indexing "
+                f"run{'s' if len(durations) != 1 else ''} took."
+                if wait is not None else None
+            ),
+        }
+
+
+async def _with_queue_positions(store, views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    try:
+        await attach_queue_positions(store, views)
+    except Exception:
+        # The place in line is a convenience; the status itself still loads.
+        logger.warning("Could not compute queue positions", exc_info=True)
+    return views
+
+
 async def list_repositories(store, user_id: str) -> list[dict[str, Any]]:
     rows = await store.fetch_all(REPOSITORY_SELECT + "WHERE r.user_id = ? ORDER BY r.created_at DESC", [user_id])
-    return [present_repository(row) for row in rows]
+    return await _with_queue_positions(store, [present_repository(row) for row in rows])
 
 
 async def fetch_owned_repository(store, user_id: str, repo_name: str) -> dict[str, Any]:
@@ -384,7 +558,7 @@ async def fetch_owned_repository(store, user_id: str, repo_name: str) -> dict[st
     row = await store.fetch_one(REPOSITORY_SELECT + "WHERE r.user_id = ? AND r.repo_name = ?", [user_id, repo_name])
     if not row:
         raise HTTPException(status_code=404, detail="Repository not found.")
-    presented = present_repository(row)
+    presented = (await _with_queue_positions(store, [present_repository(row)]))[0]
     run_prefix = row.get("run_prefix")
     # A first index's rows are visible while it builds; only a refresh's
     # replacement rows are hidden from retrieval.
