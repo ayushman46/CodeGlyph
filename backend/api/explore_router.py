@@ -1,4 +1,4 @@
-"""Repository exploration: overview, instant code search, and file viewing."""
+"""Repository exploration: overview, exact code search, files, symbols and file viewing."""
 
 from __future__ import annotations
 
@@ -19,7 +19,15 @@ from database import assert_turso_schema, get_turso_store
 from github.github_client import GitHubAPIError, fetch_raw_file
 from ingest.chunker import LONG_LINE_OVERLAP
 from ingest.cloner import RepositoryValidationError, parse_github_repository
-from retrieval.retriever import build_repo_map, search_code
+from retrieval.code_search import (
+    file_outline,
+    find_files,
+    find_symbols,
+    list_directory,
+    repository_paths,
+    search_code,
+)
+from retrieval.retriever import build_repo_map
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -788,25 +796,86 @@ async def repository_search(
     limit: int = Query(default=20, ge=1, le=50),
     current_user=Depends(get_current_user),
 ):
+    """Every line containing the query, one result per file (see ``retrieval.code_search``).
+
+    Quoted phrases match exactly; other words must all be on the line. Each
+    result lists its matching lines (declarations of the searched name first)
+    with the matched character spans, so the count of results is the number
+    of files.
+    """
     try:
         await assert_turso_schema()
         store = get_turso_store()
         repo = await fetch_owned_repository(store, current_user.id, repo_name)
         if not repo["queryable"]:
             return {
-                "results": [], "query": q, "searchable": False,
+                "results": [], "query": q, "searchable": False, "mode": "exact", "more_files": False, "line_count": 0,
                 "message": "Code search starts working as soon as keyword indexing finishes. Check back in a moment.",
             }
-        results = await search_code(store, repo["id"], q, limit=limit, staging_prefix=repo.get("staging_prefix"))
+        found = await search_code(
+            store, repo["id"], q, limit=limit, staging_prefix=repo.get("staging_prefix"),
+            chunk_count=repo.get("chunk_count"),
+        )
         return {
-            "results": results, "query": q, "searchable": True,
-            "message": None if results else (
-                f"No matches for \u201c{q.strip()}\u201d. Search matches code text: try an exact name "
-                "(a function, class or variable) or fewer words."
+            **found, "query": q, "searchable": True,
+            "message": None if found["results"] else (
+                f"No matches for \u201c{q.strip()}\u201d. Search lists the lines that contain this exact text: try "
+                "a single name (a function, class or variable), fewer words, or quotes around an exact phrase."
             ),
         }
     except Exception as error:
         _handle(error, "search the code")
+
+
+def _paths_version(repo: dict) -> tuple:
+    return (repo.get("chunk_count"), repo.get("commit_sha"), repo.get("indexed_at"), repo.get("staging_prefix"))
+
+
+@router.get("/repos/{repo_name}/files")
+async def repository_files(
+    repo_name: str,
+    q: str | None = Query(default=None, max_length=300),
+    directory: str | None = Query(default=None, alias="dir", max_length=500),
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user=Depends(get_current_user),
+):
+    """Indexed files: ranked matches for ``q`` (a name or partial path), else one folder (``dir``) for the file tree."""
+    folder = (directory or "").strip().strip("/")
+    if folder and (".." in folder.split("/") or "\\" in folder or "\x00" in folder):
+        raise HTTPException(status_code=422, detail="That folder path isn't valid. Use a path from the repository root, such as src/lib.")
+    try:
+        await assert_turso_schema()
+        store = get_turso_store()
+        repo = await fetch_owned_repository(store, current_user.id, repo_name)
+        paths = await repository_paths(
+            store, repo["id"], version=_paths_version(repo), staging_prefix=repo.get("staging_prefix"),
+        )
+        if q is not None and q.strip():
+            files, total = find_files(paths, q, limit=limit)
+            return {"query": q, "files": files, "total_matches": total, "total_files": len(paths)}
+        return {**list_directory(paths, folder), "total_files": len(paths)}
+    except Exception as error:
+        _handle(error, "list the files")
+
+
+@router.get("/repos/{repo_name}/symbols")
+async def repository_symbols(
+    repo_name: str,
+    q: str = Query(min_length=1, max_length=120),
+    limit: int = Query(default=20, ge=1, le=50),
+    current_user=Depends(get_current_user),
+):
+    """Declarations (classes, functions, methods...) whose name matches ``q``, each at its exact line."""
+    try:
+        await assert_turso_schema()
+        store = get_turso_store()
+        repo = await fetch_owned_repository(store, current_user.id, repo_name)
+        if not repo["queryable"]:
+            return {"query": q, "symbols": [], "searchable": False}
+        symbols = await find_symbols(store, repo["id"], q, limit=limit, staging_prefix=repo.get("staging_prefix"))
+        return {"query": q, "symbols": symbols, "searchable": True}
+    except Exception as error:
+        _handle(error, "find symbols")
 
 
 # A file at a commit SHA never changes, so its GitHub text is cached in
@@ -927,6 +996,9 @@ async def repository_file(
             "total_lines": total_lines if total_lines is not None else line_count,
             "exact": exact,
             "github_url": github_url,
+            # Declarations (headings for Markdown) with the lines each spans:
+            # the viewer's outline and its enclosing-symbol breadcrumb.
+            "outline": file_outline(content, clean_path),
         }
     except Exception as error:
         _handle(error, "open this file")
