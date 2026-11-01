@@ -14,6 +14,7 @@ from agent.code_edit import CodeEditValidationError, normalise_repository_path
 from agent.editor import language_for, reconstruct_indexed_file
 from api.auth import get_current_user
 from api.repository_state import fetch_owned_repository, public_view, raise_storage_error
+from api.start_here import gather_start_here
 from config import settings
 from database import assert_turso_schema, get_turso_store
 from github.github_client import GitHubAPIError, fetch_raw_file
@@ -852,6 +853,12 @@ async def repository_overview(repo_name: str, current_user=Depends(get_current_u
             # Starter questions are a convenience; folder-based ones still work.
             logger.warning("Could not read file facts for starter questions", exc_info=True)
         details = suggest_question_details(repo_map, facts)
+        start_here = None
+        try:
+            start_here = await gather_start_here(store, repo, repo_map, facts)
+        except Exception:
+            # Like the starter questions: the rest of the overview still loads.
+            logger.warning("Could not build the Start here card", exc_info=True)
         return {
             "repository": public_view(repo),
             "total_files": repo_map.get("total_files", 0),
@@ -863,6 +870,9 @@ async def repository_overview(repo_name: str, current_user=Depends(get_current_u
             # The same questions with their kind ("overview", "where", "how",
             # "change") and the indexed files each one names.
             "suggested_question_details": details,
+            # Entry file, core folder, cited commands and a reading path
+            # (api/start_here.py); null when nothing could be derived.
+            "start_here": start_here,
             "notice": _overview_notice(repo),
         }
     except Exception as error:
