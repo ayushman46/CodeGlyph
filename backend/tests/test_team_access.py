@@ -200,22 +200,98 @@ def repo_routes(name, ticket=""):
     ]
 
 
+def routes_naming_a_repository(spec):
+    """(METHOD, path without /api) of every route that takes a repository name:
+    in the path, the query string, a header or anywhere in the request body."""
+    schemas = spec.get("components", {}).get("schemas", {})
+
+    def has_repo_name(schema, seen=frozenset()):
+        if not isinstance(schema, dict):
+            return False
+        if "$ref" in schema:
+            name = schema["$ref"].rsplit("/", 1)[-1]
+            return name not in seen and has_repo_name(schemas.get(name), seen | {name})
+        properties = schema.get("properties") or {}
+        if "repo_name" in properties:
+            return True
+        nested = [*properties.values(), schema.get("items"), schema.get("additionalProperties")]
+        nested += [item for key in ("allOf", "anyOf", "oneOf") for item in schema.get(key, [])]
+        return any(has_repo_name(item, seen) for item in nested)
+
+    found = set()
+    for path, operations in spec["paths"].items():
+        short = path.removeprefix("/api")
+        for method, operation in operations.items():
+            body = (operation.get("requestBody") or {}).get("content", {})
+            if (
+                "{repo_name}" in short
+                or any(parameter.get("name") == "repo_name" for parameter in operation.get("parameters", []))
+                or any(has_repo_name(content.get("schema")) for content in body.values())
+            ):
+                found.add((method.upper(), short))
+    return found
+
+
 class RouteCoverageTests(unittest.TestCase):
     def test_every_repository_route_has_an_access_decision(self):
         from main import app
 
         listed = {(method, path) for method, path, _ in repo_routes("{repo_name}")}
         listed = {(method, path.replace("some-invite", "{invite_id}").replace(VIEWER, "{member_id}")) for method, path in listed}
-        # Routes that name the repository in the query string or the body.
-        by_name = {"/query", "/query/stream", "/github/file", "/github/push-pr", "/github/pr-status", "/answers/share"}
-        for path, operations in app.openapi()["paths"].items():
-            short = path.removeprefix("/api")
-            for method, operation in operations.items():
-                names_repo = "{repo_name}" in short or any(
-                    parameter.get("name") == "repo_name" for parameter in operation.get("parameters", [])
-                ) or short in by_name
-                if names_repo:
-                    self.assertIn((method.upper(), short), listed, f"{method.upper()} {short} has no access test")
+        found = routes_naming_a_repository(app.openapi())
+        # Routes naming the repository in the body or query string are found too.
+        self.assertLessEqual(
+            {("POST", "/query"), ("POST", "/query/stream"), ("POST", "/github/push-pr"), ("POST", "/answers/share"),
+             ("GET", "/github/file"), ("GET", "/github/pr-status")},
+            found,
+        )
+        for method, path in sorted(found):
+            self.assertIn((method, path), listed, f"{method} {path} takes a repository name but has no access test")
+
+    def test_the_guard_finds_a_repository_name_in_the_path_query_or_body(self):
+        from fastapi import Body, FastAPI
+        from pydantic import BaseModel
+
+        class Thread(BaseModel):
+            repo_name: str
+            title: str = ""
+
+        class Wrapped(BaseModel):
+            threads: list[Thread]
+
+        class Other(BaseModel):
+            github_url: str
+
+        probe = FastAPI()
+
+        @probe.post("/api/threads")
+        async def create_thread(payload: Thread):
+            return payload
+
+        @probe.post("/api/threads/many")
+        async def create_threads(payload: Wrapped):
+            return payload
+
+        @probe.post("/api/threads/fields")
+        async def create_from_fields(repo_name: str = Body(...), title: str = Body("")):
+            return repo_name
+
+        @probe.get("/api/threads")
+        async def list_threads(repo_name: str):
+            return repo_name
+
+        @probe.get("/api/r/{repo_name}/threads")
+        async def repo_threads(repo_name: str):
+            return repo_name
+
+        @probe.post("/api/other")
+        async def other(payload: Other):
+            return payload
+
+        self.assertEqual(routes_naming_a_repository(probe.openapi()), {
+            ("POST", "/threads"), ("POST", "/threads/many"), ("POST", "/threads/fields"),
+            ("GET", "/threads"), ("GET", "/r/{repo_name}/threads"),
+        })
 
 
 class NonMemberTests(TeamAccessCase):
