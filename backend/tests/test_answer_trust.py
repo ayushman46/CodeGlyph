@@ -713,6 +713,45 @@ class AnswerTrustEndpointTests(answers.EndpointTestCase):
         reloaded = self.history()[-1]
         self.assertEqual((reloaded["mode"], reloaded["answer_failure"]), ("partial", done["answer_failure"]))
 
+    def test_the_json_endpoint_stores_a_cut_off_answer_and_continues_it(self):
+        # The client falls back to POST /api/query when streaming is unavailable.
+        with patch("api.query_router.retrieve_context", AsyncMock(return_value=[answers.AUTH_CHUNK, answers.SESSION_CHUNK])), \
+             patch("api.query_router.run_agent_loop", AsyncMock(return_value=(TruncatedAnswer(CUT_ANSWER), []))):
+            response = self.client.post("/api/query", json={"repo_name": answers.REPO_NAME, "question": answers.QUESTION})
+        self.assertEqual(response.status_code, 200)
+        first = response.json()
+        self.assertEqual((first["mode"], first["truncated"], first["answer"]), ("truncated", True, CUT_ANSWER))
+        message_id = first["message_id"]
+        self.assertEqual(self.stored(message_id)["mode"], "truncated")
+        # A later question: Continue must still use the question this answer belongs to.
+        with patch("api.query_router.retrieve_context", AsyncMock(return_value=[answers.AUTH_CHUNK])), \
+             patch("api.query_router.run_agent_loop", AsyncMock(return_value=("Later answer.", []))):
+            self.client.post("/api/query", json={"repo_name": answers.REPO_NAME, "question": "A later question?"})
+
+        captured = []
+
+        def continuation(question, context, partial, *args):
+            captured.append((question, partial))
+            return stream_of("Otherwise it is a value and is stored.")()
+
+        with patch("api.query_router.stream_answer_continuation", continuation):
+            response = self.client.post("/api/query", json={
+                "repo_name": answers.REPO_NAME, "question": "Continue the answer", "continue_from": message_id,
+            })
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        base = continuation_base(CUT_ANSWER)
+        self.assertEqual(captured, [(answers.QUESTION, base)])
+        expected = base + "Otherwise it is a value and is stored."
+        self.assertEqual((result["mode"], result["truncated"], result["message_id"], result["answer"]),
+                         ("rag", False, message_id, expected))
+        self.assertEqual((self.stored(message_id)["content"], self.stored(message_id)["mode"]), (expected, "rag"))
+        # A complete answer cannot be continued again.
+        response = self.client.post("/api/query", json={
+            "repo_name": answers.REPO_NAME, "question": "Continue the answer", "continue_from": message_id,
+        })
+        self.assertEqual((response.status_code, response.json()["detail"]), (409, "That answer is already complete."))
+
     def test_when_the_other_model_fails_too_no_switch_is_reported(self):
         primary = LLMProviderError("x", reason="timeout")
         error = LLMProviderError("x", reason="timeout")
