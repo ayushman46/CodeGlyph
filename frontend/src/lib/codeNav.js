@@ -126,7 +126,9 @@ export const resolveRepositoryLink = (href, fromPath) => {
 // ---------------------------------------------------------- search results
 
 /**
- * Splits `text` into plain and matched parts from `[start, end)` spans.
+ * Splits `text` into plain and matched parts from `[start, end)` spans,
+ * counted in UTF-16 code units like JavaScript string indexes (the search
+ * API sends them that way).
  *
  * @param {string} text
  * @param {number[][]} [spans]

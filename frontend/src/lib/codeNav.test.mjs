@@ -73,6 +73,9 @@ test('search lines split into plain and highlighted parts (BUG-03)', () => {
   ]);
   assert.deepEqual(highlightParts('abc', undefined), [{ text: 'abc', match: false }]);
   assert.deepEqual(highlightParts('', []), [{ text: '', match: false }]);
+  // The API counts spans in UTF-16 code units, as JavaScript strings do: an
+  // emoji before the match counts twice, and the mark still covers the match.
+  assert.deepEqual(highlightParts('## 🚀 Quick start with httpx', [[23, 28]]).filter((part) => part.match), [{ text: 'httpx', match: true }]);
   assert.equal(searchSummary({ files: 1, lines: 3, more: false }), '1 file · 3 matching lines');
   assert.equal(searchSummary({ files: 25, lines: 80, more: true }), 'First 25 files · 80 matching lines');
 });

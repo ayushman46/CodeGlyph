@@ -13,6 +13,8 @@ Every test is offline and uses a temporary embedded libSQL database seeded
 through the real chunker, so sections overlap and split as in production.
 """
 
+import random
+import re
 import tempfile
 import unittest
 import uuid
@@ -43,6 +45,17 @@ USER = "nav-user"
 def numbered(total: int, lines: dict[int, str], filler: str = "    value_{n} = {n}") -> str:
     """A file of ``total`` lines with ``lines`` at fixed line numbers."""
     return "\n".join(lines.get(number, filler.format(n=number)) for number in range(1, total + 1)) + "\n"
+
+
+def brute_force(files: dict[str, str], needles: list[str]) -> dict[str, list[int]]:
+    """Every line of every file that contains all ``needles`` (whitespace-insensitive), read straight from the text."""
+    patterns = [re.compile(r"\s+".join(re.escape(part) for part in needle.split()), re.IGNORECASE) for needle in needles]
+    found: dict[str, list[int]] = {}
+    for path, text in files.items():
+        lines = [number for number, line in enumerate(text.split("\n"), 1) if all(p.search(line) for p in patterns)]
+        if lines:
+            found[path] = lines
+    return found
 
 
 # Laid out like pallets/click src/click/types.py: the lines the customer
@@ -311,6 +324,99 @@ class CodeSearchTests(NavigationStoreCase):
         results = await retriever.search_code(self.store, repo_id, "_set_timeout", limit=5)
         self.assertEqual(results[0]["file_path"], "httpx/_client.py")
         self.assertEqual(results[0]["start_line"], 584)
+
+    async def test_a_phrase_deep_in_a_long_file_is_found(self):
+        # Like httpx tests/models/whatwg.json: 36 sections that all mention
+        # "in" and "base" apart, and one line, past section 30, that has
+        # them together. Another file has both words on one line, apart.
+        files = {
+            "tests/models/whatwg.json": numbered(4000, {3900: '  "# Credentials in base",'}, filler="  \"base_{n}\": \"in\","),
+            "httpx/_urls.py": "def join(base, url):\n    return base if url in schemes else url\n",
+        }
+        repo = await self.add_repo("httpx", files)
+        self.assertGreater(repo[1], 30)
+        for query, mode in (("in base", "phrase"), ('"in base"', "exact")):
+            found = await self.search(repo, query)
+            self.assertEqual(found["mode"], mode, query)
+            self.assertEqual([(r["file_path"], [m["line"] for m in r["matches"]]) for r in found["results"]],
+                             [("tests/models/whatwg.json", [3900])], query)
+            self.assertFalse(found["more_files"])
+
+    async def test_common_word_phrases_agree_with_reading_every_line(self):
+        # Long files of common words (27 sections each, all of them read):
+        # each phrase is on a few lines, while its words are in every section.
+        rng = random.Random(3)
+        vocabulary = ["if", "not", "in", "base", "return", "self", "import", "os", "value", "name", "path", "data",
+                      "for", "with", "none", "is", "and", "or", "type", "key"]
+        files = {
+            f"pkg/module_{n}.py": "\n".join(f"    # {' '.join(rng.sample(vocabulary, 4))}" for _ in range(3000)) + "\n"
+            for n in range(12)
+        }
+        files["pkg/small.py"] = "def run(base):\n    if not base:\n        return self.base in path\n"
+        repo = await self.add_repo("words", files)
+        for query in ("if not", "in base", "return self", "import os", "key type", '"not in"', "data path name"):
+            found = await self.search(repo, query)
+            truth = brute_force(files, code_search.parse_code_query(query).needles(found["mode"]))
+            if found["mode"] == "all_words":
+                self.assertEqual(brute_force(files, code_search.parse_code_query(query).needles("phrase")), {}, query)
+            self.assertEqual({r["file_path"] for r in found["results"]}, set(truth), query)
+            self.assertFalse(found["more_files"], query)
+            for result in found["results"]:
+                lines = [m["line"] for m in result["matches"]]
+                expected = truth[result["file_path"]]
+                # Lines in order from the top of the file; a long file may
+                # stop early, and says so.
+                self.assertEqual(lines, expected[: len(lines)], f"{query} {result['file_path']}")
+                if not result["truncated"]:
+                    self.assertEqual(result["match_count"], len(expected), f"{query} {result['file_path']}")
+
+    async def test_search_reads_on_until_a_line_matches(self):
+        # Every section has both words, on separate lines; only the last
+        # section of one file has them on one line. A small read budget
+        # must not end the search with "no matches".
+        filler = numbered(1200, {}, filler="    alpha_{n} = 1\n    beta_{n} = 2")
+        files = {f"pkg/module_{n}.py": filler for n in range(4)}
+        files["pkg/zz_last.py"] = numbered(1200, {1190: "    beta = alpha"}, filler="    alpha_{n} = 1\n    beta_{n} = 2")
+        repo = await self.add_repo("budget", files)
+        with patch.object(code_search, "_READ_ROWS_TOTAL", 8):
+            found = await self.search(repo, "alpha beta")
+        self.assertEqual(found["mode"], "all_words")
+        self.assertEqual([(r["file_path"], [m["line"] for m in r["matches"]]) for r in found["results"]],
+                         [("pkg/zz_last.py", [2379])])
+
+    async def test_unread_candidate_files_keep_more_files(self):
+        files = {f"pkg/module_{n}.py": "def handler():\n    return marker_call()\n" for n in range(6)}
+        repo_id, count = await self.add_repo("many", files)
+        with patch.object(code_search, "_READ_ROWS_TOTAL", 2), patch.object(code_search, "_ROW_BATCH", 1):
+            found = await code_search.search_code(self.store, repo_id, "marker_call", limit=5, chunk_count=count)
+        self.assertEqual(len(found["results"]), 2)
+        self.assertTrue(found["more_files"])
+
+    async def test_a_name_typed_with_capitals_ranks_its_exact_declaration_first(self):
+        files = {
+            "httpx/_client.py": "class Client:\n    @property\n    def headers(self) -> Headers:\n        return self._headers\n",
+            "httpx/_models.py": "class Headers(typing.MutableMapping[str, str]):\n    pass\n",
+        }
+        repo = await self.add_repo("httpx", files)
+        upper = await self.search(repo, "Headers")
+        self.assertEqual([r["file_path"] for r in upper["results"]], ["httpx/_models.py", "httpx/_client.py"])
+        self.assertEqual([(m["line"], m["definition"]) for m in upper["results"][0]["matches"]], [(1, True)])
+        # "def headers" declares another name, as far as "Headers" goes.
+        self.assertEqual([(m["line"], m["definition"]) for m in upper["results"][1]["matches"]], [(3, False), (4, False)])
+        self.assertEqual(upper["results"][1]["definitions"], 0)
+        # Typed in lower case, both declare it; the exact case ranks first.
+        lower = await self.search(repo, "headers")
+        self.assertEqual([r["file_path"] for r in lower["results"]], ["httpx/_client.py", "httpx/_models.py"])
+        self.assertEqual([r["matches"][0]["definition"] for r in lower["results"]], [True, True])
+
+    async def test_spans_count_like_javascript_strings(self):
+        repo = await self.add_repo("httpx", {"README.md": "# HTTPX\n\n## 🚀 Quick start with httpx\n"})
+        match = (await self.search(repo, "httpx"))["results"][0]["matches"]
+        line = next(item for item in match if item["line"] == 3)
+        start, end = line["spans"][0]
+        # JavaScript indexes UTF-16 code units: the rocket counts twice.
+        self.assertEqual(line["text"].encode("utf-16-le")[start * 2: end * 2].decode("utf-16-le"), "httpx")
+        self.assertEqual((start, end), (23, 28))
 
 
 class QueryParsingTests(unittest.TestCase):

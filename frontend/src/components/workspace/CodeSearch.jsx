@@ -69,7 +69,7 @@ const FileResult = ({ result, defaultOpen, onOpenLine }) => {
           )}
           {(all || matches.length <= LINES_SHOWN) && result.truncated && (
             <li className="ml-9 mt-0.5 text-[11.5px] text-ink-3">
-              {count > matches.length ? `Listing the first ${matches.length} of ${count} lines. ` : 'This file has more matches than were read. '}
+              {count > matches.length ? `Listing the first ${matches.length} of ${count} lines. ` : 'Only part of this long file was searched, so it may have more matching lines. '}
               <button type="button" onClick={() => onOpenLine(result.file_path, null)} className="font-medium text-accent-strong hover:underline">Open the file</button>
             </li>
           )}

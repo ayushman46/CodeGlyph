@@ -3,7 +3,9 @@
 * ``search_code`` returns every line that contains the query, one entry per
   file. Quoted phrases match exactly; other words must all be on the line,
   and when they also appear together as typed, only those lines are shown.
-  Lines that declare a searched name come first.
+  Lines that declare a searched name come first (the name as typed before
+  the same name in another case). Match spans are UTF-16 offsets, so
+  ``text.slice(start, end)`` in JavaScript is the matched text.
 * ``find_files`` ranks indexed paths for a typed name or partial path, and
   ``list_directory`` lists one folder for the file tree.
 * ``find_symbols`` finds declarations by name and the exact line that
@@ -23,8 +25,8 @@ import json
 import logging
 import re
 import time
-from collections import OrderedDict
-from dataclasses import dataclass
+from collections import OrderedDict, deque
+from dataclasses import dataclass, field
 
 from ingest.chunker import SYMBOL_REGEX
 
@@ -35,11 +37,16 @@ MAX_QUERY_CHARACTERS = 200
 # recall, including matches inside longer identifiers); larger ones use the
 # full-text index and fall back to substring only when it finds nothing.
 SUBSTRING_SCAN_MAX_CHUNKS = 4000
-# Candidate sections considered per search (metadata only), and how many of
-# them are read in full. Files are chosen before their text is read.
+# Candidate sections considered per full-text search (metadata only; the
+# substring scan of a small repository may consider all of its sections).
 _CANDIDATE_ROWS = 2000
+# Candidate text is read in rounds: a few sections of each file until enough
+# files have a matching line, then more of the best files' sections for
+# their full line lists, up to these totals. A search with no matching line
+# yet reads on through every candidate, so "no matches" always means none.
+_FIRST_READ_ROWS = 4
 _READ_ROWS_PER_FILE = 30
-_READ_ROWS_TOTAL = 300
+_READ_ROWS_TOTAL = 600
 MAX_LINES_PER_FILE = 50
 _LINE_TEXT_CHARACTERS = 240
 _ROW_BATCH = 100
@@ -242,11 +249,25 @@ class CodeQuery:
 
     @property
     def identifiers(self) -> set[str]:
-        """Names a declaration line may declare (case-insensitive)."""
+        """Names a declaration line may declare, as typed (see ``declaration_strength``)."""
         names: set[str] = set()
         for needle in (*self.phrases, *self.words):
-            names.update(name.lower() for name in _IDENTIFIER.findall(needle))
+            names.update(_IDENTIFIER.findall(needle))
         return names
+
+
+def declaration_strength(name: str, identifiers: set[str]) -> int:
+    """How surely declaring ``name`` defines what was searched for.
+
+    2: a searched name exactly as typed. 1: the same name in another case,
+    only when that name was typed all in lower case (``headers`` also finds
+    ``class Headers``, but ``Headers`` does not make ``def headers`` a
+    definition). 0: neither.
+    """
+    if name in identifiers:
+        return 2
+    low = name.lower()
+    return 1 if any(identifier == low for identifier in identifiers) else 0
 
 
 def parse_code_query(raw: str) -> CodeQuery:
@@ -296,8 +317,17 @@ def match_line(line: str, patterns: list[re.Pattern]) -> tuple[list[tuple[int, i
     return merged, whole
 
 
+def _utf16_offset(text: str, index: int) -> int:
+    """A code point offset into ``text`` as a JavaScript string index (UTF-16 code units)."""
+    return index + sum(1 for character in text[:index] if ord(character) > 0xFFFF)
+
+
 def _display(line: str, spans: list[tuple[int, int]]) -> tuple[str, list[list[int]]]:
-    """The line without its indentation, cut to a window around the first match."""
+    """The line without its indentation, cut to a window around the first match.
+
+    Spans are UTF-16 offsets into the returned text: an emoji before the
+    match counts twice, as it does in the browser.
+    """
     stripped = line.rstrip()
     offset = len(stripped) - len(stripped.lstrip())
     text = stripped[offset:]
@@ -313,7 +343,7 @@ def _display(line: str, spans: list[tuple[int, int]]) -> tuple[str, list[list[in
             (start - begin + len(prefix), min(end - begin, len(window)) + len(prefix))
             for start, end in shifted if begin <= start < begin + len(window)
         ]
-    return text, [[start, end] for start, end in shifted if end > start]
+    return text, [[_utf16_offset(text, start), _utf16_offset(text, end)] for start, end in shifted if end > start]
 
 
 def _escape_like(value: str) -> str:
@@ -339,29 +369,52 @@ def _symbol_names(value) -> list[str]:
     return [str(item) for item in parsed] if isinstance(parsed, list) else []
 
 
-async def _candidate_rows(store, repo_id: str, needles: list[str], staging_prefix: str | None, source: str) -> list[dict]:
-    """Section metadata (no text) that may hold every needle, best first."""
+# Tabs, no-break spaces and runs of spaces read as one space, as ``\s+``
+# does in the line check: each pass halves a run of spaces, so four passes
+# collapse runs of up to 16.
+_ONE_SPACED = (
+    "replace(replace(replace(replace(replace(replace(c.content, char(9), ' '), char(160), ' '), "
+    "'  ', ' '), '  ', ' '), '  ', ' '), '  ', ' ')"
+)
+
+
+def _substring_filter(needle: str) -> tuple[str, list[str]]:
+    """SQL keeping the sections that contain ``needle`` as a whole (its words together, in order)."""
+    words = [_escape_like(word) for word in needle.split()]
+    if len(words) == 1:
+        return " AND c.content LIKE ? ESCAPE '\\'", [f"%{words[0]}%"]
+    # The words in order anywhere (cheap), then side by side once whitespace is normalised.
+    return (
+        f" AND c.content LIKE ? ESCAPE '\\' AND {_ONE_SPACED} LIKE ? ESCAPE '\\'",
+        [f"%{'%'.join(words)}%", f"%{' '.join(words)}%"],
+    )
+
+
+async def _candidate_rows(store, repo_id: str, needles: list[str], staging_prefix: str | None,
+                          source: str) -> tuple[list[dict], bool]:
+    """Section metadata (no text) that may hold every needle, best first, and whether the row cap cut it short."""
     stage_sql, stage_args = ("", []) if not staging_prefix else (" AND c.id NOT LIKE ?", [f"{staging_prefix}%"])
     columns = "c.rowid AS row_id, c.file_path, c.start_line, c.language, c.symbols"
     if source == "fts":
         phrases = [phrase for phrase in (_fts_phrase(needle) for needle in needles) if phrase]
         if not phrases:
-            return []
-        return await store.fetch_all(
+            return [], False
+        rows = await store.fetch_all(
             f"SELECT {columns} FROM chunks_fts JOIN chunks c ON c.rowid = chunks_fts.rowid "
             f"WHERE chunks_fts MATCH ? AND c.repo_id = ?{stage_sql} "
             "ORDER BY bm25(chunks_fts, 1.0, 4.0) ASC LIMIT ?",
             [" AND ".join(phrases), repo_id, *stage_args, _CANDIDATE_ROWS],
         )
-    parts = list(dict.fromkeys(part for needle in needles for part in needle.split()))
-    if not parts:
-        return []
-    likes = "".join(" AND c.content LIKE ? ESCAPE '\\'" for _ in parts)
-    return await store.fetch_all(
-        f"SELECT {columns} FROM chunks c WHERE c.repo_id = ?{likes}{stage_sql} "
+        return rows, len(rows) >= _CANDIDATE_ROWS
+    filters = [_substring_filter(needle) for needle in dict.fromkeys(needles) if needle.split()]
+    if not filters:
+        return [], False
+    rows = await store.fetch_all(
+        f"SELECT {columns} FROM chunks c WHERE c.repo_id = ?{''.join(sql for sql, _args in filters)}{stage_sql} "
         "ORDER BY c.file_path, c.start_line LIMIT ?",
-        [repo_id, *[f"%{_escape_like(part)}%" for part in parts], *stage_args, _CANDIDATE_ROWS],
+        [repo_id, *[arg for _sql, args in filters for arg in args], *stage_args, SUBSTRING_SCAN_MAX_CHUNKS],
     )
+    return rows, len(rows) >= SUBSTRING_SCAN_MAX_CHUNKS
 
 
 async def _read_rows(store, row_ids: list[int]) -> dict[int, dict]:
@@ -377,46 +430,46 @@ async def _read_rows(store, row_ids: list[int]) -> dict[int, dict]:
     return found
 
 
-def _choose_files(rows: list[dict], identifiers: set[str], limit: int, source: str) -> tuple[list[tuple[str, list[dict]]], bool]:
-    """Files worth reading, best first, and whether more were left out."""
+@dataclass
+class _FileScan:
+    """One candidate file: its sections still to read (in reading order), those read, and its result so far."""
+
+    path: str
+    language: str | None
+    pending: list[dict]
+    rows: list[dict] = field(default_factory=list)
+    result: dict | None = None
+
+
+def _candidate_files(rows: list[dict], identifiers: set[str], source: str) -> list[_FileScan]:
+    """Candidate files, most promising first, before any text is read."""
     files: OrderedDict[str, list[dict]] = OrderedDict()
     for row in rows:
         path = str(row.get("file_path") or "")
         if path:
             files.setdefault(path, []).append(row)
-
-    def prescore(item: tuple[int, tuple[str, list[dict]]]):
-        order, (path, sections) = item
-        declares = any(name.lower() in identifiers for row in sections for name in _symbol_names(row.get("symbols")))
+    ranked: list[tuple[tuple, _FileScan]] = []
+    for order, (path, sections) in enumerate(files.items()):
+        strengths = {
+            int(row["row_id"]): max((declaration_strength(name, identifiers) for name in _symbol_names(row.get("symbols"))), default=0)
+            for row in sections
+        }
+        # Sections that declare a searched name first (their lines rank the
+        # file), then the rest from the top of the file.
+        pending = sorted(sections, key=lambda row: (-strengths[int(row["row_id"])], int(row.get("start_line") or 0)))
+        language = next((row.get("language") for row in sections if row.get("language")), None)
         # FTS rows arrive best first; substring rows arrive by path, so the
         # number of matching sections stands in for relevance.
         relevance = order if source == "fts" else -len(sections)
-        return (0 if declares else 1, is_support_path(path), relevance)
-
-    ranked = [item for _order, item in sorted(enumerate(files.items()), key=prescore)]
-    wanted = max(limit + 10, limit * 2)
-    chosen: list[tuple[str, list[dict]]] = []
-    budget = _READ_ROWS_TOTAL
-    for path, sections in ranked[:wanted]:
-        if budget <= 0:
-            break
-        take = sorted(sections, key=lambda row: int(row.get("start_line") or 0))[: min(_READ_ROWS_PER_FILE, budget)]
-        budget -= len(take)
-        chosen.append((path, take if len(take) == len(sections) else [*take, {"_capped": True}]))
-    return chosen, len(ranked) > len(chosen)
+        ranked.append(((-max(strengths.values()), is_support_path(path), relevance), _FileScan(path, language, pending)))
+    ranked.sort(key=lambda item: item[0])
+    return [scan for _key, scan in ranked]
 
 
-def _scan_file(path: str, sections: list[dict], texts: dict[int, dict], patterns: list[re.Pattern],
-               identifiers: set[str]) -> dict | None:
-    capped = any(section.get("_capped") for section in sections)
+def _scan_file(scan: _FileScan, patterns: list[re.Pattern], identifiers: set[str]) -> dict | None:
+    """The file's matching lines in the sections read so far, or None when there are none."""
     seen: dict[int, dict] = {}
-    language = next((section.get("language") for section in sections if section.get("language")), None)
-    for section in sections:
-        if section.get("_capped"):
-            continue
-        row = texts.get(int(section["row_id"]))
-        if not row:
-            continue
+    for row in scan.rows:
         start = int(row.get("start_line") or 1)
         end = int(row.get("end_line") or start)
         for offset, line in enumerate(str(row.get("content") or "").split("\n")[: max(1, end - start + 1)]):
@@ -428,27 +481,100 @@ def _scan_file(path: str, sections: list[dict], texts: dict[int, dict], patterns
                 continue
             spans, whole = found
             declared = line_declaration(line)
-            definition = bool(declared and declared[0].lower() in identifiers and whole)
+            strength = declaration_strength(declared[0], identifiers) if declared and whole else 0
             text, display_spans = _display(line, spans)
-            seen[number] = {"line": number, "text": text, "spans": display_spans, "definition": definition, "_whole": whole}
+            seen[number] = {
+                "line": number, "text": text, "spans": display_spans, "definition": strength > 0,
+                "_strength": strength, "_whole": whole,
+            }
     if not seen:
         return None
-    # Declarations of the searched name first, then every other line in order.
-    ordered = sorted(seen.values(), key=lambda match: (not match["definition"], match["line"]))
+    # Declarations of the searched name first (as typed, then in another
+    # case), then every other line in order.
+    ordered = sorted(seen.values(), key=lambda match: (-match["_strength"], match["line"]))
     shown = ordered[:MAX_LINES_PER_FILE]
-    whole = any([match.pop("_whole") for match in ordered])
     return {
-        "file_path": path,
-        "language": language,
+        "file_path": scan.path,
+        "language": scan.language,
         "start_line": shown[0]["line"],
         "end_line": max(match["line"] for match in shown),
         "matches": shown,
         "match_count": len(ordered),
         "definitions": sum(1 for match in ordered if match["definition"]),
-        # More lines than listed, or sections left unread in a huge file.
-        "truncated": len(ordered) > len(shown) or capped,
-        "_whole": whole,
+        # More lines than listed, or sections of the file left unread.
+        "truncated": len(ordered) > len(shown) or bool(scan.pending),
+        "_strength": max(match["_strength"] for match in ordered),
+        "_whole": any(match["_whole"] for match in ordered),
     }
+
+
+def _result_rank(result: dict) -> tuple:
+    return (
+        -result["_strength"],
+        is_support_path(result["file_path"]),
+        0 if result["_whole"] else 1,
+        -min(result["match_count"], MAX_LINES_PER_FILE),
+        len(result["file_path"]),
+        result["file_path"],
+    )
+
+
+async def _scan_candidates(store, scans: list[_FileScan], patterns: list[re.Pattern], identifiers: set[str], *,
+                           limit: int) -> tuple[list[dict], bool]:
+    """The candidate files that have a matching line, best first, and whether candidate files were left unread.
+
+    A few sections of each file are read, best files first, until twice
+    ``limit`` files match (enough to rank them) or the candidates run out. A
+    file whose first sections have no matching line is read further later.
+    Reading stops at ``_READ_ROWS_TOTAL`` sections once some file matched;
+    before that it goes on through every candidate. The files to be shown
+    then read on for their other matching lines.
+    """
+    wanted = max(limit + 10, limit * 2)
+    queue = deque(scans)
+    matched: list[_FileScan] = []
+    spent = 0
+
+    async def read(plan: list[tuple[_FileScan, list[dict]]]) -> None:
+        nonlocal spent
+        texts = await _read_rows(store, [int(row["row_id"]) for _scan, take in plan for row in take])
+        spent += sum(len(take) for _scan, take in plan)
+        for scan, take in plan:
+            scan.rows.extend(texts[int(row["row_id"])] for row in take if int(row["row_id"]) in texts)
+            scan.result = _scan_file(scan, patterns, identifiers)
+
+    def rank(scan: _FileScan) -> tuple:
+        return _result_rank(scan.result)
+
+    while queue and len(matched) < wanted and (spent < _READ_ROWS_TOTAL or not matched):
+        plan: list[tuple[_FileScan, list[dict]]] = []
+        planned = 0
+        while queue and planned < _ROW_BATCH and len(matched) + len(plan) < wanted:
+            scan = queue.popleft()
+            take, scan.pending = scan.pending[:_FIRST_READ_ROWS], scan.pending[_FIRST_READ_ROWS:]
+            plan.append((scan, take))
+            planned += len(take)
+        await read(plan)
+        for scan, _take in plan:
+            if scan.result:
+                matched.append(scan)
+            elif scan.pending:
+                queue.append(scan)
+    matched.sort(key=rank)
+    while spent < _READ_ROWS_TOTAL:
+        plan, planned = [], 0
+        for scan in matched[:limit]:
+            room = min(_READ_ROWS_PER_FILE - len(scan.rows), _ROW_BATCH - planned, _READ_ROWS_TOTAL - spent - planned)
+            if room <= 0 or not scan.pending:
+                continue
+            take, scan.pending = scan.pending[:room], scan.pending[room:]
+            plan.append((scan, take))
+            planned += len(take)
+        if not plan:
+            break
+        await read(plan)
+        matched.sort(key=rank)
+    return [scan.result for scan in matched], bool(queue)
 
 
 async def _search_once(store, repo_id: str, query: CodeQuery, mode: str, *, limit: int, staging_prefix: str | None,
@@ -458,32 +584,25 @@ async def _search_once(store, repo_id: str, query: CodeQuery, mode: str, *, limi
     identifiers = query.identifiers
     for source in sources:
         try:
-            rows = await _candidate_rows(store, repo_id, needles, staging_prefix, source)
+            rows, capped = await _candidate_rows(store, repo_id, needles, staging_prefix, source)
         except Exception as error:
             # An index built before chunks_fts existed: fall through to the scan.
             logger.debug("Code search %s candidates unavailable (%s)", source, type(error).__name__)
             continue
         if not rows:
             continue
-        chosen, more = _choose_files(rows, identifiers, limit, source)
-        texts = await _read_rows(store, [int(row["row_id"]) for _path, sections in chosen for row in sections if "row_id" in row])
-        results = [
-            result for result in (_scan_file(path, sections, texts, patterns, identifiers) for path, sections in chosen)
-            if result
-        ]
+        results, unread = await _scan_candidates(
+            store, _candidate_files(rows, identifiers, source), patterns, identifiers, limit=limit,
+        )
         if not results:
             continue
-        results.sort(key=lambda result: (
-            0 if result["definitions"] else 1,
-            is_support_path(result["file_path"]),
-            0 if result["_whole"] else 1,
-            -min(result["match_count"], MAX_LINES_PER_FILE),
-            len(result["file_path"]),
-            result["file_path"],
-        ))
+        results = results[: limit + 1]
         for result in results:
-            result.pop("_whole", None)
-        return results[:limit], more or len(results) > limit
+            for key in ("_strength", "_whole"):
+                result.pop(key, None)
+                for match in result["matches"]:
+                    match.pop(key, None)
+        return results[:limit], len(results) > limit or unread or capped
     return [], False
 
 
