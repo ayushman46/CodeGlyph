@@ -642,7 +642,7 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
         inert={covered ? '' : undefined}
       >
         {/* Header: one row of controls; status and links underneath. */}
-        <div className="shrink-0 border-b border-line bg-canvas px-4 py-2.5 sm:px-6 sm:py-3">
+        <div className="@container shrink-0 border-b border-line bg-canvas px-4 py-2.5 sm:px-6 sm:py-3">
           <div className="flex items-center gap-2 sm:gap-3">
             <div className="min-w-0 flex-1">
               <div className="flex min-w-0 items-center gap-2">

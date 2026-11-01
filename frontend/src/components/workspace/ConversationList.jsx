@@ -222,13 +222,14 @@ const ConversationList = ({ repoName, onNewChat, onOpen }) => {
   return (
     <>
       <Popover open={open} onOpenChange={onOpenChange}>
+        {/* Icon only in a narrow header (a phone, or beside a docked panel), so the repository name keeps its room. */}
         <PopoverTrigger
-          render={<Button variant="ghost" size="sm" className="max-sm:w-9 max-sm:px-0" />}
+          render={<Button variant="ghost" size="sm" className="@max-2xl:w-9 @max-2xl:px-0" />}
           aria-label="Conversation history"
           title="Conversation history"
         >
           <History className="h-4 w-4 shrink-0" aria-hidden="true" />
-          <span className="max-sm:sr-only">History</span>
+          <span className="@max-2xl:sr-only">History</span>
         </PopoverTrigger>
         <PopoverPopup align="end" aria-labelledby={titleId} className="flex w-[22rem] max-w-[calc(100vw-2rem)] flex-col overflow-hidden p-0">
           <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2">
