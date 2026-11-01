@@ -113,6 +113,48 @@ class LegacyMigrationTests(unittest.TestCase):
             finally:
                 run(store.close())
 
+    def test_a_run_that_stopped_after_adding_the_column_completes_on_the_next_start(self):
+        # Writes over HTTP are not retried when their outcome is unknown, so
+        # the column can exist while the rest of the file never ran. That
+        # used to fail every start with "duplicate column name".
+        with tempfile.TemporaryDirectory() as directory:
+            store = TursoStore(f"file:{Path(directory) / 'partial.db'}", "local-test-token")
+            try:
+                before = tuple(item for item in database.MIGRATIONS if item[0] != "07_conversations.sql")
+                with patch.object(database, "MIGRATIONS", before):
+                    run(apply_migrations(store))
+                run(seed_repo(store))
+                run(store.execute(
+                    "INSERT INTO chat_messages (id, repo_id, user_id, role, content, created_at) VALUES ('m1', ?, ?, 'user', ?, ?)",
+                    [REPO_ID, USER, "How does login work?", "2026-10-01T09:00:00+00:00"],
+                ))
+                run(store.execute("ALTER TABLE chat_messages ADD COLUMN conversation_id TEXT"))
+
+                self.assertEqual(run(apply_migrations(store)), ["07_conversations.sql"])
+                conversation = run(store.fetch_one("SELECT id, title FROM conversations"))
+                self.assertEqual(conversation["title"], "How does login work?")
+                self.assertEqual(run(store.fetch_one("SELECT conversation_id FROM chat_messages"))["conversation_id"], conversation["id"])
+                self.assertEqual(run(apply_migrations(store)), [])
+            finally:
+                run(store.close())
+
+    def test_a_database_without_the_conversation_migration_is_reported_at_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = TursoStore(f"file:{Path(directory) / 'old.db'}", "local-test-token")
+            database.reset_schema_verification()
+            try:
+                before = tuple(item for item in database.MIGRATIONS if item[0] != "07_conversations.sql")
+                with patch.object(database, "MIGRATIONS", before):
+                    run(apply_migrations(store))
+                with patch.object(database, "get_turso_store", return_value=store), \
+                     patch.object(database.settings, "auto_migrate", False), \
+                     self.assertRaises(database.DatabaseConfigurationError) as raised:
+                    run(database.assert_turso_schema())
+                self.assertIn("missing required tables: conversations", str(raised.exception))
+            finally:
+                database.reset_schema_verification()
+                run(store.close())
+
 
 class ConversationApiTests(EndpointTestCase):
     def ask(self, question, *, conversation_id=None, new=False, deltas=("An answer.",), calls=None, retrieved=(AUTH_CHUNK,)):

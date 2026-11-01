@@ -10,10 +10,10 @@
 
 PRAGMA foreign_keys = ON;
 
--- The only statement here that is not idempotent, so it runs first: if it
--- fails, nothing else has changed and the next start applies the file again.
--- (If a run stops after it, re-running the file reports "duplicate column
--- name: conversation_id"; apply the remaining statements by hand.)
+-- Runs first: if it fails, nothing else has changed. If a run stops after
+-- it, the next start applies the file again and the runner skips this
+-- statement because the column exists (backend/database.py); the rest of
+-- the file is idempotent.
 ALTER TABLE chat_messages ADD COLUMN conversation_id TEXT;
 
 CREATE TABLE IF NOT EXISTS conversations (
