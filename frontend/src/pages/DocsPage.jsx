@@ -125,8 +125,10 @@ const SECTIONS = [
       {
         type: 'list',
         items: [
-          ['Instant code search', 'Search the indexed code by keyword and see the matching files and lines right away.'],
-          ['Repository overview', 'See the languages, a folder map and suggested questions to start with.'],
+          ['Exact code search', 'Every line that contains the text, one entry per file with declarations first. Quote a phrase ("def convert") to match it exactly; several words must all be on the line. Click a line to open the viewer there.'],
+          ['Jump to a file or symbol', 'Press ⌘K (Ctrl+K) and type a file name, a partial path or a declaration such as ParamType; Enter opens the viewer at its exact line. In the composer, @ suggests files the same way.'],
+          ['Repository overview', 'See the languages, a browsable file tree (source folders first) and suggested questions to start with.'],
+          ['File viewer', 'Names the class or function the current line sits in, lists an outline to jump between declarations, and shows Markdown rendered with a Source view. The page URL keeps the file and line (?file=…&line=…), so copying it shares the exact spot.'],
           ['Change-impact analysis', 'Pick a file to see which files import it, before you change it.'],
         ],
       },
@@ -184,7 +186,7 @@ const SECTIONS = [
       {
         type: 'shortcuts',
         items: [
-          [[['⌘', 'K'], ['Ctrl', 'K']], 'Open the command palette: switch repository, add one, or jump to a page'],
+          [[['⌘', 'K'], ['Ctrl', 'K']], 'Open the command palette: jump to a file or symbol, switch repository, add one, or go to a page'],
           [[['Enter']], 'Send your question (on a touch keyboard, use ⌘ or Ctrl with Enter)'],
           [[['Shift', 'Enter']], 'Insert a new line'],
           [[['↑']], 'Recall your last question when the box is empty'],
