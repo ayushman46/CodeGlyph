@@ -22,6 +22,7 @@ from api.repos_router import router as repos_router
 from api.billing_router import router as billing_router
 from api.github_router import router as github_router
 from api.explore_router import router as explore_router
+from api.sharing_router import router as sharing_router
 from agent.nemotron import close_async_client
 from database import DatabaseConfigurationError, assert_turso_schema, get_turso_store
 from frontend_static import HashedAssets, revalidated_file
@@ -221,6 +222,7 @@ app.include_router(repos_router, prefix="/api")
 app.include_router(billing_router, prefix="/api")
 app.include_router(github_router, prefix="/api")
 app.include_router(explore_router, prefix="/api")
+app.include_router(sharing_router, prefix="/api")
 
 
 @app.middleware("http")

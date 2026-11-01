@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from agent.code_edit import CodeEditValidationError, normalise_repository_path
 from agent.editor import language_for, reconstruct_indexed_file
 from api.auth import get_current_user
-from api.repository_state import fetch_owned_repository, public_view, raise_storage_error
+from api.repository_state import fetch_accessible_repository, public_view, raise_storage_error
 from config import settings
 from database import assert_turso_schema, get_turso_store
 from github.github_client import GitHubAPIError, fetch_raw_file
@@ -755,7 +755,7 @@ async def repository_overview(repo_name: str, current_user=Depends(get_current_u
     try:
         await assert_turso_schema()
         store = get_turso_store()
-        repo = await fetch_owned_repository(store, current_user.id, repo_name)
+        repo = await fetch_accessible_repository(store, current_user.id, repo_name)
         repo_map = await build_repo_map(store, repo["id"])
         facts: dict | None = None
         try:
@@ -791,7 +791,7 @@ async def repository_search(
     try:
         await assert_turso_schema()
         store = get_turso_store()
-        repo = await fetch_owned_repository(store, current_user.id, repo_name)
+        repo = await fetch_accessible_repository(store, current_user.id, repo_name)
         if not repo["queryable"]:
             return {
                 "results": [], "query": q, "searchable": False,
@@ -856,7 +856,7 @@ async def repository_file(
     try:
         await assert_turso_schema()
         store = get_turso_store()
-        repo = await fetch_owned_repository(store, current_user.id, repo_name)
+        repo = await fetch_accessible_repository(store, current_user.id, repo_name)
         staging = repo.get("staging_prefix")
         # A refresh's replacement rows stay hidden until the swap, so a file
         # that only exists in the unpublished version is not served.

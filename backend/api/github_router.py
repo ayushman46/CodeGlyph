@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from agent.code_edit import EditingAuthorizationError, git_blob_sha, verify_edit_ticket
 from api.auth import get_current_user
+from api.repository_state import resolve_repository_access
 from config import get_editing_ticket_secret, settings
 from database import DatabaseConfigurationError, get_turso_store
 from github.github_client import (
@@ -599,9 +600,7 @@ async def github_file(
             # only creating the branch and pull request does.
             if error.status_code != 401:
                 raise
-        repo = await store.fetch_one("SELECT github_url FROM repos WHERE user_id = ? AND repo_name = ?", [current_user.id, repo_name])
-        if not repo:
-            raise HTTPException(status_code=404, detail="Repository not found.")
+        repo = await resolve_repository_access(store, current_user.id, repo_name, permission="edit")
         owner, name = _parse_github_url(str(repo["github_url"]))
         if not token:
             data = await fetch_raw_file(owner, name, path, ref="HEAD", max_bytes=settings.github_editor_max_bytes)
@@ -656,9 +655,7 @@ async def push_pr(payload: PushPRRequest, current_user=Depends(get_current_user)
         target_branch = validate_branch_name(
             payload.branch_name.strip() or f"codebase-intel/patch-{uuid4().hex[:10]}", require_prefix=True,
         )
-        repo_row = await store.fetch_one("SELECT id, github_url FROM repos WHERE repo_name = ? AND user_id = ?", [payload.repo_name, current_user.id])
-        if not repo_row:
-            raise HTTPException(status_code=404, detail="Repository not found.")
+        repo_row = await resolve_repository_access(store, current_user.id, payload.repo_name, permission="edit")
         try:
             for file_path in file_paths:
                 verify_edit_ticket(
@@ -850,9 +847,7 @@ async def pull_request_status(
         store = get_turso_store()
         await _ensure_github_table(store)
         token, _ = await _load_token(store, current_user.id)
-        repo = await store.fetch_one("SELECT github_url FROM repos WHERE user_id = ? AND repo_name = ?", [current_user.id, repo_name])
-        if not repo:
-            raise HTTPException(status_code=404, detail="Repository not found.")
+        repo = await resolve_repository_access(store, current_user.id, repo_name)
         owner, name = _parse_github_url(str(repo["github_url"]))
         try:
             return await get_pull_request_status(token, owner, name, pr_number)
