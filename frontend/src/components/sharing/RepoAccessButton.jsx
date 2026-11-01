@@ -31,7 +31,7 @@ export const AccessDialog = ({ repo, open, onClose, stay = false }) => {
       await leaveRepository(repo.repo_name);
       onClose();
       if (!stay) navigate('/app', { replace: true });
-      toast(`You left ${repo.repo_name}`, { description: `Ask ${owner} for a new invite link to rejoin.` });
+      toast(`You left ${repo.repo_name}`, { description: `To rejoin, open an invite link from ${owner} that still works.` });
       await fetchRepos();
     } catch (leaveError) {
       setError(errorMessage(leaveError, 'You could not leave this repository. Try again.'));
@@ -70,7 +70,7 @@ export const AccessDialog = ({ repo, open, onClose, stay = false }) => {
         <p className="text-ink-3">Renaming, re-indexing, deleting and sharing are up to {owner}.</p>
         {confirming && (
           <p className="rounded-xl bg-danger-soft px-3 py-2.5 text-danger">
-            Leave {repo.repo_name}? It disappears from your workspace, and you need a new invite link to come back.
+            Leave {repo.repo_name}? It disappears from your workspace. An invite link from {owner} that still works brings you back; any role change they made for you stays.
           </p>
         )}
         {error && <p className="text-danger" role="alert">{error}</p>}

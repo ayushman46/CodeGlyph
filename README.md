@@ -183,7 +183,7 @@ All routes require a Supabase bearer token except health/readiness and the GitHu
 | POST / DELETE | `/api/repos/{repo}/invites`, `/api/repos/{repo}/invites/{id}` | Owner: create an invite link (`role`, `expires_in_days`; the token is returned once) / revoke it |
 | PATCH / DELETE | `/api/repos/{repo}/members/{user_id}` | Owner: change a member's role / remove them |
 | DELETE | `/api/repos/{repo}/membership` | Member: leave a shared repository |
-| GET / POST | `/api/invites/{token}`, `/api/invites/{token}/accept` | Preview an invite link / join (410 when expired or revoked) |
+| GET / POST | `/api/invites/{token}`, `/api/invites/{token}/accept` | Preview an invite link (`role` is the role joining gives you) / join (410 when expired or revoked) |
 | POST | `/api/answers/share` | Read-only link to one of your saved answers (`repo_name`, `message_id` or `answer`; the token is returned once) |
 | GET | `/api/shared-answers/{token}` | The shared copy: question, answer, citations pinned to the indexed commit (404 once revoked) |
 | GET / DELETE | `/api/answers/shares`, `/api/answers/shares/{id}` | Your shared answers / stop sharing one |
@@ -193,7 +193,7 @@ Repository routes accept the owner's repository name or a member's name for a sh
 ## Security
 
 - Supabase validates every session; verified sessions are cached briefly (bounded by token expiry). Every query is scoped to the authenticated user.
-- Shared repositories are checked on the server for every repository route (owner, editor or viewer). Invite tokens are 256-bit random values stored only as SHA-256 hashes; a member removed by the owner cannot rejoin with a link created before the removal.
+- Shared repositories are checked on the server for every repository route (owner, editor or viewer). Invite tokens are 256-bit random values stored only as SHA-256 hashes; a member removed by the owner cannot rejoin with a link created before the removal, and leaving and rejoining with an older link keeps a role the owner changed.
 - Repository content, issues and conversation history are treated as untrusted data in every prompt.
 - GitHub tokens are encrypted at rest; the OAuth state is single-use and short-lived. PR creation requires a signed, short-lived ticket scoped to the user, repository and exact file set, plus the reviewed blob SHA of every modified file.
 - Archive extraction rejects path traversal, links and devices, bounds download size and time, and never uses `tar.extract`.

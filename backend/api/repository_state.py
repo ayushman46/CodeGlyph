@@ -451,7 +451,8 @@ async def _raise_unavailable(store, user_id: str, repo_name: str) -> NoReturn:
     """404 for a name the user cannot open, saying so when the owner removed them."""
     removed = await _sharing_rows(
         store,
-        "SELECT 1 AS removed FROM repo_members WHERE user_id = ? AND alias = ? AND removed_at IS NOT NULL LIMIT 1",
+        "SELECT 1 AS removed FROM repo_members WHERE user_id = ? AND alias = ? AND removed_at IS NOT NULL "
+        "AND left_at IS NULL LIMIT 1",
         [user_id, repo_name],
     )
     if removed:

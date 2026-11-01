@@ -8,8 +8,12 @@ PRAGMA foreign_keys = ON;
 -- ownership stays repos.user_id. ``alias`` is the member's own name for the
 -- repository, unique among their repositories and other shares, so
 -- /app/r/<alias> and every repository route keep working by name.
--- A member the owner removed keeps a row with ``removed_at`` set, so they are
--- told the repository is no longer shared instead of "not found".
+-- The row stays when access ends (``removed_at`` set): a member the owner
+-- removed is told the repository is no longer shared instead of "not found",
+-- and the owner's decisions about a person outlast their leaving and
+-- rejoining: a link made before the owner removed them cannot bring them
+-- back, and a link made before the owner changed their role cannot override
+-- that role.
 CREATE TABLE IF NOT EXISTS repo_members (
   repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL,
@@ -20,7 +24,13 @@ CREATE TABLE IF NOT EXISTS repo_members (
   invite_id TEXT,
   joined_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  -- NULL while the row gives access; set when the owner removes the member
+  -- or the member leaves (then ``left_at`` is set too).
   removed_at TEXT,
+  left_at TEXT,
+  -- When the owner last removed this person / changed their role. Never cleared.
+  owner_removed_at TEXT,
+  role_changed_at TEXT,
   PRIMARY KEY (repo_id, user_id)
 );
 

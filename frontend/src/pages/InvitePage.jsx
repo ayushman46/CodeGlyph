@@ -119,6 +119,11 @@ const InvitePage = () => {
           {ROLE_DESCRIPTIONS[invite.role]} You ask questions using {invite.owner_label ? `${invite.owner_label}’s` : 'their'} index, so nothing is indexed again and nothing counts toward your storage. Your conversations stay private to you.
         </p>
       )}
+      {!hasAccess && invite.role_kept && (
+        <p className="mt-3 text-[13px] leading-relaxed text-ink-3">
+          You were a member before, and {invite.owner_label || 'the owner'} changed your role after this link was made, so you rejoin as {invite.role === 'editor' ? 'an editor' : 'a viewer'}.
+        </p>
+      )}
       {joinError && <p className="mt-4 rounded-xl bg-danger-soft px-3 py-2.5 text-[13px] text-danger" role="alert">{joinError}</p>}
       <div className="mt-6 flex flex-col gap-2 sm:flex-row">
         {hasAccess ? (

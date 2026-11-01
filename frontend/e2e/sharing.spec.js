@@ -35,6 +35,7 @@ const mockSharing = async (page, { repos = [repo({ access_role: 'owner', shared:
     roleChanges: [],
     removed: [],
     accepted: 0,
+    left: 0,
     sharing: {
       repository: 'cal.com', full_name: 'calcom/cal.com',
       members: [{ user_id: 'u-bo', label: 'bo@example.com', role: 'viewer', joined_at: '2026-10-20T10:00:00Z', updated_at: null }],
@@ -63,6 +64,11 @@ const mockSharing = async (page, { repos = [repo({ access_role: 'owner', shared:
     if (path.startsWith('/repos/cal.com/members/') && method === 'DELETE') {
       state.removed.push(decodeURIComponent(path.split('/').pop()));
       return json(route, { removed: true });
+    }
+    if (path === '/repos/cal.com/membership' && method === 'DELETE') {
+      state.left += 1;
+      state.repos = [];
+      return json(route, { left: true, repo_name: 'cal.com' });
     }
     if (path === `/invites/${TOKEN}` && method === 'GET') {
       if (invite.error) return json(route, { detail: invite.error.detail }, invite.error.status, { 'x-error-code': invite.error.code });
@@ -175,6 +181,21 @@ test('a viewer sees the repository under Shared with you, can ask, and cannot us
   await expect(commands.getByRole('option', { name: /Rename repository|Delete repository|Re-index/ })).toHaveCount(0);
 });
 
+test('a member leaves a shared repository and is told how to come back', async ({ page }) => {
+  await mockApi(page);
+  const state = await mockSharing(page, { repos: [sharedAs('viewer')] });
+  await page.goto('/app/r/cal.com');
+  await page.getByRole('button', { name: `Shared with you by ${OWNER_LABEL}: Viewer access` }).click();
+  const access = page.getByRole('dialog', { name: 'Shared with you' });
+  await access.getByRole('button', { name: 'Leave…' }).click();
+  await expect(access.getByText(`An invite link from ${OWNER_LABEL} that still works brings you back; any role change they made for you stays.`)).toBeVisible();
+  await access.getByRole('button', { name: 'Leave repository' }).click();
+  await expect(page).toHaveURL(/\/app$/);
+  expect(state.left).toBe(1);
+  await expect(page.getByLabel('Notifications').getByText(`To rejoin, open an invite link from ${OWNER_LABEL} that still works.`)).toBeVisible();
+  await expect(page.getByRole('navigation', { name: 'Repositories' }).getByText('cal.com', { exact: true })).toHaveCount(0);
+});
+
 test('an editor can switch to Edit & PR on a shared repository', async ({ page }) => {
   await mockApi(page);
   await mockSharing(page, { repos: [sharedAs('editor')] });
@@ -198,6 +219,15 @@ test('opening an invite link shows the repository, owner and role, and Join open
   await expect(page).toHaveURL(/\/app\/r\/cal\.com$/);
   expect(state.accepted).toBe(1);
   await expect(page.getByRole('navigation', { name: 'Repositories' }).getByRole('heading', { name: 'Shared with you' })).toBeVisible();
+});
+
+test('rejoining with a link older than the owner\'s role change says the owner\'s role stays', async ({ page }) => {
+  await mockApi(page);
+  await mockSharing(page, { repos: [], invite: { preview: { role: 'viewer', role_kept: true } } });
+  await page.goto(`/invite/${TOKEN}`);
+  await expect(page.getByRole('heading', { name: 'Join cal.com' })).toBeVisible();
+  await expect(page.getByText('Viewer', { exact: true })).toBeVisible();
+  await expect(page.getByText(`You were a member before, and ${OWNER_LABEL} changed your role after this link was made, so you rejoin as a viewer.`)).toBeVisible();
 });
 
 test('an expired or revoked invite link says so', async ({ page }) => {

@@ -79,6 +79,7 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+
 def account_label(user: Any) -> str:
     """How other people see this account: email, else name, else its id."""
     raw = getattr(user, "raw_user", None)
@@ -250,9 +251,12 @@ async def change_member_role(repo_name: str, member_id: str, payload: RoleReques
         access = await resolve_repository_access(store, current_user.id, repo_name, permission="manage")
         member = await _active_member(store, access["id"], member_id)
         updated_at = _iso(_now())
+        # role_changed_at outlasts leaving: a link made before this change
+        # cannot override the role when the member leaves and joins again.
         await store.execute(
-            "UPDATE repo_members SET role = ?, updated_at = ? WHERE repo_id = ? AND user_id = ? AND removed_at IS NULL",
-            [payload.role, updated_at, access["id"], member_id],
+            "UPDATE repo_members SET role = ?, updated_at = ?, role_changed_at = ? "
+            "WHERE repo_id = ? AND user_id = ? AND removed_at IS NULL",
+            [payload.role, updated_at, updated_at, access["id"], member_id],
         )
         return {"member": _public_member({**member, "role": payload.role, "updated_at": updated_at})}
     except Exception as error:
@@ -268,10 +272,12 @@ async def remove_member(repo_name: str, member_id: str, current_user=Depends(get
         await _active_member(store, access["id"], member_id)
         now = _iso(_now())
         # The row stays (removed) so the former member is told the repository
-        # is no longer shared, rather than that it never existed.
+        # is no longer shared, rather than that it never existed, and so links
+        # made before now cannot bring them back.
         await store.execute(
-            "UPDATE repo_members SET removed_at = ?, updated_at = ? WHERE repo_id = ? AND user_id = ? AND removed_at IS NULL",
-            [now, now, access["id"], member_id],
+            "UPDATE repo_members SET removed_at = ?, owner_removed_at = ?, updated_at = ? "
+            "WHERE repo_id = ? AND user_id = ? AND removed_at IS NULL",
+            [now, now, now, access["id"], member_id],
         )
         return {"removed": True, "user_id": member_id}
     except Exception as error:
@@ -283,7 +289,11 @@ async def remove_member(repo_name: str, member_id: str, current_user=Depends(get
 
 @router.delete("/repos/{repo_name}/membership")
 async def leave_repository(repo_name: str, current_user=Depends(get_current_user)):
-    """Leave a repository someone shared with you."""
+    """Leave a repository someone shared with you.
+
+    An invite link that still works brings you back, with the role the owner
+    last set for you if they changed it after that link was made.
+    """
     try:
         store = await _store()
         access = await resolve_repository_access(store, current_user.id, repo_name)
@@ -292,8 +302,13 @@ async def leave_repository(repo_name: str, current_user=Depends(get_current_user
                 status_code=409,
                 detail="You own this repository, so you can't leave it. Delete it instead if you no longer need it.",
             )
+        # The row stays (left) and keeps the role and the owner's earlier
+        # decisions, so joining again cannot undo them (see _join_role).
+        now = _iso(_now())
         await store.execute(
-            "DELETE FROM repo_members WHERE repo_id = ? AND user_id = ? AND removed_at IS NULL", [access["id"], current_user.id],
+            "UPDATE repo_members SET removed_at = ?, left_at = ?, updated_at = ? "
+            "WHERE repo_id = ? AND user_id = ? AND removed_at IS NULL",
+            [now, now, now, access["id"], current_user.id],
         )
         return {"left": True, "repo_name": repo_name}
     except Exception as error:
@@ -333,17 +348,38 @@ async def _load_invite(store, token: str) -> dict[str, Any]:
 
 async def _membership(store, repo_id: str, user_id: str) -> dict[str, Any] | None:
     return await store.fetch_one(
-        "SELECT role, alias, removed_at FROM repo_members WHERE repo_id = ? AND user_id = ?", [repo_id, user_id],
+        "SELECT role, alias, removed_at, owner_removed_at, role_changed_at FROM repo_members "
+        "WHERE repo_id = ? AND user_id = ?",
+        [repo_id, user_id],
     )
 
 
+def _decided_since_invite(decided_at: Any, invite: dict[str, Any]) -> bool:
+    """Whether the owner made a decision (at ``decided_at``) after the link was created."""
+    if not decided_at:
+        return False
+    decided = _parse_time(decided_at)
+    created = _parse_time(invite.get("created_at"))
+    return decided is None or created is None or decided >= created
+
+
 def _removed_since_invite(membership: dict[str, Any] | None, invite: dict[str, Any]) -> bool:
-    """A link made before the owner removed someone cannot bring them back."""
+    """A link made before the owner removed someone cannot bring them back.
+
+    This holds even after they came back with a newer link and then left.
+    """
     if not membership or not membership.get("removed_at"):
         return False
-    removed = _parse_time(membership["removed_at"])
-    created = _parse_time(invite.get("created_at"))
-    return removed is None or created is None or removed >= created
+    return _decided_since_invite(membership.get("owner_removed_at"), invite)
+
+
+def _join_role(membership: dict[str, Any] | None, invite: dict[str, Any]) -> str:
+    """The role joining with ``invite`` gives: the link's, unless the person
+    was a member before and the owner set their role after the link was made.
+    So leaving and joining again never undoes the owner's role change."""
+    if membership and _decided_since_invite(membership.get("role_changed_at"), invite):
+        return str(membership["role"])
+    return str(invite["role"])
 
 
 @router.get("/invites/{token}")
@@ -353,6 +389,7 @@ async def preview_invite(token: str, current_user=Depends(get_current_user)):
         store = await _store()
         invite = await _load_invite(store, token)
         membership = await _membership(store, invite["repo_id"], current_user.id)
+        join_role = invite["role"]
         if invite["owner_id"] == current_user.id:
             status, repo_name, role = "owner", invite["repo_name"], "owner"
         elif membership and not membership.get("removed_at"):
@@ -361,12 +398,17 @@ async def preview_invite(token: str, current_user=Depends(get_current_user)):
             status, repo_name, role = "removed", None, None
         else:
             status, repo_name, role = "valid", None, None
+            join_role = _join_role(membership, invite)
         return {
             "status": status,
             "repository": invite["repo_name"],
             "full_name": _full_name(invite["github_url"]),
             "owner_label": invite.get("owner_label") or None,
-            "role": invite["role"],
+            # The role joining gives you. It differs from the link's own role
+            # (role_kept) when you were a member before and the owner changed
+            # your role after this link was made.
+            "role": join_role,
+            "role_kept": join_role != invite["role"],
             "expires_at": invite["expires_at"],
             # How you know the repository now, when you already have access.
             "repo_name": repo_name,
@@ -396,15 +438,17 @@ async def accept_invite(token: str, current_user=Depends(get_current_user)):
                 headers={"X-Error-Code": "share_removed"},
             )
         now = _iso(_now())
-        values = [invite["role"], account_label(current_user), invite.get("owner_label") or "", invite["id"], now, now]
+        values = [_join_role(membership, invite), account_label(current_user), invite.get("owner_label") or "", invite["id"], now, now]
         for _attempt in range(3):
             alias = unique_alias(str(invite["repo_name"]), await taken_repository_names(store, current_user.id))
             try:
                 if membership:
-                    # Rejoining with a link created after the owner removed them.
+                    # Rejoining after leaving, or with a link created after the
+                    # owner removed them. owner_removed_at and role_changed_at stay.
                     await store.execute(
                         "UPDATE repo_members SET role = ?, member_label = ?, owner_label = ?, invite_id = ?, joined_at = ?, "
-                        "updated_at = ?, alias = ?, removed_at = NULL WHERE repo_id = ? AND user_id = ? AND removed_at IS NOT NULL",
+                        "updated_at = ?, alias = ?, removed_at = NULL, left_at = NULL "
+                        "WHERE repo_id = ? AND user_id = ? AND removed_at IS NOT NULL",
                         [*values, alias, invite["repo_id"], current_user.id],
                     )
                 else:

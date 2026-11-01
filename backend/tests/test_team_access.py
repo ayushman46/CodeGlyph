@@ -512,7 +512,52 @@ class RemovalAndRevocationTests(TeamAccessCase):
         self.assertEqual(self.call(VIEWER, "DELETE", f"/repos/{REPO}/membership").json(), {"left": True, "repo_name": REPO})
         gone = self.call(VIEWER, "GET", f"/status/{REPO}")
         self.assertEqual((gone.status_code, gone.json()["detail"]), (404, "Repository not found."))
-        self.assertEqual(self.call(VIEWER, "POST", f"/invites/{token}/accept").json()["joined"], True)
+        self.assertEqual(self.call(VIEWER, "GET", "/repos").json(), [])
+        self.assertEqual(self.call(OWNER, "GET", f"/repos/{REPO}/sharing").json()["members"], [])
+        self.assertEqual(self.call(VIEWER, "GET", f"/invites/{token}").json()["status"], "valid")
+        self.assertEqual(self.call(VIEWER, "POST", f"/invites/{token}/accept").json(), {"repo_name": REPO, "role": "viewer", "joined": True})
+        self.assertEqual(self.call(VIEWER, "GET", f"/status/{REPO}").json()["access_role"], "viewer")
+
+    def test_leaving_and_rejoining_with_an_older_link_keeps_the_role_the_owner_set(self):
+        editor_link = self.invite("editor")["token"]
+        self.call(EDITOR, "POST", f"/invites/{editor_link}/accept")
+        self.assertEqual(self.call(OWNER, "PATCH", f"/repos/{REPO}/members/{EDITOR}", json={"role": "viewer"}).status_code, 200)
+        self.assertEqual(self.call(EDITOR, "DELETE", f"/repos/{REPO}/membership").status_code, 200)
+        # The invite page says which role joining gives, and why it is not the link's.
+        preview = self.call(EDITOR, "GET", f"/invites/{editor_link}").json()
+        self.assertEqual((preview["status"], preview["role"], preview["role_kept"]), ("valid", "viewer", True))
+        rejoined = self.call(EDITOR, "POST", f"/invites/{editor_link}/accept")
+        self.assertEqual(rejoined.json(), {"repo_name": REPO, "role": "viewer", "joined": True})
+        self.assertEqual(self.call(EDITOR, "GET", f"/status/{REPO}").json()["access_role"], "viewer")
+        edit = self.call(EDITOR, "POST", "/query", json={"repo_name": REPO, "question": "Change the retry default to three", "workflow": "editing"})
+        self.assertEqual(edit.status_code, 403)
+        self.assertEqual(self.call(OWNER, "GET", f"/repos/{REPO}/sharing").json()["members"][0]["role"], "viewer")
+        # A link the owner makes after the change grants its own role.
+        self.call(EDITOR, "DELETE", f"/repos/{REPO}/membership")
+        newer = self.invite("editor")["token"]
+        self.assertFalse(self.call(EDITOR, "GET", f"/invites/{newer}").json()["role_kept"])
+        self.assertEqual(self.call(EDITOR, "POST", f"/invites/{newer}/accept").json()["role"], "editor")
+
+    def test_an_upgrade_also_outlasts_leaving(self):
+        viewer_link = self.invite("viewer")["token"]
+        self.call(VIEWER, "POST", f"/invites/{viewer_link}/accept")
+        self.call(OWNER, "PATCH", f"/repos/{REPO}/members/{VIEWER}", json={"role": "editor"})
+        self.call(VIEWER, "DELETE", f"/repos/{REPO}/membership")
+        self.assertEqual(self.call(VIEWER, "POST", f"/invites/{viewer_link}/accept").json()["role"], "editor")
+
+    def test_leaving_never_reopens_a_link_made_before_a_removal(self):
+        before = self.invite()["token"]
+        self.call(VIEWER, "POST", f"/invites/{before}/accept")
+        self.call(OWNER, "DELETE", f"/repos/{REPO}/members/{VIEWER}")
+        after = self.invite()["token"]
+        self.assertEqual(self.call(VIEWER, "POST", f"/invites/{after}/accept").status_code, 200)
+        self.assertEqual(self.call(VIEWER, "DELETE", f"/repos/{REPO}/membership").status_code, 200)
+        # Having come back and left does not make the pre-removal link work.
+        self.assertEqual(self.call(VIEWER, "GET", f"/invites/{before}").json()["status"], "removed")
+        refused = self.call(VIEWER, "POST", f"/invites/{before}/accept")
+        self.assertEqual((refused.status_code, refused.headers.get("x-error-code")), (403, "share_removed"))
+        self.assertEqual(self.call(VIEWER, "GET", f"/status/{REPO}").json()["detail"], "Repository not found.")
+        self.assertEqual(self.call(VIEWER, "POST", f"/invites/{after}/accept").json()["joined"], True)
 
     def test_revoked_link_is_refused_but_members_stay(self):
         created = self.invite()
