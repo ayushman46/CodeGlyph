@@ -654,15 +654,19 @@ async def search_code(
 MAX_LISTED_FILES = 25000
 _PATHS_TTL_SECONDS = 120.0
 _PATHS_CACHE_REPOS = 8
-_PATHS_CACHE: OrderedDict[str, tuple[float, tuple, list[tuple[str, int]]]] = OrderedDict()
+_PATHS_CACHE: OrderedDict[str, tuple[float, tuple, list[tuple[str, int | None]]]] = OrderedDict()
 
 
 def invalidate_paths(repo_id: str) -> None:
     _PATHS_CACHE.pop(repo_id, None)
 
 
-async def repository_paths(store, repo_id: str, *, version: tuple = (), staging_prefix: str | None = None) -> list[tuple[str, int]]:
-    """Every indexed ``(path, byte_size)``, sorted by path, cached briefly per repository version."""
+async def repository_paths(store, repo_id: str, *, version: tuple = (), staging_prefix: str | None = None) -> list[tuple[str, int | None]]:
+    """Every indexed ``(path, byte_size)``, sorted by path, cached briefly per repository version.
+
+    Empty files are listed with size 0 (they open as empty); the size is None
+    for an index without a file manifest.
+    """
     now = time.monotonic()
     cached = _PATHS_CACHE.get(repo_id)
     if cached and cached[1] == version and now - cached[0] < _PATHS_TTL_SECONDS:
@@ -675,10 +679,13 @@ async def repository_paths(store, repo_id: str, *, version: tuple = (), staging_
     if not rows:
         stage_sql, stage_args = ("", []) if not staging_prefix else (" AND id NOT LIKE ?", [f"{staging_prefix}%"])
         rows = await store.fetch_all(
-            f"SELECT DISTINCT file_path, 0 AS byte_size FROM chunks WHERE repo_id = ?{stage_sql} ORDER BY file_path LIMIT ?",
+            f"SELECT DISTINCT file_path, NULL AS byte_size FROM chunks WHERE repo_id = ?{stage_sql} ORDER BY file_path LIMIT ?",
             [repo_id, *stage_args, MAX_LISTED_FILES],
         )
-    paths = [(str(row["file_path"]), int(row.get("byte_size") or 0)) for row in rows if row.get("file_path")]
+    paths = [
+        (str(row["file_path"]), None if row.get("byte_size") is None else int(row["byte_size"]))
+        for row in rows if row.get("file_path")
+    ]
     _PATHS_CACHE[repo_id] = (now, version, paths)
     _PATHS_CACHE.move_to_end(repo_id)
     while len(_PATHS_CACHE) > _PATHS_CACHE_REPOS:
@@ -727,7 +734,7 @@ def path_match_tier(path: str, query: str) -> int | None:
     return None
 
 
-def find_files(paths: list[tuple[str, int]], query: str, *, limit: int = 20) -> tuple[list[dict], int]:
+def find_files(paths: list[tuple[str, int | None]], query: str, *, limit: int = 20) -> tuple[list[dict], int]:
     """Indexed files for a typed name or path, best first, and how many matched."""
     matched = []
     for path, size in paths:
@@ -741,7 +748,7 @@ def find_files(paths: list[tuple[str, int]], query: str, *, limit: int = 20) -> 
     ], len(matched)
 
 
-def list_directory(paths: list[tuple[str, int]], directory: str = "") -> dict:
+def list_directory(paths: list[tuple[str, int | None]], directory: str = "") -> dict:
     """One folder of the file tree: its sub-folders (with file counts) and files.
 
     Source folders come first, then tests, examples, docs and the like, then

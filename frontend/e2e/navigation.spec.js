@@ -115,6 +115,25 @@ test('a link to a file and line reopens the viewer there, and selecting a line u
   await expect(page).toHaveURL(/\/app\/r\/cal\.com\?tab=overview$/);
 });
 
+test('an empty file opens as empty, and the tree says so', async ({ page }) => {
+  await mockApi(page);
+  await page.route('**/api/repos/cal.com/files**', (route) => route.fulfill(json({
+    path: '', directories: [], files: [{ path: '__init__.py', name: '__init__.py', bytes: 0 }, { path: 'package.json', name: 'package.json', bytes: 100 }], total_files: 2,
+  })));
+  await page.route((url) => url.pathname === '/api/repos/cal.com/file', (route) => route.fulfill(json({
+    path: '__init__.py', content: '', source: 'index', ref: 'a'.repeat(40), language: 'python', line_count: 0, total_lines: 0,
+    exact: true, github_url: null, outline: [],
+  })));
+  await page.goto('/app/r/cal.com?tab=overview');
+  const tree = page.getByRole('list', { name: 'Indexed files' });
+  await expect(tree.getByRole('button', { name: '__init__.py , empty' })).toBeVisible();
+  await tree.getByRole('button', { name: '__init__.py , empty' }).click();
+  const panel = viewer(page, '__init__.py');
+  await expect(panel.getByText('This file is empty.')).toBeVisible();
+  await expect(panel.getByText('From the index')).toHaveCount(0);
+  await expect(panel.getByText(/^\d+ lines?$/)).toHaveCount(0);
+});
+
 test('the viewer names the enclosing declaration and lists an outline (FEAT-02)', async ({ page }) => {
   await mockApi(page);
   await page.goto(`/app/r/cal.com?file=${CITED_PATH}&line=60`);

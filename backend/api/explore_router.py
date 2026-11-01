@@ -934,7 +934,15 @@ async def repository_file(
             + (" AND id NOT LIKE ?" if staging else "") + " LIMIT 1",
             [repo["id"], clean_path, *([f"{staging}%"] if staging else [])],
         )
+        # An empty file (an ``__init__.py``) is listed in the manifest, and
+        # so in the file tree, but has no sections: it opens as empty.
+        listed_empty = False
         if not indexed:
+            listed = await store.fetch_one(
+                "SELECT byte_size FROM repo_files WHERE repo_id = ? AND file_path = ?", [repo["id"], clean_path],
+            )
+            listed_empty = bool(listed) and int(listed.get("byte_size") or 0) == 0
+        if not indexed and not listed_empty:
             raise HTTPException(
                 status_code=404,
                 detail=(
@@ -949,14 +957,14 @@ async def repository_file(
             github_url = f"https://github.com/{owner}/{name}/blob/{quote(ref, safe='')}/{quote(clean_path, safe='/')}"
         except (RepositoryValidationError, ValueError):
             owner = name = ""
-        content: str | None = None
+        content: str | None = "" if listed_empty else None
         source = "index"
         truncated = False
         total_lines: int | None = None
         exact = True
         pinned = bool(_COMMIT_SHA.fullmatch(ref))
         cache_key = (owner, name, ref, clean_path)
-        if owner and name and pinned:
+        if owner and name and pinned and content is None:
             cached = _cached_raw_file(cache_key)
             if cached is not None:
                 content, source = cached, "github"

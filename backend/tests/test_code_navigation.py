@@ -560,3 +560,18 @@ class NavigationApiTests(NavigationStoreCase):
             view = await explore.repository_file("httpx", path="httpx/_client.py", current_user=self.user, response=None)
             chain = [entry["name"] for entry in view["outline"] if entry["line"] <= 1036 <= entry["end_line"]]
             self.assertEqual(chain, ["Client", "get"])
+
+    async def test_an_empty_file_in_the_tree_opens_as_empty(self):
+        # An empty __init__.py has no sections, but the tree lists it.
+        await self.add_repo("httpx", {**HTTPX_FILES, "tests/__init__.py": "", "tests/client/__init__.py": ""})
+        store_patch, schema_patch, raw_patch = self.patched()
+        with store_patch, schema_patch, raw_patch as raw:
+            tests = await explore.repository_files("httpx", q=None, directory="tests", limit=20, current_user=self.user)
+            self.assertIn({"path": "tests/__init__.py", "name": "__init__.py", "bytes": 0}, tests["files"])
+            view = await explore.repository_file("httpx", path="tests/__init__.py", current_user=self.user, response=None)
+            self.assertEqual((view["content"], view["line_count"], view["total_lines"], view["outline"]), ("", 0, 0, []))
+            self.assertTrue(view["exact"])
+            raw.assert_not_awaited()
+            with self.assertRaises(HTTPException) as missing:
+                await explore.repository_file("httpx", path="tests/nothing_here.py", current_user=self.user, response=None)
+            self.assertEqual(missing.exception.status_code, 404)

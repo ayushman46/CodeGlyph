@@ -161,6 +161,8 @@ const FileViewer = ({
 
   const totalLines = Number(data?.total_lines) || Number(data?.line_count) || lines.length;
   const truncated = Boolean(data?.truncated);
+  // An empty file (an __init__.py) has nothing to number or render.
+  const empty = Boolean(data) && data.content === '' && !truncated;
   const activeStart = active?.start || null;
   // Past the real end of the file (not just past a truncated view).
   const beyondEnd = Boolean(data) && isBeyondEnd(activeStart, truncated ? totalLines : lines.length);
@@ -351,11 +353,11 @@ const FileViewer = ({
               </span>
             )}
             {data?.source === 'github' && <Badge tone="neutral" title={data.ref ? `Commit ${data.ref}` : undefined}>GitHub @ {shortSha(data.ref) || 'HEAD'}</Badge>}
-            {data?.source === 'index' && <Badge tone="warning">From the index</Badge>}
-            {data && totalLines ? <span className="text-[11px] text-ink-3">{totalLines.toLocaleString()} lines</span> : null}
+            {data?.source === 'index' && !empty && <Badge tone="warning">From the index</Badge>}
+            {data && totalLines && !empty ? <span className="text-[11px] text-ink-3">{totalLines.toLocaleString()} {totalLines === 1 ? 'line' : 'lines'}</span> : null}
           </div>
           <div className="flex shrink-0 items-center gap-0.5">
-            {markdown && data && (
+            {markdown && data && !empty && (
               <Segmented
                 size="xs"
                 label="Show the file"
@@ -365,7 +367,7 @@ const FileViewer = ({
                 options={[{ value: 'rendered', label: 'Rendered', icon: Eye }, { value: 'source', label: 'Source', icon: Code, title: 'Source with line numbers' }]}
               />
             )}
-            {data && !rendered && lines.length > 0 && (
+            {data && !rendered && !empty && lines.length > 0 && (
               <form onSubmit={goToLine} className="mr-1 flex items-center">
                 <label htmlFor={lineInputId} className="sr-only">Go to line</label>
                 <input
@@ -456,12 +458,13 @@ const FileViewer = ({
           </div>
         </div>
       )}
-      {data && rendered && (
+      {empty && <p className="px-4 py-3 text-[13px] text-code-muted">This file is empty.</p>}
+      {data && rendered && !empty && (
         <div className="min-h-full bg-surface">
           <MarkdownPreview content={data.content || ''} path={path} onOpenPath={onOpenPath} />
         </div>
       )}
-      {data && !rendered && (
+      {data && !rendered && !empty && (
         <table
           ref={tableRef}
           className="code-tokens w-full border-collapse font-mono text-[12.5px] leading-5"

@@ -75,6 +75,7 @@ const FolderContents = ({ dir, depth, folders, expanded, onToggle, onRetry, onOp
               <span className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
               <Icon className="h-3.5 w-3.5 shrink-0 text-ink-3" aria-hidden="true" />
               <span className="truncate font-mono text-[12.5px] text-ink-2">{file.name}</span>
+              {file.bytes === 0 && <span className="ml-auto shrink-0 text-[11px] text-ink-3"><span className="sr-only">, </span>empty</span>}
             </button>
           </li>
         );
