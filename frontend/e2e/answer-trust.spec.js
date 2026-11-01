@@ -170,6 +170,36 @@ test('a failed Detailed answer names the failure and offers Retry with Fast', as
   expect(payloads.map((payload) => payload.model_profile)).toEqual(['detailed', 'fast']);
 });
 
+test('an answer that stops partway names why and offers Retry with Fast', async ({ page }) => {
+  await mockApi(page);
+  const failure = {
+    reason: 'interrupted', cause: 'timeout', model_profile: 'detailed',
+    message: 'The Detailed model stopped responding partway through the answer.',
+  };
+  const text = `## Direct answer\nConfirmation starts in \`${CITED_PATH}:L42-L118\`. Then the handler`;
+  const payloads = await routeStream(page, (payload) => (payload.model_profile === 'detailed' ? [
+    ['token', { text }],
+    ['done', done({
+      answer: `${text}\n\n> The answer was interrupted. ${failure.message} Ask again to regenerate it.`,
+      mode: 'partial', model_profile: 'detailed', answer_failure: failure,
+    })],
+  ] : [['done', done({ answer: `Answered quickly from \`${CITED_PATH}:L42-L118\`.` })]]));
+  await page.goto('/app/r/cal.com');
+  await page.getByRole('button', { name: /Answer model/ }).click();
+  await page.getByRole('menuitemradio', { name: /Detailed/ }).click();
+  await ask(page, 'I need a go/no-go risk summary for changing confirmation emails.');
+
+  await expect(page.getByText(failure.message)).toBeVisible();
+  await expect(page.getByText('The answer stops there, so the rest is missing.')).toBeVisible();
+  // Named once, in the notice: the server's note is not repeated in the reply.
+  await expect(page.locator('.prose-answer').last()).not.toContainText('The answer was interrupted');
+  await expect(page.locator('[data-slot="answer-check"]').last()).toContainText('So far, 1 file/line reference exists');
+  await expect(page.getByRole('button', { name: 'Try again' })).toBeVisible();
+  await page.getByRole('button', { name: 'Retry with Fast' }).click();
+  await expect(page.getByText('Answered quickly from')).toBeVisible();
+  expect(payloads.map((payload) => payload.model_profile)).toEqual(['detailed', 'fast']);
+});
+
 test('Copy reply and Copy section put commit-pinned GitHub links on the clipboard', async ({ page, context }) => {
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await mockApi(page);

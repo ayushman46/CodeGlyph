@@ -996,7 +996,11 @@ async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool) -
                     except (LLMProviderError, ModelConfigurationError) as error:
                         answer_failure = describe_answer_failure(error, effective_model_profile)
                         if parts:
-                            answer = "".join(parts) + "\n\n> The answer was interrupted. Ask again to regenerate it."
+                            # Named here too, for API clients and copied text;
+                            # the chat shows answer_failure as a notice instead.
+                            answer = "".join(parts) + (
+                                f"\n\n> The answer was interrupted. {answer_failure['message']} Ask again to regenerate it."
+                            )
                             mode = "partial"
                         else:
                             # The other model failed too: nothing was written by it.

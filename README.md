@@ -170,7 +170,7 @@ All routes require a Supabase bearer token except health/readiness and the GitHu
 | POST | `/api/repos/{repo}/reindex`, `/api/repos/{repo}/cancel-indexing` | Refresh or stop indexing |
 | PATCH / DELETE | `/api/repos/{repo}` | Rename or delete |
 | POST | `/api/query` | Grounded answer (JSON). `done` carries `answer_references` (with a `reason` for each unverified one), `unverified_identifiers`, `truncated`, `message_id`, and `answer_failure` / `answer_notice` when a model failed |
-| POST | `/api/query/stream` | Grounded answer as server-sent events (`stage`, `citations`, `token`, `done`, `error`). With `continue_from: <message_id>` of an answer stored as `truncated`, writes the rest into that message (`continue` event with the kept text, then `token`s and `done`) |
+| POST | `/api/query/stream` | Grounded answer as server-sent events (`stage`, `citations`, `token`, `done`, `error`). A model failure after text was sent ends with `mode: "partial"` and `answer_failure` (its `cause`, such as `timeout`, says why the stream stopped). With `continue_from: <message_id>` of an answer stored as `truncated`, writes the rest into that message (`continue` event with the kept text, then `token`s and `done`) |
 | GET / DELETE | `/api/conversations/{repo}` | Conversation history (with each answer's checks) / new chat |
 | GET | `/api/edits/{id}` | Saved edit proposal with a fresh editing ticket |
 | GET | `/api/github/status`, `/api/github/login`, `/api/github/callback` | GitHub connection (callback redirects to `{GITHUB_FRONTEND_ORIGIN}/github/callback`) |

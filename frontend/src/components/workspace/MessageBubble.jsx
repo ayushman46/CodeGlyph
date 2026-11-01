@@ -8,7 +8,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { errorMessage, searchRepository } from '../../api/client';
 import { citationsToSources, shouldPaceReply } from '../../lib/ai/streamingText';
-import { absenceTerms, markdownSection } from '../../lib/answerText';
+import { absenceTerms, markdownSection, withoutInterruptionNote } from '../../lib/answerText';
 import {
   answerLinkTarget, basename, citationExcerpt, compactPath, formatLines, groupByDirectory, markdownWithPermalinks,
   matchCitation, normaliseCitationMarkdown, referenceReasonLabel, resolveReference, summariseReferences,
@@ -633,6 +633,10 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
   const messageCount = useStore((state) => (!isUser && message.streaming ? state.messages.length : 0));
   const citations = message.citations || [];
   const repoName = repo?.repo_name;
+  // The model failed partway through: a notice under the reply names the
+  // failure, so the server's own note at the end of the text is not shown.
+  const stoppedEarly = !isUser && message.mode === 'partial' && Boolean(message.answer_failure?.message);
+  const replyText = isUser ? '' : (stoppedEarly ? withoutInterruptionNote(message.content) : (message.content || ''));
 
   // Smooth pacing only for a reply that streams in while this bubble is
   // mounted (never for history), and only while shouldPaceReply allows it:
@@ -642,9 +646,9 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
   const pacingOff = useRef(isUser || !message.streaming);
   if (!pacingOff.current && (
     editRun || message.mode === 'error'
-    || !shouldPaceReply({ text: message.content || '', messageCount: message.streaming ? messageCount : 0 })
+    || !shouldPaceReply({ text: replyText, messageCount: message.streaming ? messageCount : 0 })
   )) pacingOff.current = true;
-  const { text: shownText, isSettled } = useSmoothStream(isUser ? '' : (message.content || ''), { enabled: !pacingOff.current });
+  const { text: shownText, isSettled } = useSmoothStream(replyText, { enabled: !pacingOff.current });
   const revealing = !isUser && !isSettled;
   useEffect(() => {
     if (!onRevealChange) return undefined;
@@ -816,8 +820,8 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
   // that failed outright or was stopped empty shows its own notice instead.
   const showArtifact = editRun && (message.streaming || hasProposal || (!isError && !stoppedEmpty));
 
-  // Answer trust: a reply cut off at the output limit, a failed model, and
-  // the other model answering instead.
+  // Answer trust: a reply cut off at the output limit, a model that failed
+  // before or partway through the answer, and the other model answering instead.
   const truncated = message.mode === 'truncated';
   const failure = message.answer_failure;
   const failedProfile = failure?.model_profile || message.model_profile;
@@ -889,11 +893,11 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
         ) : (
           // The transcript is already a log, so the reply is not announced
           // as it grows (announce={false}).
-          // The model-unavailable notice above offers its own Try again.
+          // The model-unavailable and stopped-partway notices offer their own Try again.
           <StreamingText
             status={replyStatus}
             copyText={replyCopyText}
-            onRetry={canRetry && message.mode !== 'retrieval_fallback' ? onRegenerate : undefined}
+            onRetry={canRetry && message.mode !== 'retrieval_fallback' && !stoppedEarly ? onRegenerate : undefined}
             sources={sources}
             sourcesIcon={FileCode2}
             announce={false}
@@ -915,6 +919,21 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
               </div>
             </div>
           </StreamingText>
+        )}
+
+        {stoppedEarly && settled && (
+          <Notice
+            tone="warning"
+            title={failure.message}
+            action={(retryWithFast || canRetry) ? (
+              <div className="flex flex-wrap gap-2">
+                {retryWithFast && <SmallActionButton onClick={retryWithFast} icon={Zap} primary>Retry with Fast</SmallActionButton>}
+                {canRetry && <RetryButton onClick={onRegenerate} />}
+              </div>
+            ) : null}
+          >
+            The answer stops there, so the rest is missing.
+          </Notice>
         )}
 
         {truncated && settled && (
@@ -941,7 +960,7 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
           <AnswerCheck
             references={message.answer_references}
             identifiers={message.unverified_identifiers}
-            truncated={truncated}
+            truncated={truncated || stoppedEarly}
             onOpen={(file) => openFile(file, message.id)}
             onSearch={repoName ? setSearchTerm : null}
           />

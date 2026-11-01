@@ -75,7 +75,10 @@ class FakeStream:
     async def __anext__(self):
         if not self.events:
             raise StopAsyncIteration
-        return self.events.pop(0)
+        event = self.events.pop(0)
+        if isinstance(event, Exception):
+            raise event
+        return event
 
     async def close(self):
         self.closed = True
@@ -214,6 +217,31 @@ class ReasoningLeakTests(ProviderTestCase):
                     content_filter = StreamingContentFilter()
                     shown = [content_filter.feed(answer[index:index + size]) for index in range(0, len(answer), size)]
                     self.assertEqual("".join(shown) + content_filter.finish(), answer)
+
+    def test_a_stream_that_stops_partway_keeps_why_it_stopped(self):
+        text = ("## Direct answer\n\nClick parses options in the parser module, which reads every token in order. "
+                "Each option name is matched against the declared options and its value is converted by the option type.")
+        cases = {
+            "timeout": httpx.ReadTimeout("read timed out", request=REQUEST),
+            "connection": httpx.RemoteProtocolError("peer closed connection", request=REQUEST),
+            None: ValueError("bad chunk"),
+        }
+        for cause, raised in cases.items():
+            with self.subTest(cause=cause):
+                self.create.reset_mock()
+                self.create.return_value = FakeStream([chunk_event(text), raised])
+                received, error = self.stream_error()
+                self.assertEqual("".join(received), text)
+                self.assertEqual((error.reason, error.cause), ("interrupted", cause))
+                self.assertEqual(self.create.await_count, 1)
+        failure = describe_answer_failure(LLMProviderError("x", reason="interrupted", cause="timeout"), "detailed")
+        self.assertEqual(failure, {"reason": "interrupted", "cause": "timeout", "model_profile": "detailed",
+                                   "message": "The Detailed model stopped responding partway through the answer."})
+        dropped = describe_answer_failure(LLMProviderError("x", reason="interrupted", cause="connection"), "fast")
+        self.assertEqual(dropped["message"], "The connection to NVIDIA dropped partway through the Fast model's answer.")
+        busy = describe_answer_failure(LLMProviderError("x", reason="interrupted", cause="unavailable", status=503), "fast")
+        self.assertEqual(busy["message"], "NVIDIA stopped the Fast model's answer partway through (HTTP 503).")
+        self.assertNotIn("cause", describe_answer_failure(LLMProviderError("x", reason="interrupted"), "fast"))
 
     def test_the_streaming_filter_never_shows_the_leaked_reasoning(self):
         content_filter = StreamingContentFilter()
@@ -628,6 +656,22 @@ class AnswerTrustEndpointTests(answers.EndpointTestCase):
         self.assertIn("No answer was written. The Detailed model did not respond in time, and NVIDIA's Fast model endpoint "
                       "is busy or down (HTTP 503).", done["answer"])
         self.assertEqual(self.history()[-1]["answer_failure"], done["answer_failure"])
+
+    def test_a_model_that_stops_partway_is_named_with_its_cause_and_kept_after_reload(self):
+        error = LLMProviderError("x", reason="interrupted", cause="timeout")
+        done = self.ask(stream_of("Sessions are checked in `src/session.py:L1-L2`. Then", error=error),
+                        model_profile="detailed")[-1][1]
+        self.assertEqual(done["mode"], "partial")
+        self.assertEqual(done["answer_failure"], {
+            "reason": "interrupted", "cause": "timeout", "model_profile": "detailed",
+            "message": "The Detailed model stopped responding partway through the answer.",
+        })
+        self.assertTrue(done["answer"].endswith(
+            "Then\n\n> The answer was interrupted. The Detailed model stopped responding partway through the answer. "
+            "Ask again to regenerate it."
+        ))
+        reloaded = self.history()[-1]
+        self.assertEqual((reloaded["mode"], reloaded["answer_failure"]), ("partial", done["answer_failure"]))
 
     def test_when_the_other_model_fails_too_no_switch_is_reported(self):
         primary = LLMProviderError("x", reason="timeout")

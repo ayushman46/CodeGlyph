@@ -1,7 +1,8 @@
 /**
  * Reading an answer's Markdown: the section under a heading (for "Copy
- * section") and the code names an answer says it did not find (for a
- * one-click "Search code" that checks the claim against the index).
+ * section"), the code names an answer says it did not find (for a one-click
+ * "Search code" that checks the claim against the index), and the server's
+ * note on an answer that stopped partway.
  */
 
 import { looksLikePath } from './citations.js';
@@ -74,3 +75,15 @@ export const absenceTerms = (markdown, limit = 3) => {
   });
   return terms.slice(0, limit);
 };
+
+// The note the server appends to an answer whose model failed partway
+// through ("> The answer was interrupted. <why> Ask again to regenerate it.").
+const INTERRUPTION_NOTE = /\n+> The answer was interrupted\.[^\n]*\s*$/;
+
+/**
+ * An answer without the server's trailing interruption note, for when the
+ * chat shows that failure as a notice with its own actions.
+ *
+ * @param {string} markdown
+ */
+export const withoutInterruptionNote = (markdown) => String(markdown || '').replace(INTERRUPTION_NOTE, '');

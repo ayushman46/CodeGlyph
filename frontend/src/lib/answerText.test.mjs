@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { absenceTerms, markdownSection } from './answerText.js';
+import { absenceTerms, markdownSection, withoutInterruptionNote } from './answerText.js';
 
 const ANSWER = [
   '## Direct answer',
@@ -51,4 +51,14 @@ test('absenceTerms finds the code names an answer says it did not retrieve', () 
   assert.deepEqual(absenceTerms(text, 5), ['_encode_files', 'to_key_val_list', 'Command.invoke']);
   assert.deepEqual(absenceTerms('`flask` handles it. Everything was retrieved.'), []);
   assert.deepEqual(absenceTerms("I couldn't find `make_response` in the evidence."), ['make_response']);
+});
+
+test('withoutInterruptionNote removes only the server note that ends a stopped answer', () => {
+  const answer = 'Sessions are checked in `src/session.py:L1-L2`. Then';
+  const note = '> The answer was interrupted. The Fast model stopped responding partway through the answer. Ask again to regenerate it.';
+  assert.equal(withoutInterruptionNote(`${answer}\n\n${note}`), answer);
+  assert.equal(withoutInterruptionNote(`${answer}\n\n> The answer was interrupted. Ask again to regenerate it.\n`), answer);
+  const quoted = `> The answer was interrupted. Quoted earlier.\n\n${answer}`;
+  assert.equal(withoutInterruptionNote(quoted), quoted);
+  assert.equal(withoutInterruptionNote(undefined), '');
 });

@@ -24,14 +24,19 @@ class LLMProviderError(RuntimeError):
     "unavailable" (HTTP 5xx), "http_error", "planning" (reasoning instead of
     an answer), "length" (the output budget ran out before any answer),
     "empty", "interrupted" or "invalid". ``status`` is the HTTP status, if any.
+    ``cause`` says why an "interrupted" stream stopped ("timeout",
+    "connection", "unavailable", ...), when that is known.
     """
 
     default_reason = "invalid"
 
-    def __init__(self, message: str = "", *, reason: str | None = None, status: int | None = None):
+    def __init__(
+        self, message: str = "", *, reason: str | None = None, status: int | None = None, cause: str | None = None,
+    ):
         super().__init__(message)
         self.reason = reason or self.default_reason
         self.status = status
+        self.cause = cause
 
 
 class LLMOutputTruncatedError(LLMProviderError):
@@ -917,10 +922,17 @@ async def stream_complete(
         except LLMProviderError:
             raise
         except Exception as error:
-            _log_provider_failure(model_name, attempt, attempts, _as_sdk_error(error, stream))
+            sdk_error = _as_sdk_error(error, stream)
+            _log_provider_failure(model_name, attempt, attempts, sdk_error)
             if yielded:
-                raise LLMProviderError("The answer stream was interrupted.", reason="interrupted") from error
-            last_error = _as_sdk_error(error, stream)
+                # The cause stays with the error so the chat can say why the
+                # answer stopped (a read timeout, a dropped connection, ...).
+                cause = _provider_failure(sdk_error)
+                raise LLMProviderError(
+                    "The answer stream was interrupted.", reason="interrupted",
+                    cause=cause.reason if cause.reason != "invalid" else None, status=cause.status,
+                ) from error
+            last_error = sdk_error
             # Same rule as complete(): retired models (404/410), auth and
             # validation errors never recover, so only outages are retried.
             if not is_transient_provider_error(last_error) or attempt == attempts - 1:

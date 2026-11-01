@@ -300,6 +300,13 @@ def _failure_sentence(error: Exception | None, model: str) -> str:
     if reason == "empty":
         return f"the {model} model returned an empty reply"
     if reason == "interrupted":
+        cause = getattr(error, "cause", None)
+        if cause == "timeout":
+            return f"the {model} model stopped responding partway through the answer"
+        if cause == "connection":
+            return f"the connection to NVIDIA dropped partway through the {model} model's answer"
+        if cause in {"unavailable", "rate_limited", "http_error"} and status:
+            return f"NVIDIA stopped the {model} model's answer partway through (HTTP {status})"
         return f"the {model} model's answer stream was interrupted"
     if reason == "not_configured":
         return "no NVIDIA API key is configured on this server"
@@ -310,7 +317,8 @@ def describe_answer_failure(error: Exception, model_profile: str) -> dict:
     """Why no (complete) answer was written, for the chat: ``{reason, message, model_profile}``.
 
     When the other chat model was tried after the requested one failed
-    (``error.previous``), both failures are named.
+    (``error.previous``), both failures are named. A stream that stopped
+    partway ("interrupted") also carries its ``cause`` ("timeout", ...).
     """
     from agent.agent import alternate_profile
 
@@ -324,11 +332,15 @@ def describe_answer_failure(error: Exception, model_profile: str) -> dict:
             message = f"{_failure_sentence(previous, requested)}, and {_failure_sentence(error, other)}."
     else:
         message = f"{_failure_sentence(error, requested)}."
-    return {
+    failure = {
         "reason": _failure_reason(previous if previous is not None else error),
         "message": message[0].upper() + message[1:],
         "model_profile": model_profile,
     }
+    cause = getattr(error, "cause", None)
+    if failure["reason"] == "interrupted" and isinstance(cause, str):
+        failure["cause"] = cause
+    return failure
 
 
 def describe_model_switch(marker, requested_profile: str) -> dict:
