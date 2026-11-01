@@ -4,10 +4,12 @@ import json
 import logging
 import posixpath
 from datetime import UTC, datetime
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from api import impact
 from api.auth import get_current_user
 from api.repository_state import (
     fetch_owned_repository,
@@ -56,10 +58,6 @@ def _normalise_impact_path(file_path: str) -> str:
             detail="Enter a path inside this repository; \"..\" segments aren't allowed (for example src/app.ts).",
         )
     return normalised
-
-
-def _escape_like(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 async def owned_repo(store, user_id: str, repo_name: str):
@@ -164,103 +162,85 @@ async def repository_impact(
     file_path: str = Query(min_length=1, max_length=500),
     limit: int = Query(default=20, ge=1, le=100),
     current_user=Depends(get_current_user),
+    depth: Annotated[int, Query(ge=1, le=impact.MAX_DEPTH)] = 1,
+    symbol: Annotated[str | None, Query(max_length=120)] = None,
 ):
-    """Show the local files that would be affected by changing one source file.
+    """Show the files and tests that would be affected by changing one file.
 
     The graph is deliberately conservative: only imports resolved to another
     indexed file are returned. External packages and unresolved aliases are
-    omitted instead of being presented as speculative breakage.
+    omitted instead of being presented as speculative breakage. ``depth``
+    (1-3) follows imports of imports; ``symbol`` lists the test functions in
+    the affected test files that use (or are named after) that name. A path
+    that matches several files returns ``ambiguous`` with the candidates and
+    analyses nothing until one is chosen.
     """
-    target = _normalise_impact_path(file_path)
+    target_query = _normalise_impact_path(file_path)
+    try:
+        symbol_name = impact.normalise_symbol(symbol)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     try:
         await assert_turso_schema()
         store = get_turso_store()
         repo = await owned_repo(store, current_user.id, repo_name)
-        escaped = _escape_like(target.lower())
-        # During a refresh the replacement rows are hidden from every read
-        # endpoint until the swap, exactly like search and chat.
-        staging = repo.get("staging_prefix")
-        stage_sql, stage_args = ("", []) if not staging else (" AND id NOT LIKE ?", [f"{staging}%"])
-        target_rows = await store.fetch_all(
-            "SELECT DISTINCT file_path FROM chunks WHERE repo_id = ? AND (lower(file_path) = ? "
-            "OR (lower(file_path) LIKE ? ESCAPE '\\' AND instr(lower(file_path), '/') > 0))"
-            f"{stage_sql} ORDER BY file_path LIMIT ?",
-            [repo["id"], target.lower(), f"%/{escaped}", *stage_args, limit],
-        )
-        target_paths = [str(row["file_path"]) for row in target_rows]
-        if not target_paths:
+        matches = await impact.resolve_target(store, repo, target_query)
+        if not matches:
             raise HTTPException(
                 status_code=404,
                 detail=(
-                    f"No indexed file matches {target}. Check the spelling and use the path from the repository "
+                    f"No indexed file matches {target_query}. Check the spelling and use the path from the repository "
                     "root, or open the file tree to pick one. Skipped files are listed in the coverage report."
                 ),
             )
-
-        dependency_conditions = []
-        dependency_args = [repo["id"]]
-        for path in target_paths:
-            escaped_path = _escape_like(path)
-            dependency_conditions.append("(d.target_file = ? OR d.target_file LIKE ? ESCAPE '\\')")
-            dependency_args.extend([path, f"%/{escaped_path}"])
-        edges = await store.fetch_all(
-            "SELECT d.source_file, d.target_file, d.import_name, d.line_number "
-            "FROM repo_dependencies d "
-            f"WHERE d.repo_id = ? AND ({' OR '.join(dependency_conditions)}) "
-            "ORDER BY d.source_file, d.line_number, d.target_file LIMIT ?",
-            [*dependency_args, limit * 4],
-        )
-        # Distinct dependent *files* (not chunk rows, which let a few large
-        # files use up the limit) that are part of the published index.
-        indexed_source = (
-            "EXISTS (SELECT 1 FROM chunks c WHERE c.repo_id = d.repo_id AND c.file_path = d.source_file"
-            + (" AND c.id NOT LIKE ?" if staging else "") + ")"
-        )
-        dependents_where = f"d.repo_id = ? AND ({' OR '.join(dependency_conditions)}) AND {indexed_source}"
-        dependents_args = [*dependency_args, *stage_args]
-        dependents = await store.fetch_all(
-            f"SELECT DISTINCT d.source_file AS file_path FROM repo_dependencies d WHERE {dependents_where} "
-            "ORDER BY d.source_file LIMIT ?",
-            [*dependents_args, limit],
-        )
-        dependent_paths = sorted({str(row["file_path"]) for row in dependents})
-        counted = await store.fetch_one(
-            f"SELECT COUNT(DISTINCT d.source_file) AS count FROM repo_dependencies d WHERE {dependents_where}",
-            dependents_args,
-        )
-        dependent_total = max(len(dependent_paths), int((counted or {}).get("count") or 0))
-        # Imports of the target (what it depends on) give the other half of
-        # the change surface.
-        target_conditions = " OR ".join("d.source_file = ?" for _ in target_paths)
-        imports = await store.fetch_all(
-            f"SELECT DISTINCT d.target_file FROM repo_dependencies d WHERE d.repo_id = ? AND ({target_conditions}) "
-            "ORDER BY d.target_file LIMIT ?",
-            [repo["id"], *target_paths, limit],
-        )
-        truncated = dependent_total > len(dependent_paths)
-        if dependent_paths:
-            summary = (
-                f"{dependent_total:,} indexed file(s) import the selected file"
-                + (f" (showing {len(dependent_paths):,})." if truncated else ".")
-            )
-        else:
-            summary = "No other indexed file imports the selected file."
-        summary += (
-            " Counts include resolved local imports (relative paths, workspace packages and tsconfig path "
-            "aliases); external packages and computed import paths are not included."
-        )
-        return {
+        graph = await impact.ensure_current_graph(store, repo)
+        base = {
             "repository": repo_name,
-            "target_files": target_paths,
-            "dependent_files": dependent_paths,
-            "dependent_count": dependent_total,
-            "truncated": truncated,
-            "imported_files": [str(row["target_file"]) for row in imports],
-            "edges": edges,
-            "summary": summary,
+            "query": target_query,
+            "commit_sha": repo.get("commit_sha"),
+            "github_url": repo.get("github_url"),
+            "graph": graph,
         }
+        if len(matches) > 1:
+            shown = matches[:impact.CANDIDATE_LIMIT]
+            counts = await impact.dependent_counts(store, str(repo["id"]), shown)
+            return {
+                **base,
+                "ambiguous": True,
+                "candidates": [{"file_path": path, "dependent_count": counts.get(path, 0)} for path in shown],
+                "candidate_count": len(matches),
+                "target_file": None,
+                "target_files": [],
+                "dependents": [],
+                "dependent_files": [],
+                "dependent_count": 0,
+                "summary": (
+                    f"{len(matches):,} indexed files match {target_query}. Choose one to see its impact; "
+                    "nothing is analysed until you do."
+                ),
+            }
+        report = await impact.analyse_impact(store, repo, matches[0], depth=depth, symbol=symbol_name, limit=limit)
+        return {**base, "ambiguous": False, "candidates": [], **report}
     except Exception as error:
         _database_errors("analyze the change impact")(error)
+
+
+@router.get("/repos/{repo_name}/impact/suggestions")
+async def repository_impact_suggestions(repo_name: str, current_user=Depends(get_current_user)):
+    """The most imported indexed files: examples to start an impact check from.
+
+    Opening the dialog calls this first, so an index whose import graph
+    predates the current resolver is rebuilt before the first analysis.
+    """
+    try:
+        await assert_turso_schema()
+        store = get_turso_store()
+        repo = await owned_repo(store, current_user.id, repo_name)
+        graph = await impact.ensure_current_graph(store, repo)
+        files = await impact.most_imported_files(store, repo)
+        return {"repository": repo_name, "files": files, "graph": graph}
+    except Exception as error:
+        _database_errors("load impact suggestions")(error)
 
 
 @router.delete("/repos/{repo_name}")

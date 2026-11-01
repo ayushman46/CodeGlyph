@@ -659,14 +659,22 @@ class ExploreTests(DatabaseCase):
 
     async def test_impact_counts_distinct_dependent_files(self):
         from api.repos_router import repository_impact
+        from ingest.dependencies import graph_version_edge
         await self.add_chunks("repo-1", "t-", "lib/fixtures.ts", 1)
         statements = []
-        for index in range(12):
-            path = f"tests/spec{index:02d}.ts"
-            await self.add_chunks("repo-1", f"s{index}-", path, 6)
+        # The fixture graph is hand-written (the chunk text has no imports),
+        # so it carries the current version row; an unversioned graph would
+        # be rebuilt from the indexed text on first use.
+        for index, edge in enumerate([
+            *({"source_file": f"tests/spec{index:02d}.ts", "target_file": "lib/fixtures.ts",
+               "import_name": "../lib/fixtures", "line_number": 1} for index in range(12)),
+            graph_version_edge(),
+        ]):
+            if edge["source_file"]:
+                await self.add_chunks("repo-1", f"s{index}-", edge["source_file"], 6)
             statements.append(Statement(
                 "INSERT INTO repo_dependencies (repo_id, source_file, target_file, import_name, line_number) VALUES (?, ?, ?, ?, ?)",
-                ["repo-1", path, "lib/fixtures.ts", "../lib/fixtures", 1],
+                ["repo-1", edge["source_file"], edge["target_file"], edge["import_name"], edge["line_number"]],
             ))
         await self.store.batch(statements)
         p = self.patches()
@@ -675,7 +683,8 @@ class ExploreTests(DatabaseCase):
         self.assertEqual(len(response["dependent_files"]), 5)
         self.assertEqual(response["dependent_count"], 12)
         self.assertTrue(response["truncated"])
-        self.assertIn("12 indexed file(s)", response["summary"])
+        self.assertFalse(response["graph"]["rebuilt"])
+        self.assertIn("12 indexed files import lib/fixtures.ts directly", response["summary"])
         self.assertIn("showing 5", response["summary"])
 
 
