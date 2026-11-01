@@ -1,10 +1,12 @@
 import {
-  BookOpen, CreditCard, FolderGit2, GitFork, LayoutDashboard, MessageSquareText, Moon, Pencil, PieChart, Plus, RefreshCw,
-  Search, Square, Trash2, User,
+  BookOpen, Braces, CreditCard, FileCode2, FolderGit2, GitFork, LayoutDashboard, MessageSquareText, Moon, Pencil, PieChart, Plus,
+  RefreshCw, Search, Square, Trash2, User,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
+import { listRepositoryFiles, searchRepositorySymbols } from '../../api/client';
+import { commandScore as score, pathScore, symbolLabel, symbolScore } from '../../lib/codeNav';
 import { parseRepositoryInput } from '../../lib/format';
 import { statusSentence } from '../../lib/phase';
 import { getThemePreference, resolveTheme, setThemePreference } from '../../lib/theme';
@@ -12,18 +14,53 @@ import useStore from '../../store/useStore';
 import useFocusTrap from '../../hooks/useFocusTrap';
 import Kbd from '../ui/Kbd';
 
-const score = (text, query) => {
-  const haystack = text.toLowerCase();
-  const needle = query.toLowerCase().trim();
-  if (!needle) return 1;
-  if (haystack.includes(needle)) return 3 - haystack.indexOf(needle) / Math.max(1, haystack.length);
-  let position = 0;
-  for (const character of needle) {
-    position = haystack.indexOf(character, position);
-    if (position === -1) return 0;
-    position += 1;
-  }
-  return 1;
+// Files and symbols of the open repository are looked up once the query has
+// two characters, shortly after typing pauses.
+const CODE_QUERY_MIN = 2;
+const CODE_DELAY_MS = 120;
+const NO_CODE = { query: '', files: [], symbols: [], loading: false };
+
+/** Files and declarations matching `query` in `repoName` (a queryable repository), from the API. */
+const useCodeResults = (repoName, query) => {
+  const [state, setState] = useState(NO_CODE);
+  const text = query.trim();
+  const active = Boolean(repoName) && text.length >= CODE_QUERY_MIN;
+  useEffect(() => {
+    if (!active) {
+      setState(NO_CODE);
+      return undefined;
+    }
+    const controller = new AbortController();
+    setState((current) => ({ ...current, loading: true }));
+    const timer = window.setTimeout(async () => {
+      const [files, symbols] = await Promise.allSettled([
+        listRepositoryFiles(repoName, { q: text, limit: 8 }, { signal: controller.signal }),
+        searchRepositorySymbols(repoName, text, { signal: controller.signal }),
+      ]);
+      if (controller.signal.aborted) return;
+      setState({
+        query: text,
+        files: files.status === 'fulfilled' ? files.value.data?.files || [] : [],
+        symbols: symbols.status === 'fulfilled' ? symbols.value.data?.symbols || [] : [],
+        loading: false,
+      });
+    }, CODE_DELAY_MS);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [active, repoName, text]);
+  return active ? state : NO_CODE;
+};
+
+const Path = ({ path }) => {
+  const slash = path.lastIndexOf('/');
+  return (
+    <span className="font-mono text-[12.5px]">
+      {slash > 0 && <span className="text-ink-3">{path.slice(0, slash + 1)}</span>}
+      {path.slice(slash + 1)}
+    </span>
+  );
 };
 
 const dotClass = (repo) => {
@@ -35,16 +72,23 @@ const dotClass = (repo) => {
 
 /**
  * ⌘K palette: jump to a repository, act on the open one, or start indexing
- * a typed owner/repo. Arrow keys move, Enter runs, Escape closes.
+ * a typed owner/repo. Inside a searchable repository it also jumps to any
+ * indexed file (by name or partial path) or declaration (`class ParamType`
+ * → its exact line). Arrow keys move, Enter runs, Escape closes.
  */
 const CommandPalette = ({ open, onClose, onAddRepository, currentRepo = null, onRepoAction, onShowTab }) => {
   const repos = useStore((state) => state.repos);
+  const openFile = useStore((state) => state.openFile);
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
   const inputRef = useRef(null);
   const dialogRef = useRef(null);
   const listRef = useRef(null);
+  // Enter pressed while files and symbols are still loading runs the best
+  // result once they arrive.
+  const pendingEnter = useRef(false);
+  const code = useCodeResults(open && currentRepo?.queryable ? currentRepo.repo_name : null, query);
   useFocusTrap(dialogRef, open, { onEscape: () => onClose(), initialFocusRef: inputRef });
 
   useEffect(() => {
@@ -90,16 +134,41 @@ const CommandPalette = ({ open, onClose, onAddRepository, currentRepo = null, on
       { id: 'docs', label: 'Documentation', icon: BookOpen, group: 'Go to', run: go('/docs') },
     ];
     if (!query.trim()) return all;
-    return all
-      .map((item) => ({
+    // Declarations and files of the open repository, scored on the same
+    // 0–100 scale as the commands so the best match of any kind comes first.
+    const codeItems = [
+      ...code.symbols.map((symbol) => ({
+        id: `symbol-${symbol.path}-${symbol.line}`, label: symbolLabel(symbol), detail: symbol.container ? `in ${symbol.container}` : '',
+        hint: `${symbol.path}:${symbol.line}`, icon: Braces, group: 'Symbol', score: symbolScore(symbol.name, query),
+        run: () => openFile({ path: symbol.path, start: symbol.line, end: symbol.line, from: 'symbol' }),
+      })),
+      ...code.files.map((file) => ({
+        id: `file-${file.path}`, label: file.path, path: file.path, icon: FileCode2, group: 'File', score: pathScore(file.path, query),
+        run: () => openFile({ path: file.path, from: 'file' }),
+      })),
+    ].filter((item) => item.score > 0);
+    return [
+      ...all.map((item) => ({
         ...item,
-        score: item.pinned ? 4 : Math.max(score(item.label, query), item.hint ? score(item.hint, query) * 0.9 : 0, item.group !== 'Repositories' ? score(`${item.group} ${item.label}`, query) * 0.8 : 0),
-      }))
+        score: item.pinned ? 101 : Math.max(score(item.label, query), item.hint ? score(item.hint, query) * 0.9 : 0, item.group !== 'Repositories' ? score(`${item.group} ${item.label}`, query) * 0.8 : 0),
+      })),
+      ...codeItems,
+    ]
       .filter((item) => item.score > 0)
       .sort((a, b) => b.score - a.score);
-  }, [repos, query, navigate, onAddRepository, currentRepo, onRepoAction, onShowTab]);
+  }, [repos, query, navigate, onAddRepository, currentRepo, onRepoAction, onShowTab, code, openFile]);
 
   useEffect(() => setActive(0), [query]);
+
+  useEffect(() => {
+    if (!pendingEnter.current || code.loading) return;
+    pendingEnter.current = false;
+    if (items[0]) {
+      onClose();
+      items[0].run?.();
+    }
+  }, [code.loading, items]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { pendingEnter.current = false; }, [query, open]);
 
   // Keep the highlighted option visible while moving with the keyboard.
   useEffect(() => {
@@ -128,9 +197,15 @@ const CommandPalette = ({ open, onClose, onAddRepository, currentRepo = null, on
               if (event.key === 'ArrowUp') { event.preventDefault(); setActive((value) => (items.length ? (value - 1 + items.length) % items.length : 0)); }
               if (event.key === 'Home' && !query) { event.preventDefault(); setActive(0); }
               if (event.key === 'End' && !query) { event.preventDefault(); setActive(Math.max(0, items.length - 1)); }
-              if (event.key === 'Enter') { event.preventDefault(); run(items[active]); }
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                const typed = query.trim();
+                const waiting = Boolean(currentRepo?.queryable) && typed.length >= CODE_QUERY_MIN && (code.loading || code.query !== typed);
+                if (waiting && active === 0 && !(items[0]?.score >= 85)) pendingEnter.current = true;
+                else run(items[active]);
+              }
             }}
-            placeholder="Jump to a repository, run an action, or type owner/repo…"
+            placeholder={currentRepo?.queryable ? 'Jump to a file, symbol, repository or action…' : 'Jump to a repository, run an action, or type owner/repo…'}
             className="h-12 min-w-0 flex-1 bg-transparent text-[14px] text-ink outline-none placeholder:text-ink-3"
             aria-label="Search commands"
             role="combobox"
@@ -146,7 +221,9 @@ const CommandPalette = ({ open, onClose, onAddRepository, currentRepo = null, on
         <ul id="command-results" ref={listRef} role="listbox" aria-label="Commands" className="scroll-thin min-h-0 flex-1 overflow-y-auto p-1.5">
           {items.length === 0 && (
             <li role="presentation" className="px-3 py-6 text-center text-[13px] text-ink-3">
-              No matches for “{query.trim()}”. Type owner/repo to add a repository.
+              {code.loading
+                ? `Looking for files and symbols named “${query.trim()}”…`
+                : `No matches for “${query.trim()}”. Type owner/repo to add a repository.`}
             </li>
           )}
           {items.map((item, index) => {
@@ -166,11 +243,12 @@ const CommandPalette = ({ open, onClose, onAddRepository, currentRepo = null, on
                     <span className="flex h-4 w-4 shrink-0 items-center justify-center" aria-hidden="true"><span className={`h-2 w-2 rounded-full ${dotClass(item.status)}`} /></span>
                   ) : <item.icon className={`h-4 w-4 shrink-0 ${item.danger ? 'text-danger' : 'text-ink-3'}`} aria-hidden="true" />}
                   <span className={`min-w-0 flex-1 truncate text-[13.5px] ${item.danger ? 'text-danger' : 'text-ink'}`}>
-                    {item.label}
+                    {item.path ? <Path path={item.path} /> : item.label}
+                    {item.detail && <span className="ml-1.5 text-[12px] text-ink-3">{item.detail}</span>}
                     {item.status && <span className="sr-only">, {statusSentence(item.status)}</span>}
                   </span>
                   {item.current && <span className="shrink-0 rounded-full bg-accent-soft px-1.5 py-px text-[10.5px] font-medium text-accent-strong">Open</span>}
-                  {item.hint && <span className="hidden truncate font-mono text-[11px] text-ink-3 sm:inline">{item.hint}</span>}
+                  {item.hint && <span className={`${item.group === 'Symbol' ? 'max-w-[45%]' : 'hidden sm:inline'} truncate font-mono text-[11px] text-ink-3`}>{item.hint}</span>}
                   {!grouped && <span className="shrink-0 text-[10.5px] text-ink-3">{item.group}</span>}
                 </div>
               </li>
