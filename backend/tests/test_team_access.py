@@ -196,6 +196,7 @@ def repo_routes(name, ticket=""):
         ("POST", "/github/push-pr", {"json": {"repo_name": name, "file_path": "source/retry.ts", "new_content": "x",
                                               "file_sha": "abc", "edit_ticket": ticket or "missing"}}),
         ("GET", "/github/pr-status", {"params": {"repo_name": name, "pr_number": 1}}),
+        ("POST", "/answers/share", {"json": {"repo_name": name, "answer": ANSWER}}),
     ]
 
 
@@ -205,7 +206,8 @@ class RouteCoverageTests(unittest.TestCase):
 
         listed = {(method, path) for method, path, _ in repo_routes("{repo_name}")}
         listed = {(method, path.replace("some-invite", "{invite_id}").replace(VIEWER, "{member_id}")) for method, path in listed}
-        by_name = {"/query", "/query/stream", "/github/file", "/github/push-pr", "/github/pr-status"}
+        # Routes that name the repository in the query string or the body.
+        by_name = {"/query", "/query/stream", "/github/file", "/github/push-pr", "/github/pr-status", "/answers/share"}
         for path, operations in app.openapi()["paths"].items():
             short = path.removeprefix("/api")
             for method, operation in operations.items():
@@ -604,6 +606,85 @@ class AliasTests(TeamAccessCase):
         names = [(repo["repo_name"], repo["id"]) for repo in self.call(VIEWER, "GET", "/repos").json()]
         self.assertEqual(names, [(REPO, "repo-own"), (f"{REPO}-shared", REPO_ID)])
         self.assertEqual(self.call(VIEWER, "GET", f"/status/{REPO}-shared").json()["id"], REPO_ID)
+
+
+class AnswerShareTests(TeamAccessCase):
+    """FEAT-15: a read-only link to one answer, revocable by its author."""
+
+    def ask(self, user, question="Where are retries configured?"):
+        response = self.call(user, "POST", "/query", json={"repo_name": REPO, "question": question})
+        self.assertEqual(response.status_code, 200, response.text)
+        return self.call(user, "GET", f"/conversations/{REPO}").json()["messages"][-1]
+
+    def share(self, user, **body):
+        response = self.call(user, "POST", "/answers/share", json={"repo_name": REPO, **body})
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def test_a_member_shares_an_answer_any_signed_in_user_reads_it_and_revoking_hides_it(self):
+        self.join(VIEWER)
+        stored = self.ask(VIEWER)
+        created = self.share(VIEWER, message_id=stored["id"])
+        self.assertEqual(created["path"], f"/shared/answer/{created['token']}")
+        shown = self.call(STRANGER, "GET", f"/shared-answers/{created['token']}")
+        self.assertEqual(shown.status_code, 200, shown.text)
+        body = shown.json()
+        self.assertEqual(body["question"], "Where are retries configured?")
+        self.assertEqual(body["answer"], ANSWER)
+        self.assertEqual(body["repository"], "sindresorhus/ky")
+        self.assertEqual(body["commit_sha"], COMMIT)
+        self.assertEqual(body["shared_by"], f"{VIEWER}@example.test")
+        self.assertFalse(body["yours"])
+        citation = body["citations"][0]
+        self.assertEqual(citation["file_path"], "source/retry.ts")
+        self.assertIn(f"/blob/{COMMIT}/source/retry.ts#L1-L3", citation["github_url"])
+        self.assertNotIn("content", citation)
+        self.assertNotIn(created["token"], str(self.rows("SELECT * FROM answer_shares")))
+
+        listed = self.call(VIEWER, "GET", "/answers/shares").json()["shares"]
+        self.assertEqual([(item["id"], item["question"]) for item in listed], [(created["id"], "Where are retries configured?")])
+        self.assertEqual(self.call(STRANGER, "DELETE", f"/answers/shares/{created['id']}").status_code, 404)
+        self.assertEqual(self.call(VIEWER, "DELETE", f"/answers/shares/{created['id']}").status_code, 200)
+        gone = self.call(STRANGER, "GET", f"/shared-answers/{created['token']}")
+        self.assertEqual((gone.status_code, gone.headers.get("x-error-code")), (404, "answer_unavailable"))
+        self.assertEqual(self.call(VIEWER, "GET", "/answers/shares").json()["shares"], [])
+
+    def test_a_just_streamed_answer_is_found_by_its_text(self):
+        self.ask(OWNER)
+        created = self.share(OWNER, message_id="client-side-id", answer=ANSWER)
+        self.assertTrue(self.call(OWNER, "GET", f"/shared-answers/{created['token']}").json()["yours"])
+
+    def test_only_your_own_saved_answer_in_a_repository_you_can_open_is_shared(self):
+        owner_answer = self.ask(OWNER)
+        self.join(VIEWER)
+        refused = self.call(VIEWER, "POST", "/answers/share", json={"repo_name": REPO, "message_id": owner_answer["id"]})
+        self.assertEqual(refused.status_code, 404)
+        self.assertIn("isn't saved in your conversation", refused.json()["detail"])
+        made_up = self.call(VIEWER, "POST", "/answers/share", json={"repo_name": REPO, "answer": "Anything I like"})
+        self.assertEqual(made_up.status_code, 404)
+        stranger = self.call(STRANGER, "POST", "/answers/share", json={"repo_name": REPO, "message_id": owner_answer["id"]})
+        self.assertEqual((stranger.status_code, stranger.json()["detail"]), (404, "Repository not found."))
+        self.assertEqual(self.rows("SELECT * FROM answer_shares"), [])
+
+    def test_the_snapshot_survives_a_cleared_conversation(self):
+        created = self.share(OWNER, message_id=self.ask(OWNER)["id"])
+        self.call(OWNER, "DELETE", f"/conversations/{REPO}")
+        self.assertEqual(self.call(STRANGER, "GET", f"/shared-answers/{created['token']}").json()["answer"], ANSWER)
+
+    def test_a_link_stops_working_when_its_author_loses_access_or_the_repository_is_deleted(self):
+        self.join(VIEWER)
+        member_link = self.share(VIEWER, message_id=self.ask(VIEWER)["id"])
+        owner_link = self.share(OWNER, message_id=self.ask(OWNER)["id"])
+        self.call(OWNER, "DELETE", f"/repos/{REPO}/members/{VIEWER}")
+        self.assertEqual(self.call(STRANGER, "GET", f"/shared-answers/{member_link['token']}").status_code, 404)
+        self.assertEqual(self.call(STRANGER, "GET", f"/shared-answers/{owner_link['token']}").status_code, 200)
+        self.assertEqual(self.call(OWNER, "DELETE", f"/repos/{REPO}").status_code, 200)
+        self.assertEqual(self.call(STRANGER, "GET", f"/shared-answers/{owner_link['token']}").status_code, 404)
+        self.assertEqual(self.rows("SELECT * FROM answer_shares"), [])
+
+    def test_unknown_links_are_404(self):
+        for token in ("x" * 43, "short"):
+            self.assertEqual(self.call(STRANGER, "GET", f"/shared-answers/{token}").status_code, 404)
 
 
 if __name__ == "__main__":

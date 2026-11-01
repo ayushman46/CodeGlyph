@@ -620,8 +620,8 @@ async def list_accessible_repositories(store, user_id: str) -> list[dict[str, An
 
 
 async def remove_repository_access(store, repo_id: str) -> None:
-    """Delete a repository's memberships and invite links (with the repository)."""
-    for table in ("repo_members", "repo_invites"):
+    """Delete a repository's memberships, invite links and shared answers (with the repository)."""
+    for table in ("repo_members", "repo_invites", "answer_shares"):
         try:
             await store.execute(f"DELETE FROM {table} WHERE repo_id = ?", [repo_id])
         except Exception as error:

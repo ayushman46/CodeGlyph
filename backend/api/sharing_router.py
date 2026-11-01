@@ -1,10 +1,13 @@
-"""Share a repository with teammates through invite links.
+"""Share a repository with teammates through invite links, and share answers.
 
 The owner (the user who indexed the repository) creates invite links with a
 role and an expiry, sees and revokes the active ones, changes members'
 roles and removes members. Anyone signed in who opens a link sees what it
 grants and joins; the repository then appears in their workspace under an
 alias that is unique among their own repositories. Members can leave.
+
+Anyone who can open a repository can also share one of their answers as a
+read-only link: a snapshot of the question, the answer and its citations.
 
 Links are long random tokens; only their SHA-256 is stored, so a link is
 shown once, when it is created. Access checks for every repository route
@@ -14,6 +17,7 @@ live in ``api.repository_state`` (``fetch_accessible_repository``).
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import secrets
@@ -27,6 +31,7 @@ from pydantic import BaseModel, Field
 from api.auth import get_current_user
 from api.repository_state import (
     raise_storage_error,
+    repository_access_by_id,
     resolve_repository_access,
     taken_repository_names,
     unique_alias,
@@ -423,3 +428,156 @@ async def accept_invite(token: str, current_user=Depends(get_current_user)):
         return {"repo_name": joined["alias"], "role": joined["role"], "joined": True}
     except Exception as error:
         _storage_errors("join the repository")(error)
+
+
+# ----------------------------------------------------------- shared answers
+
+
+ANSWER_PATH = "/shared/answer/"
+# Active answer links per person.
+MAX_ACTIVE_ANSWER_SHARES = 200
+_ANSWER_UNAVAILABLE = (
+    "This shared answer isn't available. The link may be incomplete, or the person who shared it stopped sharing it."
+)
+_COMMIT_IN_URL = re.compile(r"/blob/([0-9a-f]{7,40})/")
+_CITATION_FIELDS = ("file_path", "start_line", "end_line", "github_url", "language", "cited_in_answer")
+
+
+class AnswerShareRequest(BaseModel):
+    repo_name: str = Field(min_length=1, max_length=200)
+    # The stored message id (an answer loaded from history) and/or the answer
+    # text (an answer streamed in this session, whose stored id the page does
+    # not know). Either way the snapshot is copied from the stored message.
+    message_id: str = Field(default="", max_length=100)
+    answer: str = Field(default="", max_length=200_000)
+
+
+def _answer_snapshot(question: str, message: dict[str, Any], github_url: Any, shared_by: str) -> dict[str, Any]:
+    citations = message.get("citations") if isinstance(message.get("citations"), list) else []
+    kept = [
+        {field: citation.get(field) for field in _CITATION_FIELDS if field in citation}
+        for citation in citations if isinstance(citation, dict) and citation.get("file_path")
+    ][:30]
+    commits = (_COMMIT_IN_URL.search(str(item.get("github_url") or "")) for item in kept)
+    return {
+        "question": question,
+        "answer": str(message.get("content") or ""),
+        "citations": kept,
+        "repository": _full_name(github_url),
+        "commit_sha": next((match.group(1) for match in commits if match), None),
+        "answered_at": message.get("created_at"),
+        "shared_by": shared_by,
+    }
+
+
+@router.post("/answers/share")
+async def share_answer(payload: AnswerShareRequest, current_user=Depends(get_current_user)):
+    """Create a read-only link to one of your answers (shown once)."""
+    try:
+        store = await _store()
+        access = await resolve_repository_access(store, current_user.id, payload.repo_name)
+        select = (
+            "SELECT id, content, citations, created_at FROM chat_messages "
+            "WHERE repo_id = ? AND user_id = ? AND role = 'assistant' "
+        )
+        message = None
+        if payload.message_id:
+            message = await store.fetch_one(select + "AND id = ?", [access["id"], current_user.id, payload.message_id])
+        if not message and payload.answer.strip():
+            message = await store.fetch_one(
+                select + "AND content = ? ORDER BY created_at DESC LIMIT 1", [access["id"], current_user.id, payload.answer],
+            )
+        if not message:
+            raise HTTPException(
+                status_code=404,
+                detail="That answer isn't saved in your conversation, so it can't be shared. Ask again, then share the new answer.",
+            )
+        active = await store.fetch_one(
+            "SELECT COUNT(*) AS count FROM answer_shares WHERE user_id = ? AND revoked_at IS NULL", [current_user.id],
+        )
+        if int((active or {}).get("count") or 0) >= MAX_ACTIVE_ANSWER_SHARES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"You have {MAX_ACTIVE_ANSWER_SHARES} shared answers. Stop sharing some on your account page first.",
+            )
+        question = await store.fetch_one(
+            "SELECT content FROM chat_messages WHERE repo_id = ? AND user_id = ? AND role = 'user' AND created_at <= ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            [access["id"], current_user.id, message["created_at"]],
+        )
+        snapshot = _answer_snapshot(
+            str((question or {}).get("content") or ""), message, access["github_url"], account_label(current_user),
+        )
+        token = secrets.token_urlsafe(32)
+        share_id, created_at = str(uuid4()), _iso(_now())
+        await store.execute(
+            "INSERT INTO answer_shares (id, user_id, repo_id, message_id, token_hash, snapshot_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [share_id, current_user.id, access["id"], message["id"], hash_token(token),
+             json.dumps(snapshot, separators=(",", ":"), ensure_ascii=False), created_at],
+        )
+        return {"id": share_id, "token": token, "path": f"{ANSWER_PATH}{token}", "created_at": created_at}
+    except Exception as error:
+        _storage_errors("share the answer")(error)
+
+
+@router.get("/shared-answers/{token}")
+async def open_shared_answer(token: str, current_user=Depends(get_current_user)):
+    """A shared answer, for any signed-in user with the link."""
+    unavailable = HTTPException(status_code=404, detail=_ANSWER_UNAVAILABLE, headers={"X-Error-Code": "answer_unavailable"})
+    try:
+        if not _TOKEN_PATTERN.fullmatch(token or ""):
+            raise unavailable
+        store = await _store()
+        row = await store.fetch_one(
+            "SELECT id, user_id, repo_id, snapshot_json, created_at FROM answer_shares WHERE token_hash = ? AND revoked_at IS NULL",
+            [hash_token(token)],
+        )
+        # A link stops working once its author can no longer open the
+        # repository (they left or were removed, or it was deleted).
+        if not row or not await repository_access_by_id(store, str(row["user_id"]), str(row["repo_id"])):
+            raise unavailable
+        snapshot = json.loads(row["snapshot_json"])
+        return {**snapshot, "id": row["id"], "shared_at": row["created_at"], "yours": row["user_id"] == current_user.id}
+    except Exception as error:
+        _storage_errors("open the shared answer")(error)
+
+
+@router.get("/answers/shares")
+async def list_answer_shares(current_user=Depends(get_current_user)):
+    """Your active shared answers, newest first."""
+    try:
+        store = await _store()
+        rows = await store.fetch_all(
+            "SELECT id, snapshot_json, created_at FROM answer_shares WHERE user_id = ? AND revoked_at IS NULL "
+            "ORDER BY created_at DESC LIMIT 100",
+            [current_user.id],
+        )
+        shares = []
+        for row in rows:
+            snapshot = json.loads(row["snapshot_json"])
+            shares.append({
+                "id": row["id"], "created_at": row["created_at"], "repository": snapshot.get("repository"),
+                "question": str(snapshot.get("question") or "")[:200],
+            })
+        return {"shares": shares}
+    except Exception as error:
+        _storage_errors("load your shared answers")(error)
+
+
+@router.delete("/answers/shares/{share_id}")
+async def revoke_answer_share(share_id: str, current_user=Depends(get_current_user)):
+    """Stop sharing an answer: its link returns 404 from now on."""
+    try:
+        store = await _store()
+        result = await store.execute(
+            "UPDATE answer_shares SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL",
+            [_iso(_now()), share_id, current_user.id],
+        )
+        if not result.rows_affected:
+            mine = await store.fetch_one("SELECT 1 AS ok FROM answer_shares WHERE id = ? AND user_id = ?", [share_id, current_user.id])
+            if not mine:
+                raise HTTPException(status_code=404, detail="That shared answer was not found. Refresh the list.")
+        return {"revoked": True, "id": share_id}
+    except Exception as error:
+        _storage_errors("stop sharing the answer")(error)

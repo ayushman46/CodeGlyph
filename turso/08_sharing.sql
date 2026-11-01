@@ -45,3 +45,21 @@ CREATE TABLE IF NOT EXISTS repo_invites (
 );
 
 CREATE INDEX IF NOT EXISTS repo_invites_by_repo ON repo_invites(repo_id, created_at);
+
+-- Read-only links to one answer. The question, answer and citations
+-- (commit-pinned GitHub links) are copied when the link is made, so later
+-- conversation or index changes do not alter it. Only a SHA-256 of the token
+-- is stored. A link stops working when it is revoked, or when the person who
+-- made it can no longer open the repository.
+CREATE TABLE IF NOT EXISTS answer_shares (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  snapshot_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS answer_shares_by_user ON answer_shares(user_id, created_at);
