@@ -1,6 +1,5 @@
-import { ArrowRight, ChevronRight, ExternalLink, FileCode2, Folder, FolderOpen, PieChart, Search, Sparkles, X } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
-import { errorMessage, searchRepository } from '../../api/client';
+import { ArrowRight, ExternalLink, FileCode2, PieChart, Sparkles } from 'lucide-react';
+import { useEffect } from 'react';
 import { parseRepository } from '../../lib/citations';
 import { formatBytes, formatCount, relativeTime, shortSha } from '../../lib/format';
 import { formatExact } from '../../lib/phase';
@@ -9,147 +8,10 @@ import ContextMeter, { filesLabels } from '../ai/ContextMeter';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
 import ProgressBar from '../ui/ProgressBar';
-import Spinner from '../ui/Spinner';
+import CodeSearch from './CodeSearch';
+import FileTree from './FileTree';
 
 const LANGUAGE_COLORS = ['#e4561b', '#3178c6', '#f1c40f', '#2ea44f', '#8957e5', '#db61a2', '#0ea5e9', '#a3a3a3'];
-const SEARCH_LIMIT = 25;
-export const CODE_SEARCH_INPUT_ID = 'code-search-input';
-
-const TreeNode = ({ node, depth = 0 }) => {
-  const [open, setOpen] = useState(depth === 0 && node.files > 20);
-  const hasChildren = node.children?.length > 0;
-  const name = node.path.split('/').pop();
-  const indent = { paddingLeft: `${depth * 16 + 6}px` };
-  const content = (
-    <>
-      <ChevronRight className={`h-3.5 w-3.5 shrink-0 text-ink-3 transition-transform ${open ? 'rotate-90' : ''} ${hasChildren ? '' : 'opacity-0'}`} aria-hidden="true" />
-      {open ? <FolderOpen className="h-3.5 w-3.5 shrink-0 text-accent" aria-hidden="true" /> : <Folder className="h-3.5 w-3.5 shrink-0 text-ink-3" aria-hidden="true" />}
-      <span className="truncate font-mono text-[12.5px] text-ink-2">{name}/</span>
-      <span className="ml-auto shrink-0 font-mono text-[11px] text-ink-3"><span className="sr-only">, </span>{formatCount(node.files)}<span className="sr-only"> files</span></span>
-    </>
-  );
-  return (
-    <li>
-      {hasChildren ? (
-        <button
-          type="button"
-          onClick={() => setOpen((value) => !value)}
-          className="flex w-full items-center gap-1.5 rounded-lg py-1 pr-2 text-left text-[13px] transition-colors hover:bg-surface-2"
-          style={indent}
-          aria-expanded={open}
-        >
-          {content}
-        </button>
-      ) : (
-        <div className="flex w-full items-center gap-1.5 py-1 pr-2 text-[13px]" style={indent}>{content}</div>
-      )}
-      {open && hasChildren && (
-        <ul>{node.children.map((child) => <TreeNode key={child.path} node={child} depth={depth + 1} />)}</ul>
-      )}
-    </li>
-  );
-};
-
-const CodeSearch = ({ repoName, onOpenFile }) => {
-  const [query, setQuery] = useState('');
-  const [state, setState] = useState({ loading: false, results: null, error: '' });
-  const requestRef = useRef(0);
-
-  useEffect(() => {
-    const value = query.trim();
-    if (value.length < 2) {
-      requestRef.current += 1;
-      setState({ loading: false, results: null, error: '' });
-      return undefined;
-    }
-    const revision = ++requestRef.current;
-    const controller = new AbortController();
-    const timer = window.setTimeout(async () => {
-      setState((current) => ({ ...current, loading: true, error: '' }));
-      try {
-        const response = await searchRepository(repoName, value, { signal: controller.signal });
-        if (revision === requestRef.current) setState({ loading: false, results: response.data.results || [], error: '' });
-      } catch (error) {
-        if (error?.code === 'ERR_CANCELED') return;
-        if (revision === requestRef.current) setState({ loading: false, results: null, error: errorMessage(error, 'Search failed. Try again in a moment.') });
-      }
-    }, 250);
-    return () => {
-      window.clearTimeout(timer);
-      controller.abort();
-    };
-  }, [query, repoName]);
-
-  const count = state.results?.length ?? 0;
-  const summary = state.results
-    ? count === 0 ? `No matches for “${query.trim()}”.` : `${count >= SEARCH_LIMIT ? `First ${SEARCH_LIMIT}` : count} matching ${count === 1 ? 'file' : 'files'}`
-    : '';
-
-  return (
-    <div>
-      <label className="relative block">
-        <span className="sr-only">Search code</span>
-        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-3" aria-hidden="true" />
-        <input
-          id={CODE_SEARCH_INPUT_ID}
-          type="search"
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          onKeyDown={(event) => { if (event.key === 'Escape' && query) { event.stopPropagation(); setQuery(''); } }}
-          placeholder="Search code: function names, strings, identifiers…"
-          autoComplete="off"
-          spellCheck={false}
-          className="h-10 w-full rounded-xl border border-line bg-surface pl-9 pr-9 text-[13.5px] text-ink outline-none transition-colors placeholder:text-ink-3 focus:border-accent [&::-webkit-search-cancel-button]:hidden"
-        />
-        {state.loading ? (
-          <Spinner className="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-3" />
-        ) : query && (
-          <button type="button" onClick={() => setQuery('')} className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-ink-3 hover:bg-surface-2 hover:text-ink" aria-label="Clear search">
-            <X className="h-3.5 w-3.5" />
-          </button>
-        )}
-      </label>
-      <p className="sr-only" role="status" aria-live="polite">{state.loading ? 'Searching' : summary}</p>
-      {!state.results && !state.error && query.trim().length === 1 && (
-        <p className="mt-1.5 text-[12px] text-ink-3">Keep typing: searches need at least 2 characters.</p>
-      )}
-      {state.error && <p className="mt-2 text-[12.5px] text-danger" role="alert">{state.error}</p>}
-      {state.results && (
-        <div className="mt-2 overflow-hidden rounded-xl border border-line bg-surface">
-          {state.results.length === 0 ? (
-            <p className="p-4 text-[13px] text-ink-3">No matches in the indexed code. Try a shorter identifier or an exact string, or ask a question instead.</p>
-          ) : (
-            <>
-              <p className="border-b border-line px-3.5 py-2 text-[11.5px] text-ink-3" aria-hidden="true">{summary}{count >= SEARCH_LIMIT ? ' · refine the search to narrow it down' : ''}</p>
-              <ul className="scroll-thin max-h-96 divide-y divide-line overflow-y-auto">
-                {state.results.map((result) => (
-                  <li key={`${result.file_path}-${result.start_line}`}>
-                    <button
-                      type="button"
-                      onClick={() => onOpenFile({ path: result.file_path, start: result.matches?.[0]?.line || result.start_line, end: result.matches?.[0]?.line || result.start_line })}
-                      className="w-full px-3.5 py-2.5 text-left transition-colors hover:bg-surface-2 focus-visible:bg-surface-2"
-                    >
-                      <span className="flex items-center gap-2 font-mono text-[12.5px] text-ink">
-                        <FileCode2 className="h-3.5 w-3.5 shrink-0 text-ink-3" aria-hidden="true" />
-                        <span className="truncate">{result.file_path}</span>
-                      </span>
-                      {(result.matches || []).map((match) => (
-                        <span key={match.line} className="mt-1 flex gap-3 font-mono text-[11.5px] text-ink-3">
-                          <span className="w-10 shrink-0 text-right">{match.line}</span>
-                          <span className="truncate text-ink-2">{match.text.trim()}</span>
-                        </span>
-                      ))}
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </>
-          )}
-        </div>
-      )}
-    </div>
-  );
-};
 
 const CoverageCard = ({ repo, onOpenCoverage }) => {
   const selection = repo.selection || {};
@@ -222,7 +84,7 @@ const RepoOverview = ({ repo, onAsk, compact = false, onOpenCoverage, onShowOver
   const fileBudget = Number(selection.selection_budget?.max_files) || 0;
 
   return (
-    <div className="space-y-5">
+    <div className="@container space-y-5">
       {compact && (
         <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[12.5px] text-ink-3">
           <span>{formatCount(repo.indexed_files || data?.total_files)} files indexed</span>
@@ -295,19 +157,13 @@ const RepoOverview = ({ repo, onAsk, compact = false, onOpenCoverage, onShowOver
       {compact && repo.queryable && <CodeSearch repoName={repo.repo_name} onOpenFile={(file) => openFile(file)} />}
 
       {!compact && (
-        <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_18rem]">
+        <div className="grid gap-4 @3xl:grid-cols-[minmax(0,1fr)_18rem]">
           <section className="rounded-2xl border border-line bg-surface p-4" aria-labelledby="folder-map-title">
             <div className="mb-2 flex items-center justify-between">
-              <h2 id="folder-map-title" className="text-[13px] font-semibold text-ink">Folder map</h2>
+              <h2 id="folder-map-title" className="text-[13px] font-semibold text-ink">Files</h2>
               {data?.total_files > 0 && <span className="text-[11px] text-ink-3">{formatCount(data.total_files)} files</span>}
             </div>
-            {overview?.loading && !data ? (
-              <div className="space-y-2" aria-hidden="true">{Array.from({ length: 7 }, (_, index) => <div key={index} className="skeleton h-5" style={{ width: `${55 + ((index * 23) % 40)}%` }} />)}</div>
-            ) : data?.tree?.length ? (
-              <ul className="scroll-thin max-h-[26rem] overflow-y-auto">{data.tree.map((node) => <TreeNode key={node.path} node={node} />)}</ul>
-            ) : (
-              <p className="text-[13px] text-ink-3">{overview?.error || 'No folders yet.'}</p>
-            )}
+            <FileTree repoName={repo.repo_name} onOpenFile={(path) => openFile({ path, from: 'tree' })} className="scroll-thin max-h-[26rem] overflow-y-auto" />
           </section>
           <div className="space-y-4">
             <CoverageCard repo={repo} onOpenCoverage={onOpenCoverage} />

@@ -197,5 +197,13 @@ export const pushGithubPR = (payload) => api.post('/github/push-pr', payload, { 
 export const getPullRequestStatus = (repoName, prNumber, config = {}) => api.get(
   '/github/pr-status', { params: { repo_name: repoName, pr_number: prNumber }, ...config },
 );
+/** Indexed files: ranked matches for `q` (a file name or partial path), or one folder (`dir`) for the file tree. */
+export const listRepositoryFiles = (repo_name, params = {}, config = {}) => api.get(
+  `/repos/${encodeURIComponent(repo_name)}/files`, { params, ...config },
+);
+/** Declarations whose name matches `q`, each with the exact line that declares it. */
+export const searchRepositorySymbols = (repo_name, q, config = {}) => api.get(
+  `/repos/${encodeURIComponent(repo_name)}/symbols`, { params: { q, limit: 12 }, ...config },
+);
 
 export default api;
