@@ -111,6 +111,7 @@ const SECTIONS = [
       { type: 'p', text: 'Answers stream in real time. Claims cite code with its path and line range:' },
       { type: 'pills', items: ['src/server/auth.ts:L12-L40', 'packages/db/schema.prisma:L88-L104'] },
       { type: 'p', text: 'Every citation opens the exact lines in the built-in file viewer and links to GitHub at the indexed commit, so the code you read is the code the answer was based on. Sources are grouped by folder, which makes it easy to see which parts of the repository an answer relied on.' },
+      { type: 'callout', title: 'Name files and code', text: 'Name a file (`httpx/_client.py`) or a symbol (`Client.get`, `res.redirect`) to focus the evidence. A named file is searched for the parts your question is about, not read from the top. Ask which tests cover it, who calls it or what imports it, and those test files, call sites and import lines are included.' },
       { type: 'callout', title: 'Follow-up questions', text: 'Ask follow-ups in the same conversation; recent messages are kept in context. Conversations are saved per repository, so you can pick up where you left off.' },
     ],
   },
