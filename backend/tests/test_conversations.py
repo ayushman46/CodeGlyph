@@ -357,6 +357,55 @@ class ConversationApiTests(EndpointTestCase):
                 self.assertEqual(getattr(self.client, method)(url).status_code, 404)
 
 
+    def test_conversation_queries_read_only_that_conversation_through_its_index(self):
+        # Production has no planner statistics (no ANALYZE), like this file.
+        # Without the conversation among the leading index columns SQLite
+        # picked chat_messages_by_repo_user and read every message the user
+        # has in the repository, large citations included, for each row of
+        # the History list and for each page of an older conversation.
+        first = self.done(self.ask("q0", new=True)[0])["conversation"]
+        for index in range(1, 3):
+            self.done(self.ask(f"q{index}", conversation_id=first["id"])[0])
+        self.done(self.ask("another conversation", new=True)[0])
+        run(save_message(self.store, repo_id=REPO_ID, user_id=USER, role="user", content="Written by an older server"))
+
+        recorded = []
+        fetch_all, fetch_one = self.store.fetch_all, self.store.fetch_one
+
+        async def recording_all(sql, args=None):
+            recorded.append((sql, list(args or [])))
+            return await fetch_all(sql, args)
+
+        async def recording_one(sql, args=None):
+            recorded.append((sql, list(args or [])))
+            return await fetch_one(sql, args)
+
+        with patch.object(self.store, "fetch_all", recording_all), patch.object(self.store, "fetch_one", recording_one):
+            self.threads()
+            url = f"/api/conversations/{REPO_NAME}"
+            page = self.client.get(url, params={"conversation_id": first["id"], "limit": 2}).json()
+            self.client.get(url, params={"conversation_id": first["id"], "limit": 2, "before": page["next_before"]})
+            self.client.get(url)
+            self.done(self.ask("Where is it called?", conversation_id=first["id"])[0])
+
+        kinds = {
+            "history list": "AS message_count", "page": "SELECT id, role, content", "follow-up history": "SELECT role, content, citations",
+            "unthreaded check": "conversation_id IS NULL", "latest": "ORDER BY c.updated_at DESC, c.id DESC LIMIT 1",
+        }
+        seen = set()
+        for sql, args in {(sql, tuple(args)) for sql, args in recorded if "chat_messages" in sql}:
+            plan = [row["detail"] for row in run(fetch_all(f"EXPLAIN QUERY PLAN {sql}", list(args)))]
+            with self.subTest(sql=sql[:100], plan=plan):
+                self.assertFalse([line for line in plan if "chat_messages_by_repo_user" in line or line.startswith("SCAN")])
+                self.assertFalse([line for line in plan if "TEMP B-TREE" in line])
+                self.assertTrue([line for line in plan if "INDEX chat_messages_by_conversation (repo_id=? AND user_id=? AND conversation_id=?)" in line])
+                if "AS message_count" in sql:
+                    # The count and the has-messages check never read a message row.
+                    self.assertEqual(len([line for line in plan if "COVERING INDEX chat_messages_by_conversation" in line]), 2)
+            seen |= {kind for kind, marker in kinds.items() if marker in sql}
+        self.assertEqual(seen, set(kinds))
+
+
 class RepositoryDeletionTests(DatabaseTestCase):
     def test_deleting_a_repository_removes_its_conversations(self):
         run(seed_repo(self.store))

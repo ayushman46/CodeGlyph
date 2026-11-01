@@ -26,8 +26,12 @@ CREATE TABLE IF NOT EXISTS conversations (
   deleted_at TEXT
 );
 
-CREATE INDEX IF NOT EXISTS conversations_by_repo_user ON conversations(repo_id, user_id, deleted_at, updated_at);
-CREATE INDEX IF NOT EXISTS chat_messages_by_conversation ON chat_messages(conversation_id, created_at, id);
+CREATE INDEX IF NOT EXISTS conversations_by_repo_user ON conversations(repo_id, user_id, deleted_at, updated_at, id);
+-- Every message query names the repository, user and conversation. With
+-- all three leading, SQLite prefers this index to chat_messages_by_repo_user
+-- (which would read every message the user has in the repository, including
+-- the large citations of each answer), and created_at, id serve the order.
+CREATE INDEX IF NOT EXISTS chat_messages_by_conversation ON chat_messages(repo_id, user_id, conversation_id, created_at, id);
 
 -- Repository deletion removes its rows table by table; this keeps working
 -- when foreign keys are not enforced on the connection.
@@ -57,7 +61,8 @@ UPDATE conversations SET title = COALESCE((
     replace(replace(replace(f.content, char(13), ' '), char(10), ' '), char(9), ' '),
     '  ', ' '), '  ', ' '), '  ', ' '), '  ', ' '))
   FROM chat_messages f
-  WHERE f.conversation_id = conversations.id AND f.role = 'user'
+  WHERE f.repo_id = conversations.repo_id AND f.user_id = conversations.user_id
+    AND f.conversation_id = conversations.id AND f.role = 'user'
   ORDER BY f.created_at, f.id LIMIT 1
 ), '')
 WHERE title = '';
