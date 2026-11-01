@@ -52,6 +52,26 @@ const deep = {
   summary: '2 indexed files import src/flask/app.py directly, and 2 more files reach it through them (up to 3 levels). 1 test file is affected.',
 };
 
+// Twelve files two levels away: more than ten, so that level starts folded.
+const folded = {
+  ...deep, query: 'src/flask/ctx.py', target_file: 'src/flask/ctx.py', target_files: ['src/flask/ctx.py'],
+  depth_counts: { 1: 1, 2: 12 }, total_dependents: 13,
+  dependents: [
+    { file_path: 'src/flask/app.py', depth: 1, via: 'src/flask/ctx.py', line_number: 32, import_name: '.ctx', is_test: false },
+    ...Array.from({ length: 12 }, (_, index) => ({
+      file_path: `tests/test_${String(index).padStart(2, '0')}.py`, depth: 2, via: 'src/flask/app.py', line_number: 3, import_name: 'flask', is_test: true,
+    })),
+  ],
+  affected_tests: { files: [], count: 0, truncated: false, indirect_count: 0, functions: [], functions_truncated: false, scanned_files: 0 },
+  symbol: null, imports: [],
+};
+
+const tooMany = {
+  ...ambiguous, query: 'index.ts', candidate_count: 2, candidates_complete: false,
+  candidates: [{ file_path: 'packages/a/src/index.ts', dependent_count: 3 }, { file_path: 'packages/b/src/index.ts', dependent_count: 1 }],
+  summary: 'At least 2 indexed files match index.ts. Choose one to see its impact; nothing is analysed until you do.',
+};
+
 const mockImpact = async (page) => {
   const requests = [];
   await page.route('**/api/repos/cal.com/impact/suggestions', (route) => route.fulfill({
@@ -63,6 +83,8 @@ const mockImpact = async (page) => {
     requests.push(params);
     let body = direct;
     if (params.file_path === 'app.py') body = ambiguous;
+    else if (params.file_path === 'index.ts') body = tooMany;
+    else if (params.file_path === 'src/flask/ctx.py') body = folded;
     else if (params.depth === '3') body = deep;
     return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
   });
@@ -116,6 +138,41 @@ test('a dependent opens at its import line inside the dialog and Back returns to
   await expect(row).toBeVisible();
   await page.keyboard.press('Escape');
   await expect(dialog).toHaveCount(0);
+});
+
+test('Back returns to a row in a level that started folded, which stays open', async ({ page }) => {
+  await mockApi(page);
+  await mockImpact(page);
+  await page.goto('/app/r/cal.com');
+  const dialog = await openImpact(page);
+  await dialog.getByLabel(/Include indirect/).check();
+  await dialog.getByLabel('File').fill('src/flask/ctx.py');
+  await dialog.getByRole('button', { name: 'Analyze' }).click();
+  const level = dialog.locator('details', { has: page.locator('summary', { hasText: '2 levels away (12)' }) });
+  const row = dialog.getByRole('button', { name: /tests\/test_07\.py:3/ });
+  await expect(level).not.toHaveAttribute('open', '');
+  await level.locator('summary').click();
+  await row.click();
+  await expect(dialog.getByText('tests/test_07.py imports src/flask/app.py on line 3.')).toBeVisible();
+  await dialog.getByRole('button', { name: 'Back to impact' }).click();
+  await expect(level).toHaveAttribute('open', '');
+  await expect(row).toBeFocused();
+  // Escape from the file comes back to the same place.
+  await row.click();
+  await page.keyboard.press('Escape');
+  await expect(row).toBeFocused();
+  await expect(dialog.getByLabel('File')).toHaveValue('src/flask/ctx.py');
+});
+
+test('a partial list of matches says so', async ({ page }) => {
+  await mockApi(page);
+  await mockImpact(page);
+  await page.goto('/app/r/cal.com');
+  const dialog = await openImpact(page);
+  await dialog.getByLabel('File').fill('index.ts');
+  await dialog.getByRole('button', { name: 'Analyze' }).click();
+  await expect(dialog.getByRole('list', { name: 'Files matching index.ts' }).getByRole('button')).toHaveCount(2);
+  await expect(dialog.getByText('Showing 2 of at least 2. Type more of the path to narrow it down.')).toBeVisible();
 });
 
 test('indirect dependents are grouped by depth with the affected tests and test functions for a symbol', async ({ page }) => {
