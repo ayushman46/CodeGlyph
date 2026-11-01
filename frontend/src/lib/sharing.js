@@ -57,11 +57,28 @@ export const membersLine = (repo) => {
   return `Shared with ${count} ${count === 1 ? 'person' : 'people'}`;
 };
 
-/** The full invite URL for a server path such as "/invite/<token>". */
-export const inviteUrl = (path, origin = '') => `${String(origin).replace(/\/$/, '')}${path?.startsWith('/') ? path : `/${path || ''}`}`;
+/** The full URL for a server path such as "/invite/<token>" or "/shared/answer/<token>". */
+export const linkUrl = (path, origin = '') => `${String(origin).replace(/\/$/, '')}${path?.startsWith('/') ? path : `/${path || ''}`}`;
 
 const DAY = 86_400_000;
 const HOUR = 3_600_000;
+
+// Replies that are not an answer worth sending to someone.
+const UNSHAREABLE_MODES = new Set(['error', 'greeting', 'editing_guidance', 'editing']);
+
+/** Whether a finished reply can be shared as a read-only link. */
+export const canShareAnswer = (message) => Boolean(
+  message && message.role === 'assistant' && !message.streaming && String(message.content || '').trim()
+  && !message.error && !message.stopped && !message.interrupted && !UNSHAREABLE_MODES.has(message.mode),
+);
+
+/** "source/retry.ts:1–3" for a citation (one line: "source/retry.ts:7"). */
+export const citationLabel = (citation) => {
+  const start = Number(citation?.start_line) || 0;
+  const end = Number(citation?.end_line) || start;
+  if (!start) return String(citation?.file_path || '');
+  return `${citation.file_path}:${start}${end > start ? `–${end}` : ''}`;
+};
 
 /** "Expires in 7 days", "Expires in 5 hours", "Expires in under an hour" or "Expired". */
 export const expiryLabel = (expiresAt, now = Date.now()) => {
@@ -98,15 +115,20 @@ export const inviteSentence = (role, expiresAt, locale = undefined) => {
  */
 const plain = (text) => text.replace(/[’']/g, "'").toLowerCase();
 
+/**
+ * A server message shown under `title`. The message stands alone for API
+ * clients, so it may start with the title; under that heading the sentence
+ * would only repeat it, so it is dropped (and `fallback` used if nothing is left).
+ */
+export const detailUnder = (title, detail, fallback = '') => {
+  const text = String(detail || '').trim();
+  const first = text.match(/^[^.]*\.\s*/)?.[0] || '';
+  const rest = first && plain(first).startsWith(plain(title)) ? text.slice(first.length) : text;
+  return rest || fallback;
+};
+
 export const inviteProblem = (status, code, detail = '') => {
-  const problem = (title, fallback) => {
-    // The server's message stands alone for API clients, so it may start
-    // with the title; under that heading the sentence would only repeat it.
-    const text = String(detail || '').trim();
-    const first = text.match(/^[^.]*\.\s*/)?.[0] || '';
-    const rest = first && plain(first).startsWith(plain(title)) ? text.slice(first.length) : text;
-    return { title, detail: rest || fallback };
-  };
+  const problem = (title, fallback) => ({ title, detail: detailUnder(title, detail, fallback) });
   if (code === 'invite_expired') return problem('This invite link has expired', 'Ask the person who shared it for a new link.');
   if (code === 'invite_revoked') return problem('This invite link was revoked', 'Ask the person who shared it for a new link.');
   if (code === 'share_removed') return problem('Your access was removed', 'Ask the owner for a new invite link if you still need this repository.');

@@ -1,9 +1,29 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  canEdit, canManage, editBlockedReason, expiryLabel, inviteProblem, inviteSentence, inviteUrl, isShared, membersLine,
-  roleOf, sharedLine, splitRepos,
+  canEdit, canManage, canShareAnswer, citationLabel, detailUnder, editBlockedReason, expiryLabel, inviteProblem, inviteSentence, linkUrl,
+  isShared, membersLine, roleOf, sharedLine, splitRepos,
 } from './sharing.js';
+
+test('only a finished, written answer offers a share link', () => {
+  const answer = { role: 'assistant', content: '## Direct answer\nRetries live in `source/retry.ts`.', mode: 'rag' };
+  assert.equal(canShareAnswer(answer), true);
+  assert.equal(canShareAnswer({ ...answer, mode: 'retrieval_fallback' }), true);
+  assert.equal(canShareAnswer({ ...answer, streaming: true }), false);
+  assert.equal(canShareAnswer({ ...answer, content: '  ' }), false);
+  assert.equal(canShareAnswer({ ...answer, error: 'Network' }), false);
+  assert.equal(canShareAnswer({ ...answer, stopped: true, partial: true }), false);
+  assert.equal(canShareAnswer({ ...answer, interrupted: true }), false);
+  for (const mode of ['error', 'greeting', 'editing_guidance', 'editing']) assert.equal(canShareAnswer({ ...answer, mode }), false);
+  assert.equal(canShareAnswer({ ...answer, role: 'user' }), false);
+  assert.equal(canShareAnswer(null), false);
+});
+
+test('citation labels name the file and the line range', () => {
+  assert.equal(citationLabel({ file_path: 'source/retry.ts', start_line: 1, end_line: 3 }), 'source/retry.ts:1–3');
+  assert.equal(citationLabel({ file_path: 'source/retry.ts', start_line: 7, end_line: 7 }), 'source/retry.ts:7');
+  assert.equal(citationLabel({ file_path: 'README.md' }), 'README.md');
+});
 
 const owned = { id: 'a', repo_name: 'ky-http', access_role: 'owner', member_count: 2 };
 const viewer = { id: 'b', repo_name: 'express', access_role: 'viewer', shared: true, owner_label: 'ann@example.com' };
@@ -48,8 +68,8 @@ test('sidebar and account lines name the role, the owner and the member count', 
 });
 
 test('invite links are built from the server path and the page origin', () => {
-  assert.equal(inviteUrl('/invite/abc', 'https://app.example.com/'), 'https://app.example.com/invite/abc');
-  assert.equal(inviteUrl('invite/abc', 'http://127.0.0.1:5306'), 'http://127.0.0.1:5306/invite/abc');
+  assert.equal(linkUrl('/invite/abc', 'https://app.example.com/'), 'https://app.example.com/invite/abc');
+  assert.equal(linkUrl('invite/abc', 'http://127.0.0.1:5306'), 'http://127.0.0.1:5306/invite/abc');
 });
 
 test('expiry labels count down in days, then hours', () => {
@@ -65,6 +85,13 @@ test('expiry labels count down in days, then hours', () => {
 test('an invite sentence says the role and the last day it works', () => {
   assert.equal(inviteSentence('viewer', '2026-11-09T12:00:00Z', 'en-GB'), 'Anyone signed in with this link can join as a viewer until 9 Nov 2026.');
   assert.equal(inviteSentence('editor', '', 'en-GB'), 'Anyone signed in with this link can join as an editor.');
+});
+
+test('a shared answer\'s unavailable message is not repeated under its heading', () => {
+  const server = "This shared answer isn't available. The link may be incomplete, or the person who shared it stopped sharing it.";
+  assert.equal(detailUnder('This shared answer isn’t available', server), 'The link may be incomplete, or the person who shared it stopped sharing it.');
+  assert.equal(detailUnder('Title', 'Something else happened.'), 'Something else happened.');
+  assert.equal(detailUnder('Title', '', 'Fallback.'), 'Fallback.');
 });
 
 test('a server message that starts with the title is not repeated under it', () => {

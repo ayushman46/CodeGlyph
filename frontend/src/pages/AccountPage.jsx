@@ -8,6 +8,7 @@ import { disconnectGithub, errorMessage, getGithubLoginUrl } from '../api/client
 import { Avatar } from '../components/SiteHeader';
 import { AccessDialog } from '../components/sharing/RepoAccessButton';
 import ShareDialog from '../components/sharing/ShareDialog';
+import SharedAnswersList from '../components/sharing/SharedAnswersList';
 import Badge from '../components/ui/Badge';
 import Button from '../components/ui/Button';
 import ProgressBar from '../components/ui/ProgressBar';
@@ -138,6 +139,7 @@ const TeamAccessCard = ({ owned, shared, loaded }) => {
           </section>
         </div>
       )}
+      <SharedAnswersList />
       {dialog?.type === 'share' && <ShareDialog repo={dialog.repo} open onClose={() => setDialog(null)} />}
       {dialog?.type === 'access' && <AccessDialog repo={dialog.repo} open stay onClose={() => setDialog(null)} />}
     </Card>

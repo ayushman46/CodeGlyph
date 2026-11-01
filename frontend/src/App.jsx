@@ -37,6 +37,7 @@ const DashboardPage = lazyPage(() => import('./pages/DashboardPage'));
 const DocsPage = lazyPage(() => import('./pages/DocsPage'));
 const GithubCallbackPage = lazyPage(() => import('./pages/GithubCallbackPage'));
 const InvitePage = lazyPage(() => import('./pages/InvitePage'));
+const SharedAnswerPage = lazyPage(() => import('./pages/SharedAnswerPage'));
 const LandingPage = lazyPage(() => import('./pages/LandingPage'));
 const PlatformPage = lazyPage(() => import('./pages/PlatformPage'));
 const PricingPage = lazyPage(() => import('./pages/PricingPage'));
@@ -326,6 +327,7 @@ function App() {
         <Route path="/app" element={<RequireAuth><WorkspaceRoute><DashboardPage /></WorkspaceRoute></RequireAuth>} />
         <Route path="/app/r/:repoName" element={<RequireAuth><WorkspaceRoute><DashboardPage /></WorkspaceRoute></RequireAuth>} />
         <Route path="/invite/:token" element={<RequireAuth><MarketingLayout><InvitePage /></MarketingLayout></RequireAuth>} />
+        <Route path="/shared/answer/:token" element={<RequireAuth><MarketingLayout><SharedAnswerPage /></MarketingLayout></RequireAuth>} />
         <Route path="/github/callback" element={<RouteBoundary fallback={<PageLoader fullscreen label="Connecting GitHub" />} fullscreen><GithubCallbackPage /></RouteBoundary>} />
         <Route path="/dashboard" element={<Navigate to="/app" replace />} />
         <Route path="*" element={<MarketingLayout><NotFoundPage /></MarketingLayout>} />

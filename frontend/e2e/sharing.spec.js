@@ -77,9 +77,36 @@ const mockSharing = async (page, { repos = [repo({ access_role: 'owner', shared:
       return json(route, { repo_name: 'cal.com', role: 'viewer', joined: true });
     }
     if (path === '/status/cal.com' && status) return json(route, status.body, status.code, status.headers);
+    if (path === '/answers/share' && method === 'POST') {
+      state.answerShares.push(route.request().postDataJSON());
+      return json(route, { id: 'share-1', token: TOKEN, path: `/shared/answer/${TOKEN}`, created_at: '2026-11-02T10:00:00Z' });
+    }
+    if (path === `/shared-answers/${TOKEN}`) {
+      if (state.answerRevoked) {
+        return json(route, { detail: 'This shared answer isn\'t available. The link may be incomplete, or the person who shared it stopped sharing it.' }, 404, { 'x-error-code': 'answer_unavailable' });
+      }
+      return json(route, SHARED_ANSWER);
+    }
+    if (path === '/answers/shares/share-1' && method === 'DELETE') {
+      state.answerRevoked = true;
+      return json(route, { revoked: true, id: 'share-1' });
+    }
     return route.fallback();
   });
+  state.answerShares = [];
+  state.answerRevoked = false;
   return state;
+};
+
+const SHARED_ANSWER = {
+  id: 'share-1', question: 'Where is booking confirmation handled?',
+  answer: '## Direct answer\nBooking confirmation is handled in `packages/features/bookings/lib/handleConfirmation.ts:L42-L118`.',
+  citations: [{
+    file_path: 'packages/features/bookings/lib/handleConfirmation.ts', start_line: 42, end_line: 118, language: 'ts', cited_in_answer: true,
+    github_url: `https://github.com/calcom/cal.com/blob/${SHA}/packages/features/bookings/lib/handleConfirmation.ts#L42-L118`,
+  }],
+  repository: 'calcom/cal.com', commit_sha: SHA, answered_at: '2026-11-02T09:59:00Z', shared_by: OWNER_LABEL,
+  shared_at: '2026-11-02T10:00:00Z', yours: false,
 };
 
 test('an owner creates a viewer link, changes a member to editor and removes them', async ({ page }) => {
@@ -202,4 +229,39 @@ test('a name that was never shared still reads as not found', async ({ page }) =
   await mockSharing(page, { repos: [], status: { code: 404, body: { detail: 'Repository not found.' } } });
   await page.goto('/app/r/cal.com');
   await expect(page.getByRole('heading', { name: 'Repository not found' })).toBeVisible();
+});
+
+test('Share answer makes a read-only link to the answer, and Stop sharing revokes it', async ({ page }) => {
+  await mockApi(page);
+  const state = await mockSharing(page);
+  await page.goto('/app/r/cal.com');
+  const composer = page.getByRole('textbox', { name: 'Ask about this codebase' });
+  await composer.fill('Where is booking confirmation handled?');
+  await composer.press('Enter');
+  await expect(page.getByText('which updates the booking and sends emails.')).toBeVisible();
+  await page.getByRole('button', { name: 'Share answer' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Share this answer' });
+  await expect(dialog.getByLabel('Answer link')).toHaveValue(new RegExp(`/shared/answer/${TOKEN}$`));
+  expect(state.answerShares).toHaveLength(1);
+  expect(state.answerShares[0].repo_name).toBe('cal.com');
+  expect(state.answerShares[0].answer).toContain('which updates the booking and sends emails.');
+  await dialog.getByRole('button', { name: 'Stop sharing' }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(state.answerRevoked).toBe(true);
+});
+
+test('a shared answer shows the question, the answer and commit-pinned sources; a revoked one says it is unavailable', async ({ page }) => {
+  await mockApi(page);
+  const state = await mockSharing(page);
+  await page.goto(`/shared/answer/${TOKEN}`);
+  await expect(page.getByRole('heading', { name: 'Where is booking confirmation handled?' })).toBeVisible();
+  await expect(page.getByRole('article', { name: 'Answer' }).getByText('Booking confirmation is handled in')).toBeVisible();
+  await expect(page.getByText(`Shared by ${OWNER_LABEL}`)).toBeVisible();
+  const source = page.getByRole('link', { name: 'packages/features/bookings/lib/handleConfirmation.ts:42–118' });
+  await expect(source).toHaveAttribute('href', new RegExp(`/blob/${SHA}/.*#L42-L118$`));
+  state.answerRevoked = true;
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'This shared answer isn’t available' })).toBeVisible();
+  await expect(page.getByText('The link may be incomplete, or the person who shared it stopped sharing it.', { exact: true })).toBeVisible();
+  await expect(page.getByText(/This shared answer isn.t available/)).toHaveCount(1);
 });

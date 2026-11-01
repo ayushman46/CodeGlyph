@@ -16,6 +16,7 @@ import CodeBlock from '../CodeBlock';
 import { LoadingState } from '../ai/LoadingState';
 import { StreamingFollowUps, StreamingText, useSmoothStream } from '../ai/StreamingText';
 import EditProposalCard, { ProposalToolChips, isEditRun } from './EditProposalCard';
+import ShareAnswerButton from '../sharing/ShareAnswerButton';
 
 const STAGE_LABELS = {
   retrieving: 'Searching the indexed code',
@@ -666,6 +667,7 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
         )}
 
         {settled && !isError && <ReferenceCheck references={message.answer_references} />}
+        {settled && !isError && !editRun && <ShareAnswerButton message={message} repo={repo} />}
 
         {showArtifact && <EditProposalCard message={message} />}
 

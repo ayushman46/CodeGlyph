@@ -5,7 +5,7 @@ import {
 } from '../../api/client';
 import { toast } from '../../hooks/useToasts';
 import {
-  EXPIRY_OPTIONS, MEMBER_ROLES, ROLE_DESCRIPTIONS, ROLE_LABELS, expiryLabel, formatDate, inviteSentence, inviteUrl,
+  EXPIRY_OPTIONS, MEMBER_ROLES, ROLE_DESCRIPTIONS, ROLE_LABELS, expiryLabel, formatDate, inviteSentence, linkUrl,
 } from '../../lib/sharing';
 import useStore from '../../store/useStore';
 import Badge from '../ui/Badge';
@@ -114,7 +114,7 @@ const ShareDialog = ({ repo, open, onClose }) => {
     try {
       const response = await createInvite(repoName, role, days);
       const { invite, path } = response.data;
-      setCreated({ url: inviteUrl(path, window.location.origin), invite });
+      setCreated({ url: linkUrl(path, window.location.origin), invite });
       setData((current) => (current ? { ...current, invites: [invite, ...current.invites] } : current));
     } catch (createError) {
       setError(errorMessage(createError, 'The invite link could not be created.'));

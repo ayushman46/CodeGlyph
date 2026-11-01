@@ -179,6 +179,7 @@ const SECTIONS = [
         ],
       },
       { type: 'callout', title: 'Conversations stay private', text: 'Each person’s questions, answers and saved changes are visible only to them. A member who no longer needs a repository can leave it from its header.' },
+      { type: 'callout', title: 'Share one answer', text: 'Share answer under an answer makes a read-only link to a copy of the question, the answer and its sources (pinned to the indexed commit) for anyone signed in. Stop sharing it from the same dialog or from your account page.' },
     ],
   },
   {

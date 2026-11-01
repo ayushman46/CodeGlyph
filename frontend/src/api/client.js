@@ -211,5 +211,10 @@ export const removeMember = (repoName, userId) => api.delete(`${sharedRepoPath(r
 export const leaveRepository = (repoName) => api.delete(`${sharedRepoPath(repoName)}/membership`);
 export const previewInvite = (token) => api.get(`/invites/${encodeURIComponent(token)}`);
 export const acceptInvite = (token) => api.post(`/invites/${encodeURIComponent(token)}/accept`);
+// Read-only links to one answer (the server copies it from your conversation).
+export const shareAnswer = (repoName, messageId, answer) => api.post('/answers/share', { repo_name: repoName, message_id: messageId || '', answer: answer || '' });
+export const getSharedAnswer = (token) => api.get(`/shared-answers/${encodeURIComponent(token)}`);
+export const listAnswerShares = () => api.get('/answers/shares');
+export const revokeAnswerShare = (shareId) => api.delete(`/answers/shares/${encodeURIComponent(shareId)}`);
 
 export default api;
