@@ -229,7 +229,7 @@ class DatabaseTestCase(unittest.TestCase):
 
 class SchemaBootstrapTests(DatabaseTestCase):
     def test_migrations_create_every_required_table_and_are_idempotent(self):
-        self.assertEqual(self.applied, ["00_init.sql", "05_performance.sql", "06_scale_and_editing.sql"])
+        self.assertEqual(self.applied, ["00_init.sql", "05_performance.sql", "06_scale_and_editing.sql", "07_conversations.sql"])
         tables = {row["name"] for row in run(self.store.fetch_all("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"))}
         self.assertEqual([table for table in REQUIRED_TABLES if table not in tables], [])
         self.assertIn("chunks_fts", tables)
@@ -865,7 +865,10 @@ class EditProposalEndpointTests(EndpointTestCase):
 
 
 class ConversationEndpointTests(EndpointTestCase):
-    def test_delete_conversation_clears_only_the_owners_repository_history(self):
+    def test_delete_conversation_hides_only_the_owners_repository_history_and_erases_nothing(self):
+        # This endpoint used to erase every message (customers lost whole
+        # conversations to one "New chat" click). It now hides the
+        # repository's conversations, and each one can be restored.
         run(seed_repo(self.store, repo_id="repo-gadgets", repo_name="gadgets"))
         run(seed_repo(self.store, repo_id="repo-other", user_id=OTHER, repo_name=REPO_NAME))
         for repo_id, user_id in ((REPO_ID, USER), (REPO_ID, USER), ("repo-gadgets", USER), ("repo-other", OTHER)):
@@ -873,11 +876,22 @@ class ConversationEndpointTests(EndpointTestCase):
 
         response = self.client.delete(f"/api/conversations/{REPO_NAME}")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"cleared": True})
-        self.assertEqual(self.chat_rows(), [])
+        body = response.json()
+        self.assertTrue(body["cleared"])
+        self.assertEqual(len(body["conversation_ids"]), 1)
+        self.assertEqual(len(self.chat_rows()), 2)
         self.assertEqual(len(self.chat_rows("repo-gadgets")), 1)
         self.assertEqual(len(self.chat_rows("repo-other", OTHER)), 1)
-        self.assertEqual(self.client.get(f"/api/conversations/{REPO_NAME}").json(), {"messages": [], "has_more": False, "next_before": None})
+        self.assertEqual(
+            self.client.get(f"/api/conversations/{REPO_NAME}").json(),
+            {"messages": [], "has_more": False, "next_before": None, "conversation": None},
+        )
+        self.assertEqual(self.client.get("/api/conversations/gadgets").json()["messages"][0]["content"], "q for repo-gadgets")
+
+        restored = self.client.post(f"/api/conversations/{REPO_NAME}/threads/{body['conversation_ids'][0]}/restore")
+        self.assertEqual(restored.status_code, 200)
+        self.assertEqual(restored.json()["conversation"]["message_count"], 2)
+        self.assertEqual(len(self.client.get(f"/api/conversations/{REPO_NAME}").json()["messages"]), 2)
 
         self.assertEqual(self.client.delete("/api/conversations/unknown").status_code, 404)
 

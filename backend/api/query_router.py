@@ -1,6 +1,7 @@
 """Repository question, streaming answer, and conversation endpoints."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import posixpath
@@ -14,7 +15,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from starlette.background import BackgroundTask
 
 from agent.agent import run_agent_loop, stream_agent_answer
@@ -79,11 +80,32 @@ _FOLLOW_UP_FILLER = {
     "happening", "mentioned", "previous", "earlier", "above", "one", "ones", "thing", "things", "stuff", "next",
 }
 _BACKTICK_IDENTIFIER = re.compile(r"`([A-Za-z_$][\w$]{2,80})(?:\(\))?`")
+# Conversation ids are 32 lowercase hex characters (uuid4().hex, or
+# hex(randomblob(16)) for conversations made by turso/07_conversations.sql).
+CONVERSATION_ID_PATTERN = r"^[0-9a-f]{32}$"
+CONVERSATION_TITLE_MAX = 80
+
+
 class QueryRequest(BaseModel):
     repo_name: str = Field(min_length=1, max_length=200)
     question: str = Field(min_length=1, max_length=8_000)
     model_profile: Literal["fast", "detailed", "code"] = "fast"
     workflow: Literal["general", "onboarding", "security", "architecture", "contributor", "due_diligence", "editing"] = "general"
+    # The conversation to continue. `new_conversation` starts a new one
+    # instead; with neither, the most recent conversation continues (the
+    # behaviour of clients from before conversations existed).
+    conversation_id: str | None = Field(default=None, pattern=CONVERSATION_ID_PATTERN)
+    new_conversation: bool = False
+
+    @model_validator(mode="after")
+    def _one_conversation_target(self):
+        if self.new_conversation and self.conversation_id:
+            raise ValueError("Send either conversation_id or new_conversation, not both.")
+        return self
+
+
+class ConversationRenameRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=500)
 
 
 def timestamp() -> str:
@@ -94,11 +116,18 @@ async def get_owned_repo(store, repo_name: str, user_id: str):
     return await fetch_owned_repository(store, user_id, repo_name)
 
 
-async def get_conversation_history(store, repo_id: str, user_id: str, limit: int | None = None):
+async def get_conversation_history(store, repo_id: str, user_id: str, conversation_id: str | None, limit: int | None = None):
+    """Recent messages of one conversation, for follow-up questions.
+
+    Only the conversation being continued counts: a new chat has no history,
+    and another conversation's topic never leaks into retrieval.
+    """
+    if not conversation_id:
+        return []
     rows = await store.fetch_all(
-        "SELECT role, content, citations FROM chat_messages WHERE repo_id = ? AND user_id = ? "
+        "SELECT role, content, citations FROM chat_messages WHERE conversation_id = ? AND repo_id = ? AND user_id = ? "
         "ORDER BY created_at DESC, id DESC LIMIT ?",
-        [repo_id, user_id, limit or settings.conversation_history_messages],
+        [conversation_id, repo_id, user_id, limit or settings.conversation_history_messages],
     )
     remaining, retained = settings.max_conversation_history_characters, []
     for message in rows:
@@ -692,13 +721,152 @@ def rank_citations_by_answer(answer: str, citations: list[dict], references: lis
 
 async def save_message(store, *, repo_id: str, user_id: str, role: str, content: str,
                        citations: list | None = None, tool_calls: list | None = None,
-                       mode: str | None = None, latency_ms: int | None = None) -> None:
+                       mode: str | None = None, latency_ms: int | None = None, conversation_id: str | None = None) -> None:
     executor = getattr(store, "execute_idempotent", store.execute)
     await executor(
-        "INSERT INTO chat_messages (id, repo_id, user_id, role, content, citations, tool_calls, mode, latency_ms, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
-        [str(uuid4()), repo_id, user_id, role, content, json.dumps(citations or []), json.dumps(tool_calls or []), mode, latency_ms, timestamp()],
+        "INSERT INTO chat_messages (id, repo_id, user_id, role, content, citations, tool_calls, mode, latency_ms, created_at, conversation_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+        [str(uuid4()), repo_id, user_id, role, content, json.dumps(citations or []), json.dumps(tool_calls or []), mode, latency_ms, timestamp(),
+         conversation_id],
     )
+
+
+# ---------------------------------------------------------------------------
+# Conversations: several per repository, private to the user who asked.
+# ---------------------------------------------------------------------------
+
+
+def conversation_title(question: str) -> str:
+    """A new conversation's title: its first question on one line, cut at a word."""
+    text = " ".join(str(question or "").split())
+    if len(text) <= CONVERSATION_TITLE_MAX:
+        return text or "Untitled conversation"
+    cut = text[:CONVERSATION_TITLE_MAX - 1]
+    space = cut.rfind(" ")
+    if space >= CONVERSATION_TITLE_MAX // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,.;:-") + "…"
+
+
+_CONVERSATION_COLUMNS = "c.id, c.title, c.created_at, c.updated_at"
+# Shown in the history list. A reply holds a proposal when its tool calls
+# include the code editor's (see answer_events).
+_CONVERSATION_COUNTS = (
+    "(SELECT COUNT(*) FROM chat_messages m WHERE m.conversation_id = c.id AND m.repo_id = c.repo_id "
+    "AND m.user_id = c.user_id) AS message_count, "
+    "(SELECT COUNT(*) FROM chat_messages m WHERE m.conversation_id = c.id AND m.repo_id = c.repo_id "
+    "AND m.user_id = c.user_id AND m.role = 'assistant' AND instr(m.tool_calls, '\"code_edit\"') > 0) AS proposal_count"
+)
+# An answer whose messages could not be saved leaves an empty conversation
+# behind; it is never listed or opened.
+_HAS_MESSAGES = (
+    "EXISTS (SELECT 1 FROM chat_messages e WHERE e.conversation_id = c.id AND e.repo_id = c.repo_id AND e.user_id = c.user_id)"
+)
+
+
+def _conversation_payload(row: dict | None) -> dict | None:
+    if not row or not row.get("id"):
+        return None
+    payload = {key: row.get(key) for key in ("id", "title", "created_at", "updated_at")}
+    for key in ("message_count", "proposal_count"):
+        if key in row:
+            payload[key] = int(row.get(key) or 0)
+    return payload
+
+
+async def find_conversation(store, repo_id: str, user_id: str, conversation_id: str, *,
+                            include_deleted: bool = False, counts: bool = False) -> dict | None:
+    where = "c.id = ? AND c.repo_id = ? AND c.user_id = ?" + ("" if include_deleted else " AND c.deleted_at IS NULL")
+    columns = f"{_CONVERSATION_COLUMNS}, c.deleted_at" + (f", {_CONVERSATION_COUNTS}" if counts else "")
+    return await store.fetch_one(f"SELECT {columns} FROM conversations c WHERE {where}", [conversation_id, repo_id, user_id])
+
+
+async def latest_conversation(store, repo_id: str, user_id: str) -> dict | None:
+    """The conversation a repository opens with: the one most recently asked in."""
+    return await store.fetch_one(
+        f"SELECT {_CONVERSATION_COLUMNS} FROM conversations c WHERE c.repo_id = ? AND c.user_id = ? "
+        f"AND c.deleted_at IS NULL AND {_HAS_MESSAGES} ORDER BY c.updated_at DESC, c.id DESC LIMIT 1",
+        [repo_id, user_id],
+    )
+
+
+async def adopt_unthreaded_messages(store, repo_id: str, user_id: str) -> None:
+    """Give messages saved without a conversation one of their own.
+
+    turso/07_conversations.sql threads every message that exists when it runs;
+    a message written afterwards by an older server (during a deploy) has no
+    conversation and would otherwise never be shown. The id comes from the
+    oldest such message, so two requests adopting at once agree on it.
+    """
+    row = await store.fetch_one(
+        "SELECT MIN(created_at) AS first_at, MAX(created_at) AS last_at, COUNT(*) AS total FROM chat_messages "
+        "WHERE conversation_id IS NULL AND repo_id = ? AND user_id = ?",
+        [repo_id, user_id],
+    )
+    if not row or not int(row.get("total") or 0):
+        return
+    question = await store.fetch_one(
+        "SELECT content FROM chat_messages WHERE conversation_id IS NULL AND repo_id = ? AND user_id = ? AND role = 'user' "
+        "ORDER BY created_at, id LIMIT 1",
+        [repo_id, user_id],
+    )
+    conversation_id = hashlib.sha256(f"{repo_id}\0{user_id}\0{row.get('first_at')}".encode()).hexdigest()[:32]
+    executor = getattr(store, "execute_idempotent", store.execute)
+    await executor(
+        "INSERT INTO conversations (id, repo_id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO NOTHING",
+        [conversation_id, repo_id, user_id,
+         conversation_title((question or {}).get("content") or "Earlier conversation"),
+         row.get("first_at") or timestamp(), row.get("last_at") or timestamp()],
+    )
+    await executor(
+        "UPDATE chat_messages SET conversation_id = ? WHERE conversation_id IS NULL AND repo_id = ? AND user_id = ?",
+        [conversation_id, repo_id, user_id],
+    )
+
+
+async def resolve_conversation(store, repo: dict, req, user_id: str) -> dict:
+    """The conversation a question belongs to; ``{"id": None}`` starts a new one."""
+    if getattr(req, "new_conversation", False):
+        return {"id": None}
+    conversation_id = getattr(req, "conversation_id", None)
+    if conversation_id:
+        row = await find_conversation(store, repo["id"], user_id, conversation_id)
+        if not row:
+            raise HTTPException(
+                status_code=404, detail="This conversation was deleted or does not exist. Start a new chat to keep asking.",
+            )
+        return row
+    try:
+        return await latest_conversation(store, repo["id"], user_id) or {"id": None}
+    except Exception as error:
+        # Continuity is not required to answer: the answer starts a new conversation.
+        logger.warning("Latest conversation unavailable for repository %s: %s", repo["id"], type(error).__name__)
+        return {"id": None}
+
+
+async def save_exchange(store, *, repo_id: str, user_id: str, conversation: dict, question: str, answer: str,
+                        citations: list, tool_calls: list, mode: str, latency_ms: int) -> dict:
+    """Save a question and its answer in their conversation, creating it for a new chat."""
+    executor = getattr(store, "execute_idempotent", store.execute)
+    now = timestamp()
+    conversation_id = conversation.get("id")
+    if not conversation_id:
+        conversation_id = uuid4().hex
+        conversation = {"id": conversation_id, "title": conversation_title(question), "created_at": now}
+        await executor(
+            "INSERT INTO conversations (id, repo_id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO NOTHING",
+            [conversation_id, repo_id, user_id, conversation["title"], now, now],
+        )
+    else:
+        await executor("UPDATE conversations SET updated_at = ? WHERE id = ? AND user_id = ?", [now, conversation_id, user_id])
+    await save_message(store, repo_id=repo_id, user_id=user_id, role="user", content=question, conversation_id=conversation_id)
+    await save_message(
+        store, repo_id=repo_id, user_id=user_id, role="assistant", content=answer,
+        citations=citations, tool_calls=tool_calls, mode=mode, latency_ms=latency_ms, conversation_id=conversation_id,
+    )
+    return _conversation_payload({**conversation, "updated_at": now})
 
 
 def _compact_proposal(proposal: dict, max_bytes: int = 3_000_000) -> str:
@@ -764,11 +932,18 @@ def _check_answerable(repo: dict, req) -> None:
         raise HTTPException(status_code=422, detail="The code model is available only in Code editing and PR mode.")
 
 
-async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool) -> AsyncIterator[tuple[str, dict]]:
-    """The single answer pipeline behind the JSON and the streaming endpoints."""
+async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool,
+                        conversation: dict | None = None) -> AsyncIterator[tuple[str, dict]]:
+    """The single answer pipeline behind the JSON and the streaming endpoints.
+
+    `conversation` is the result of resolve_conversation when the caller
+    already checked it (the streaming endpoint does, before its 200).
+    """
     started = time.time()
     repo_name = str(getattr(req, "repo_name"))
     _check_answerable(repo, req)
+    if conversation is None:
+        conversation = await resolve_conversation(store, repo, req, user_id)
     question = str(getattr(req, "question", "")).strip()
     workflow = getattr(req, "workflow", "general") or "general"
     model_profile = getattr(req, "model_profile", "fast") or "fast"
@@ -800,7 +975,7 @@ async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool) -
         mode = "editing_guidance"
     else:
         try:
-            history = await get_conversation_history(store, repo["id"], user_id)
+            history = await get_conversation_history(store, repo["id"], user_id, conversation.get("id"))
         except Exception as error:
             # History improves continuity but is not required to answer.
             logger.warning("Conversation history unavailable for repository %s: %s", repo["id"], type(error).__name__)
@@ -955,16 +1130,19 @@ async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool) -
                 citations = rank_citations_by_answer(answer, citations, answer_references)
 
     latency_ms = int((time.time() - started) * 1000)
+    saved_conversation = _conversation_payload(conversation)
     try:
-        await save_message(store, repo_id=repo["id"], user_id=user_id, role="user", content=question)
-        await save_message(
-            store, repo_id=repo["id"], user_id=user_id, role="assistant", content=answer,
+        saved_conversation = await save_exchange(
+            store, repo_id=repo["id"], user_id=user_id, conversation=conversation, question=question, answer=answer,
             citations=citations, tool_calls=tool_calls, mode=mode, latency_ms=latency_ms,
         )
     except Exception:
         # Chat history is durable telemetry, not a prerequisite for the answer.
         logger.warning("Could not persist chat history for repository %s", repo["id"], exc_info=True)
     yield "done", {
+        # The conversation the exchange was saved in (null when a new chat
+        # could not be saved), so the client can continue it.
+        "conversation": saved_conversation,
         "answer": answer, "mode": mode, "citations": citations, "tool_calls": tool_calls,
         "latency_ms": latency_ms, "tokens_used": 0, "model_profile": effective_model_profile,
         "workflow": workflow, "evidence_plan": evidence_plan, "answer_references": answer_references,
@@ -1164,6 +1342,8 @@ async def query_repo_stream(req: QueryRequest, current_user=Depends(get_current_
         store = get_turso_store()
         repo = await get_owned_repo(store, req.repo_name, current_user.id)
         _check_answerable(repo, req)
+        # A deleted or unknown conversation is a plain 404, like the checks above.
+        conversation = await resolve_conversation(store, repo, req, current_user.id)
     except BaseException as error:
         # BaseException: a cancelled request (shutdown, timeout) must not keep
         # one of the user's few concurrent slots until the process restarts.
@@ -1177,7 +1357,7 @@ async def query_repo_stream(req: QueryRequest, current_user=Depends(get_current_
 
         async def produce():
             try:
-                async for event, data in answer_events(store, repo, req, current_user.id, stream=True):
+                async for event, data in answer_events(store, repo, req, current_user.id, stream=True, conversation=conversation):
                     await queue.put((event, data))
             except asyncio.CancelledError:
                 raise
@@ -1247,23 +1427,56 @@ def _history_cursor(message: dict) -> str:
     return f"{message.get('created_at') or ''}|{message.get('id') or ''}"
 
 
+def _conversation_http_error(error: Exception, action: str) -> HTTPException:
+    if isinstance(error, HTTPException):
+        return error
+    if isinstance(error, DatabaseConfigurationError):
+        return HTTPException(status_code=503, detail=str(error))
+    logger.exception("Could not %s", action)
+    return HTTPException(status_code=500, detail=explain_database_error(error))
+
+
+async def _repository_for(repo_name: str, user_id: str):
+    await assert_turso_schema()
+    store = get_turso_store()
+    return store, await get_owned_repo(store, repo_name, user_id)
+
+
+async def _existing_conversation(store, repo: dict, user_id: str, conversation_id: str, **options) -> dict:
+    if not re.fullmatch(CONVERSATION_ID_PATTERN, conversation_id or ""):
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    row = await find_conversation(store, repo["id"], user_id, conversation_id, **options)
+    if not row:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    return row
+
+
 @router.get("/conversations/{repo_name}")
 async def get_conversation(
     repo_name: str,
     limit: int = Query(default=100, ge=1, le=200),
     before: str | None = Query(default=None, max_length=200),
+    conversation_id: str | None = Query(default=None, max_length=64),
     current_user=Depends(get_current_user),
 ):
-    """Newest `limit` messages, oldest first; `before` pages back through older ones.
+    """One conversation's newest `limit` messages, oldest first; `before` pages back through older ones.
 
+    `conversation_id` picks the conversation; without it the most recently
+    active one opens (`conversation` is null when there is none yet).
     `before` is the `next_before` cursor of the previous page. The response
     says whether older messages exist so the client can load them on demand.
     """
     try:
-        await assert_turso_schema()
-        store = get_turso_store()
-        repo = await get_owned_repo(store, repo_name, current_user.id)
-        where, params = "repo_id = ? AND user_id = ?", [repo["id"], current_user.id]
+        store, repo = await _repository_for(repo_name, current_user.id)
+        if conversation_id:
+            conversation = await _existing_conversation(store, repo, current_user.id, conversation_id)
+        else:
+            await adopt_unthreaded_messages(store, repo["id"], current_user.id)
+            conversation = await latest_conversation(store, repo["id"], current_user.id)
+            if not conversation:
+                return {"messages": [], "has_more": False, "next_before": None, "conversation": None}
+        where = "conversation_id = ? AND repo_id = ? AND user_id = ?"
+        params = [conversation["id"], repo["id"], current_user.id]
         if before:
             created_at, _, message_id = before.partition("|")
             where += " AND (created_at < ? OR (created_at = ? AND id < ?))"
@@ -1282,32 +1495,128 @@ async def get_conversation(
             "messages": messages,
             "has_more": has_more,
             "next_before": _history_cursor(messages[0]) if has_more and messages else None,
+            "conversation": _conversation_payload(conversation),
         }
-    except HTTPException:
-        raise
-    except DatabaseConfigurationError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
     except Exception as error:
-        logger.exception("Could not load conversation history")
-        raise HTTPException(status_code=500, detail=explain_database_error(error)) from error
+        raise _conversation_http_error(error, "load conversation history") from error
 
 
 @router.delete("/conversations/{repo_name}")
 async def clear_conversation(repo_name: str, current_user=Depends(get_current_user)):
-    """Start a fresh conversation for one repository."""
+    """Hide every conversation of one repository (the "new chat" of older clients).
+
+    Nothing is erased: the returned ids can each be restored with
+    POST /conversations/{repo}/threads/{id}/restore.
+    """
     try:
-        await assert_turso_schema()
-        store = get_turso_store()
-        repo = await get_owned_repo(store, repo_name, current_user.id)
-        await store.execute("DELETE FROM chat_messages WHERE repo_id = ? AND user_id = ?", [repo["id"], current_user.id])
-        return {"cleared": True}
-    except HTTPException:
-        raise
-    except DatabaseConfigurationError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+        store, repo = await _repository_for(repo_name, current_user.id)
+        await adopt_unthreaded_messages(store, repo["id"], current_user.id)
+        rows = await store.fetch_all(
+            "SELECT id FROM conversations WHERE repo_id = ? AND user_id = ? AND deleted_at IS NULL",
+            [repo["id"], current_user.id],
+        )
+        ids = [str(row["id"]) for row in rows]
+        if ids:
+            await store.execute(
+                f"UPDATE conversations SET deleted_at = ? WHERE user_id = ? AND id IN ({', '.join('?' for _ in ids)})",
+                [timestamp(), current_user.id, *ids],
+            )
+        return {"cleared": True, "conversation_ids": ids}
     except Exception as error:
-        logger.exception("Could not clear conversation history")
-        raise HTTPException(status_code=500, detail=explain_database_error(error)) from error
+        raise _conversation_http_error(error, "clear conversation history") from error
+
+
+@router.get("/conversations/{repo_name}/threads")
+async def list_conversations(
+    repo_name: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    before: str | None = Query(default=None, max_length=200),
+    current_user=Depends(get_current_user),
+):
+    """The user's saved conversations for one repository, most recently active first.
+
+    Each has its title, dates, and message and proposal counts. `before` is
+    the `next_before` cursor of the previous page.
+    """
+    try:
+        store, repo = await _repository_for(repo_name, current_user.id)
+        await adopt_unthreaded_messages(store, repo["id"], current_user.id)
+        where, params = "c.repo_id = ? AND c.user_id = ? AND c.deleted_at IS NULL", [repo["id"], current_user.id]
+        if before:
+            updated_at, _, last_id = before.partition("|")
+            where += " AND (c.updated_at < ? OR (c.updated_at = ? AND c.id < ?))"
+            params += [updated_at, updated_at, last_id]
+        rows = await store.fetch_all(
+            f"SELECT {_CONVERSATION_COLUMNS}, {_CONVERSATION_COUNTS} FROM conversations c "
+            f"WHERE {where} AND {_HAS_MESSAGES} ORDER BY c.updated_at DESC, c.id DESC LIMIT ?",
+            [*params, limit + 1],
+        )
+        has_more = len(rows) > limit
+        page = [_conversation_payload(row) for row in rows[:limit]]
+        return {
+            "conversations": page,
+            "has_more": has_more,
+            "next_before": f"{page[-1]['updated_at']}|{page[-1]['id']}" if has_more and page else None,
+        }
+    except Exception as error:
+        raise _conversation_http_error(error, "list conversations") from error
+
+
+@router.patch("/conversations/{repo_name}/threads/{conversation_id}")
+async def rename_conversation(
+    repo_name: str, conversation_id: str, body: ConversationRenameRequest, current_user=Depends(get_current_user),
+):
+    title = " ".join(body.title.split())
+    if not title:
+        raise HTTPException(status_code=422, detail="Enter a title.")
+    if len(title) > 120:
+        raise HTTPException(status_code=422, detail="Titles can be at most 120 characters.")
+    try:
+        store, repo = await _repository_for(repo_name, current_user.id)
+        await _existing_conversation(store, repo, current_user.id, conversation_id)
+        await store.execute(
+            "UPDATE conversations SET title = ? WHERE id = ? AND repo_id = ? AND user_id = ?",
+            [title, conversation_id, repo["id"], current_user.id],
+        )
+        return {"conversation": _conversation_payload(await find_conversation(
+            store, repo["id"], current_user.id, conversation_id, counts=True,
+        ))}
+    except Exception as error:
+        raise _conversation_http_error(error, "rename a conversation") from error
+
+
+@router.delete("/conversations/{repo_name}/threads/{conversation_id}")
+async def delete_conversation(repo_name: str, conversation_id: str, current_user=Depends(get_current_user)):
+    """Hide one conversation. Nothing is erased; .../restore brings it back."""
+    try:
+        store, repo = await _repository_for(repo_name, current_user.id)
+        row = await _existing_conversation(store, repo, current_user.id, conversation_id, include_deleted=True)
+        if not row.get("deleted_at"):
+            await store.execute(
+                "UPDATE conversations SET deleted_at = ? WHERE id = ? AND repo_id = ? AND user_id = ? AND deleted_at IS NULL",
+                [timestamp(), conversation_id, repo["id"], current_user.id],
+            )
+        return {"deleted": True, "conversation": _conversation_payload(row)}
+    except Exception as error:
+        raise _conversation_http_error(error, "delete a conversation") from error
+
+
+@router.post("/conversations/{repo_name}/threads/{conversation_id}/restore")
+async def restore_conversation(repo_name: str, conversation_id: str, current_user=Depends(get_current_user)):
+    """Bring back a deleted conversation, in its old place in the list."""
+    try:
+        store, repo = await _repository_for(repo_name, current_user.id)
+        row = await _existing_conversation(store, repo, current_user.id, conversation_id, include_deleted=True)
+        if row.get("deleted_at"):
+            await store.execute(
+                "UPDATE conversations SET deleted_at = NULL WHERE id = ? AND repo_id = ? AND user_id = ?",
+                [conversation_id, repo["id"], current_user.id],
+            )
+        return {"restored": True, "conversation": _conversation_payload(await find_conversation(
+            store, repo["id"], current_user.id, conversation_id, counts=True,
+        ))}
+    except Exception as error:
+        raise _conversation_http_error(error, "restore a conversation") from error
 
 
 @router.get("/edits/{proposal_id}")
