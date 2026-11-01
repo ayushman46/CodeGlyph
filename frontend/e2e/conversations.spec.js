@@ -124,6 +124,18 @@ test('a conversation can be renamed, and the repository reopens the one last ope
   await rows.nth(1).getByRole('button', { name: /^Onboarding path/ }).click();
   await expect(page.getByText('Start with apps/web and packages/features.')).toBeVisible();
 
+  // Export takes the open conversation only, under its title.
+  await page.getByRole('button', { name: 'Repository actions' }).click();
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('menuitem', { name: 'Export conversation' }).click(),
+  ]);
+  expect(download.suggestedFilename()).toBe('cal-com-onboarding-path.md');
+  const exported = await (await download.createReadStream()).toArray().then((chunks) => Buffer.concat(chunks).toString('utf8'));
+  expect(exported).toContain('# calcom/cal.com: Onboarding path');
+  expect(exported).toContain('## Q: Where do I start?');
+  expect(exported).not.toContain('wrong timezone');
+
   // Leaving the repository and coming back (no ?c= in the link) reopens it.
   await page.getByRole('navigation', { name: 'Repositories' }).getByText('fastapi', { exact: true }).click();
   await expect(page).toHaveURL(/\/app\/r\/fastapi$/);
