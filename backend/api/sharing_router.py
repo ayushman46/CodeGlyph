@@ -396,7 +396,7 @@ async def accept_invite(token: str, current_user=Depends(get_current_user)):
             alias = unique_alias(str(invite["repo_name"]), await taken_repository_names(store, current_user.id))
             try:
                 if membership:
-                    # Rejoining after being removed (with a newer link) or leaving.
+                    # Rejoining with a link created after the owner removed them.
                     await store.execute(
                         "UPDATE repo_members SET role = ?, member_label = ?, owner_label = ?, invite_id = ?, joined_at = ?, "
                         "updated_at = ?, alias = ?, removed_at = NULL WHERE repo_id = ? AND user_id = ? AND removed_at IS NOT NULL",
