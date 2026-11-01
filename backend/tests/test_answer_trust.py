@@ -184,6 +184,9 @@ class ReasoningLeakTests(ProviderTestCase):
         for opening in (
             "The user wants a go/no-go risk summary for the change.",
             "The user is requesting a list of every call site.",
+            "The user wants me to list every call site.",
+            "The user would like to know how options are parsed.",
+            "The user has asked for a risk summary.",
             "Okay, so the question is about make_response.",
             "Let me analyze the evidence before answering.",
             "We need to list the tests first.",
@@ -193,6 +196,24 @@ class ReasoningLeakTests(ProviderTestCase):
             self.assertEqual(caught.exception.reason, "planning")
         for answer in ("## Direct answer\nThe user-facing API is `make_response`.", "Okay is a status, not planning."):
             self.assertEqual(user_facing_content(answer), answer)
+
+    # Answers about user-facing flows open this way without a heading; they
+    # were thrown away as "planning" when "needs"/"requests" alone counted.
+    USER_FLOW_ANSWERS = (
+        "The user needs a valid session token; `requireAuth` in `src/auth.ts:L10-L30` rejects requests without one.",
+        "The user requests a reset through `POST /reset`, handled in `src/reset.ts:L5-L40`.",
+        "The user wants to sign in again after the token expires; `refresh` in `src/auth.ts:L40-L52` handles it.",
+    )
+
+    def test_answers_about_what_a_user_does_are_not_mistaken_for_planning(self):
+        for answer in self.USER_FLOW_ANSWERS:
+            with self.subTest(answer=answer):
+                self.assertEqual(user_facing_content(answer), answer)
+                # The streaming filter reaches the same verdict, whatever the chunking.
+                for size in (7, 40):
+                    content_filter = StreamingContentFilter()
+                    shown = [content_filter.feed(answer[index:index + size]) for index in range(0, len(answer), size)]
+                    self.assertEqual("".join(shown) + content_filter.finish(), answer)
 
     def test_the_streaming_filter_never_shows_the_leaked_reasoning(self):
         content_filter = StreamingContentFilter()

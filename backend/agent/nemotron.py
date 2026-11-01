@@ -94,9 +94,17 @@ _FINAL_LABEL = re.compile(
 # Ultra wrote untagged reasoning ("The user wants a go/no-go risk summary...
 # I need to use only the evidence provided") into ``content``, and the user saw
 # it as the reply. Every phrase here is one a real answer does not start with.
+# Answers about user-facing flows do start "The user needs a valid session
+# token" or "The user requests a reset through `POST /reset`", so "wants",
+# "needs" and similar count only when they describe the question: aimed at the
+# assistant ("wants me to") or asking for an answer ("wants a summary", "would
+# like to know"). Every phrase stays shorter than the 40-character paragraph
+# threshold, so the streaming filter can decide as soon as it has 40 characters.
 _INTERNAL_PLANNING_PREFIX = re.compile(
     r"^\s*(?:analysis\s*:|reasoning\s*:|"
-    r"the user (?:said|asked|is asking|wants|would like|needs|has asked|is requesting|requests)|"
+    r"the user (?:said|asked|is asking|has asked)|"
+    r"the user (?:wants|would like|needs|is requesting|requests) (?:me|us)|"
+    r"the user (?:wants|would like|is requesting) (?:a|an|to know|to understand)|"
     r"i (?:should|need to|will)|we (?:should|need to|will)|no need to|"
     r"let me (?:think|analy[sz]e|re-?read|figure out|look (?:at|through) the evidence|check the evidence)|"
     r"(?:okay|ok|alright)[,.]?\s+(?:so|let(?:'s| me)|the user|i|we))\b",
