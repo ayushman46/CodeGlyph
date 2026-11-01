@@ -115,6 +115,40 @@ test('a link to a file and line reopens the viewer there, and selecting a line u
   await expect(page).toHaveURL(/\/app\/r\/cal\.com\?tab=overview$/);
 });
 
+test('a link opened while the repository is still indexing opens once it can be searched (FEAT-10)', async ({ page }) => {
+  await mockApi(page);
+  // fastapi is indexing when the page loads; the second status poll (polls run every 3 s) finds it searchable.
+  const ready = {
+    ...READY_REPO, id: 'r2', repo_name: 'fastapi', github_url: 'https://github.com/tiangolo/fastapi.git', owner: 'tiangolo',
+    full_name: 'tiangolo/fastapi', commit_sha: 'b'.repeat(40),
+  };
+  const indexing = {
+    ...ready, status: 'chunking', index_phase: 'chunking', job_status: 'processing', is_indexing: true, queryable: false,
+    chunk_count: 0, semantic_progress: 0, commit_sha: null, message: 'Reading source files (120 of 900 changed files).', selection: {},
+  };
+  let polls = 0;
+  await page.route('**/api/repos', (route) => route.fulfill(json([indexing])));
+  await page.route('**/api/repos/statuses', (route) => {
+    polls += 1;
+    return route.fulfill(json([polls >= 2 ? ready : indexing]));
+  });
+  await page.route('**/api/repos/fastapi/overview', (route) => route.fulfill(json({
+    repository: ready, total_files: 900, tree: [], root_files: [], key_files: [], languages: [], suggested_questions: [],
+  })));
+  await page.route((url) => url.pathname === '/api/repos/fastapi/file', (route) => route.fulfill(json({
+    path: 'fastapi/routing.py', content: Array.from({ length: 40 }, (_, index) => `value_${index + 1} = ${index + 1}`).join('\n'),
+    source: 'github', ref: 'b'.repeat(40), language: 'python', line_count: 40, total_lines: 40, exact: true, github_url: null, outline: [],
+  })));
+  await page.goto('/app/r/fastapi?file=fastapi/routing.py&line=12');
+  const panel = viewer(page, 'fastapi/routing.py');
+  await expect(panel.getByText('Line 12', { exact: true })).toBeVisible({ timeout: 15_000 });
+  await expect(row(page, 12)).toHaveClass(/color-highlight/);
+  // Loading the conversation that comes with being searchable keeps the viewer and the link.
+  await page.waitForTimeout(1000);
+  await expect(panel).toBeVisible();
+  await expect(page).toHaveURL(/\/app\/r\/fastapi\?file=fastapi\/routing\.py&line=12$/);
+});
+
 test('an empty file opens as empty, and the tree says so', async ({ page }) => {
   await mockApi(page);
   await page.route('**/api/repos/cal.com/files**', (route) => route.fulfill(json({

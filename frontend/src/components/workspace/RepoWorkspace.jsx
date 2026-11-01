@@ -346,22 +346,29 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
   // the repository is selected (selecting resets the panel); after that the
   // URL follows the viewer, and a link to another file arriving later opens
   // it. Only the query string changes (replace), never the transcript.
+  // Selecting the repository again (when it becomes searchable after the
+  // page loaded, the dashboard loads its conversation) resets the panel
+  // after the link was opened: `queryEpoch` changes with history loading,
+  // and the link is read again before the URL can follow the closed panel.
   const selectedRepo = useStore((state) => state.selectedRepo);
+  const queryEpoch = useStore((state) => state.queryEpoch);
   const openFile = useStore((state) => state.openFile);
-  const linkReadFor = useRef(null);
+  const linkRead = useRef({ repoId: null, epoch: null });
   const linkWritten = useRef('');
   const urlLink = readFileLink(location.search);
   const urlLinkKey = fileLinkKey(urlLink);
   useEffect(() => {
     if (selectedRepo !== repo.repo_name || !repo.queryable) return;
-    const first = linkReadFor.current !== repo.id;
-    linkReadFor.current = repo.id;
-    if (!urlLink || urlLinkKey === fileLinkKey(viewerLink(useStore.getState().sources))) return;
+    const state = useStore.getState();
+    const reselected = linkRead.current.repoId === repo.id && linkRead.current.epoch !== queryEpoch && state.isHistoryLoading;
+    const first = linkRead.current.repoId !== repo.id || reselected;
+    linkRead.current = { repoId: repo.id, epoch: queryEpoch };
+    if (!urlLink || urlLinkKey === fileLinkKey(viewerLink(state.sources))) return;
     if (!first && urlLinkKey === linkWritten.current) return;
     openFile({ path: urlLink.path, start: urlLink.start, end: urlLink.end, from: 'link' });
-  }, [selectedRepo, repo.repo_name, repo.queryable, repo.id, urlLinkKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selectedRepo, repo.repo_name, repo.queryable, repo.id, urlLinkKey, queryEpoch]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
-    if (linkReadFor.current !== repo.id) return;
+    if (linkRead.current.repoId !== repo.id) return;
     const link = viewerLink(useStore.getState().sources);
     linkWritten.current = fileLinkKey(link);
     const search = writeFileLink(location.search, link);
