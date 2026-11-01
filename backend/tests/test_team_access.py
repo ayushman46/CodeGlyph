@@ -19,6 +19,7 @@ import test_000_environment  # noqa: F401  (isolate from real services first)
 
 import asyncio
 import itertools
+import logging
 import tempfile
 import unittest
 import uuid
@@ -32,6 +33,7 @@ from fastapi.testclient import TestClient
 from agent.code_edit import create_edit_ticket
 from api.auth import AuthenticatedUser, get_current_user
 from api.repository_state import unique_alias
+from api.sharing_router import hash_token, redact_link_tokens
 from config import UserRequestLimiter, settings
 from database import TursoStore, apply_migrations
 
@@ -695,6 +697,54 @@ class RemovalAndRevocationTests(TeamAccessCase):
         self.join(VIEWER, "viewer")
         result = self.call(VIEWER, "POST", f"/invites/{self.invite('editor')['token']}/accept").json()
         self.assertEqual(result, {"repo_name": REPO, "role": "viewer", "joined": False})
+
+
+class LinkTokensInLogsTests(TeamAccessCase):
+    """Invite and answer links are bearer tokens in the URL path: logs must not hold them."""
+
+    def test_paths_with_a_link_token_are_redacted_to_a_fingerprint(self):
+        token = "Jx4m8k2Q9vZpL0aT7wR3nY6uC1eB5dHfGgKiMoNsPqX"
+        mark = f"[token:{hash_token(token)[:8]}]"
+        for path, expected in (
+            (f"/api/invites/{token}", f"/api/invites/{mark}"),
+            (f"/api/invites/{token}/accept", f"/api/invites/{mark}/accept"),
+            (f"/api/shared-answers/{token}?x=1", f"/api/shared-answers/{mark}?x=1"),
+            (f"/invite/{token}", f"/invite/{mark}"),
+            (f"/shared/answer/{token}", f"/shared/answer/{mark}"),
+            # Invite ids, member ids and other paths are not secrets.
+            (f"/api/repos/{REPO}/invites/0f9c7d2e-1111-4222-8333-444455556666", f"/api/repos/{REPO}/invites/0f9c7d2e-1111-4222-8333-444455556666"),
+            (f"/api/status/{REPO}", f"/api/status/{REPO}"),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(redact_link_tokens(path), expected)
+
+    def test_the_apps_request_log_shows_a_fingerprint_not_the_token(self):
+        token = self.invite()["token"]
+        with self.assertLogs("codebase_intel", "INFO") as captured:
+            self.call(VIEWER, "GET", f"/invites/{token}")
+            self.call(VIEWER, "POST", f"/invites/{token}/accept")
+            self.call(VIEWER, "GET", f"/shared-answers/{token}")
+        text = "\n".join(captured.output)
+        self.assertNotIn(token, text)
+        self.assertIn(f"path=/api/invites/[token:{hash_token(token)[:8]}]/accept status=200", text)
+
+    def test_uvicorns_access_log_shows_a_fingerprint_not_the_token(self):
+        import uvicorn
+
+        from main import app
+
+        # The server applies its logging config at startup, after main is
+        # imported (scripts/dev_server.py) or before (uvicorn main:app); the
+        # filter must survive either way.
+        uvicorn.Config(app=app)
+        token = self.invite()["token"]
+        access = logging.getLogger("uvicorn.access")
+        with self.assertLogs("uvicorn.access", "INFO") as captured:
+            access.info('%s - "%s %s HTTP/%s" %d', "127.0.0.1:50000", "POST", f"/api/invites/{token}/accept", "1.1", 200)
+            access.info('%s - "%s %s HTTP/%s" %d', "127.0.0.1:50000", "GET", f"/invite/{token}", "1.1", 200)
+        self.assertNotIn(token, "\n".join(captured.output))
+        self.assertEqual(len(captured.records[0].args), 5)  # uvicorn's AccessFormatter unpacks five values
+        self.assertIn(f"/invite/[token:{hash_token(token)[:8]}]", captured.output[1])
 
 
 class AliasTests(TeamAccessCase):

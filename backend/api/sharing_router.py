@@ -79,6 +79,26 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+# Invite and answer links carry their token in the URL path, both the API's
+# and the web app's. Request logs show the start of the token's stored hash
+# instead (enough to find its row), so logs never hold a working link.
+_TOKEN_IN_PATH = re.compile(r"^(/api/invites/|/api/shared-answers/|/invite/|/shared/answer/)([^/?#]+)")
+
+
+def redact_link_tokens(path: str) -> str:
+    """``path`` with an invite or answer link's token replaced by a fingerprint."""
+    return _TOKEN_IN_PATH.sub(lambda match: f"{match[1]}[token:{hash_token(match[2])[:8]}]", str(path or ""), count=1)
+
+
+class RedactLinkTokens(logging.Filter):
+    """Redacts link tokens in uvicorn's access log ("%s - "%s %s HTTP/%s" %d")."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            record.args = (*args[:2], redact_link_tokens(args[2]), *args[3:])
+        return True
+
 
 def account_label(user: Any) -> str:
     """How other people see this account: email, else name, else its id."""

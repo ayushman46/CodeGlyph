@@ -193,7 +193,7 @@ Repository routes accept the owner's repository name or a member's name for a sh
 ## Security
 
 - Supabase validates every session; verified sessions are cached briefly (bounded by token expiry). Every query is scoped to the authenticated user.
-- Shared repositories are checked on the server for every repository route (owner, editor or viewer). Invite tokens are 256-bit random values stored only as SHA-256 hashes; a member removed by the owner cannot rejoin with a link created before the removal, and leaving and rejoining with an older link keeps a role the owner changed.
+- Shared repositories are checked on the server for every repository route (owner, editor or viewer). Invite and answer link tokens are 256-bit random values stored only as SHA-256 hashes and shown in request logs only as a hash prefix; a member removed by the owner cannot rejoin with a link created before the removal, and leaving and rejoining with an older link keeps a role the owner changed.
 - Repository content, issues and conversation history are treated as untrusted data in every prompt.
 - GitHub tokens are encrypted at rest; the OAuth state is single-use and short-lived. PR creation requires a signed, short-lived ticket scoped to the user, repository and exact file set, plus the reviewed blob SHA of every modified file.
 - Archive extraction rejects path traversal, links and devices, bounds download size and time, and never uses `tar.extract`.

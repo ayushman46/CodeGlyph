@@ -22,13 +22,15 @@ from api.repos_router import router as repos_router
 from api.billing_router import router as billing_router
 from api.github_router import router as github_router
 from api.explore_router import router as explore_router
-from api.sharing_router import router as sharing_router
+from api.sharing_router import RedactLinkTokens, redact_link_tokens, router as sharing_router
 from agent.nemotron import close_async_client
 from database import DatabaseConfigurationError, assert_turso_schema, get_turso_store
 from frontend_static import HashedAssets, revalidated_file
 from ingest.local_worker import process_queue_forever
 
 logger = logging.getLogger("codebase_intel")
+# Invite and shared-answer links carry a token in the path; keep it out of logs.
+logging.getLogger("uvicorn.access").addFilter(RedactLinkTokens())
 _dependency_cache: dict[bool, tuple[float, dict]] = {}
 _dependency_cache_lock = asyncio.Lock()
 
@@ -143,7 +145,7 @@ class BodySizeLimitMiddleware:
             try:
                 await self.app(scope, counted_receive, send)
             except _BodyTooLarge:
-                logger.warning("Request body exceeded its declared length path=%s", scope.get("path"))
+                logger.warning("Request body exceeded its declared length path=%s", redact_link_tokens(scope.get("path")))
             return
         # No declared length: buffer at most ``limit`` bytes, then replay.
         messages, total = [], 0
@@ -234,7 +236,7 @@ async def add_security_headers(request: Request, call_next):
     try:
         response = await call_next(request)
     except Exception:
-        logger.exception("request failed method=%s path=%s request_id=%s", request.method, request.url.path, request_id)
+        logger.exception("request failed method=%s path=%s request_id=%s", request.method, redact_link_tokens(request.url.path), request_id)
         raise
     # The SPA uses only same-origin scripts and API calls. Supabase is needed
     # for OAuth/session traffic and remote HTTPS avatars are permitted.
@@ -258,7 +260,7 @@ async def add_security_headers(request: Request, call_next):
     logger.info(
         "request completed method=%s path=%s status=%s latency_ms=%s request_id=%s",
         request.method,
-        request.url.path,
+        redact_link_tokens(request.url.path),
         response.status_code,
         int((time.perf_counter() - started) * 1000),
         request_id,
