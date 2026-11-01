@@ -199,3 +199,17 @@ export const getPullRequestStatus = (repoName, prNumber, config = {}) => api.get
 );
 
 export default api;
+
+/**
+ * Change impact for one file: `depth` 1-3 follows imports of imports and
+ * `symbol` lists the test functions that use it. A path matching several
+ * files answers `ambiguous` with `candidates` instead of a report.
+ */
+export const getChangeImpact = (repo_name, { filePath, depth = 1, symbol = '', limit = 100 }, config = {}) => api.get(
+  `/repos/${encodeURIComponent(repo_name)}/impact`,
+  { params: { file_path: filePath, depth, limit, ...(symbol ? { symbol } : {}) }, ...config },
+);
+/** The most imported files of a repository; also upgrades an outdated import graph. */
+export const getImpactSuggestions = (repo_name, config = {}) => api.get(
+  `/repos/${encodeURIComponent(repo_name)}/impact/suggestions`, config,
+);

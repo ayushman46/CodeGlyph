@@ -1,14 +1,20 @@
-import { AlertTriangle, FileCode2, RefreshCw, Search, Square } from 'lucide-react';
+import {
+  AlertTriangle, ArrowLeft, Check, ChevronRight, Copy, FileCode2, PanelRight, RefreshCw, Search, Square,
+} from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { errorMessage, getRepositoryCoverage } from '../../api/client';
+import { errorMessage, getChangeImpact, getImpactSuggestions, getRepositoryCoverage } from '../../api/client';
 import { formatBytes, formatCount, shownLabel } from '../../lib/format';
+import {
+  MAX_IMPACT_DEPTH, depthLabel, examplePath, groupDependents, groupTestFunctions, impactMarkdown, testMatchLabel,
+} from '../../lib/impact';
 import useStore from '../../store/useStore';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
 import Modal from '../ui/Modal';
 import ProgressBar from '../ui/ProgressBar';
 import Spinner from '../ui/Spinner';
+import FileViewer from './FileViewer';
 
 const REASON_LABELS = {
   hidden: 'Hidden files',
@@ -250,50 +256,408 @@ const StopDialog = ({ repo: snapshot, onClose }) => {
   );
 };
 
+const ImpactRow = ({ rowKey, path, line, detail, badge, onOpen }) => (
+  <li>
+    <button
+      type="button"
+      data-impact-row={rowKey}
+      onClick={onOpen}
+      className="group flex w-full items-start gap-2 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-surface-2"
+    >
+      <FileCode2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-ink-3" aria-hidden="true" />
+      <span className="min-w-0 flex-1">
+        <span className="block truncate font-mono text-[12.5px] text-ink-2 group-hover:text-ink" title={path}>
+          {path}{line ? <span className="text-ink-3">:{line}</span> : null}
+        </span>
+        {detail && <span className="block truncate text-[11.5px] leading-snug text-ink-3" title={detail}>{detail}</span>}
+      </span>
+      {badge}
+    </button>
+  </li>
+);
+
+const SectionTitle = ({ children, aside }) => (
+  <div className="mb-1 flex items-baseline justify-between gap-3">
+    <h3 className="text-[11px] font-semibold uppercase tracking-wider text-ink-3">{children}</h3>
+    {aside}
+  </div>
+);
+
+/**
+ * The dependents found at one depth, each opening at its import line. A
+ * long indirect level starts folded so the affected tests stay in reach.
+ */
+const DependentGroup = ({ group, showDepth, onOpen }) => {
+  const rows = (
+    <ul>
+      {group.items.map((node) => (
+        <ImpactRow
+          key={node.file_path}
+          rowKey={`dep:${node.file_path}`}
+          path={node.file_path}
+          line={node.line_number}
+          detail={node.depth > 1 ? `via ${node.via}` : null}
+          badge={node.is_test ? <Badge tone="info" className="mt-0.5">test</Badge> : null}
+          onOpen={() => onOpen({
+            key: `dep:${node.file_path}`, path: node.file_path, start: node.line_number,
+            caption: `${node.file_path} imports ${node.via} on line ${node.line_number}.`,
+          })}
+        />
+      ))}
+      {group.items.length < group.total && (
+        <li className="px-2 pt-1 text-[12px] text-ink-3">Showing {formatCount(group.items.length)} of {formatCount(group.total)}.</li>
+      )}
+    </ul>
+  );
+  if (!showDepth) return rows;
+  const heading = <>{depthLabel(group.depth)} <span className="font-normal text-ink-3">({formatCount(group.total)})</span></>;
+  if (group.depth === 1) return <div><p className="mb-0.5 mt-2 px-2 text-[12px] font-medium text-ink-2">{heading}</p>{rows}</div>;
+  return (
+    <details className="group/depth mt-1" open={group.total <= 10}>
+      <summary className="flex cursor-pointer list-none items-center gap-1 rounded-lg px-2 py-1 text-[12px] font-medium text-ink-2 hover:bg-surface-2 [&::-webkit-details-marker]:hidden">
+        <ChevronRight className="h-3.5 w-3.5 text-ink-3 transition-transform group-open/depth:rotate-90" aria-hidden="true" />
+        {heading}
+      </summary>
+      {rows}
+    </details>
+  );
+};
+
 const ImpactDialog = ({ repo, onClose }) => {
-  const analyzeImpact = useStore((state) => state.analyzeImpact);
-  const clearImpactAnalysis = useStore((state) => state.clearImpactAnalysis);
-  const impactAnalysis = useStore((state) => state.impactAnalysis);
-  const impactAnalysisLoading = useStore((state) => state.impactAnalysisLoading);
-  const impactAnalysisError = useStore((state) => state.impactAnalysisError);
   const openFile = useStore((state) => state.openFile);
-  const [path, setPath] = useState('');
-  useEffect(() => () => clearImpactAnalysis(), [clearImpactAnalysis]);
+  // The file open in the viewer is the likely subject of the question.
+  const viewerPath = useStore((state) => (state.sources.open ? state.sources.file?.path || '' : ''));
+  const rootFiles = useStore((state) => state.overviews[repo.repo_name]?.data?.root_files);
+  const [path, setPath] = useState(viewerPath);
+  const [symbol, setSymbol] = useState('');
+  const [indirect, setIndirect] = useState(false);
+  const [state, setState] = useState({ loading: false, result: null, error: '' });
+  const [suggestions, setSuggestions] = useState({ files: [], graph: null });
+  const [viewing, setViewing] = useState(null);
+  const [copy, setCopy] = useState({ status: '', text: '' });
+  const inputRef = useRef(null);
+  const backRef = useRef(null);
+  const bodyRef = useRef(null);
+  const returnRow = useRef('');
+  const requestId = useRef(0);
+  const result = state.result;
+
+  useEffect(() => {
+    const controller = new AbortController();
+    getImpactSuggestions(repo.repo_name, { signal: controller.signal })
+      .then((response) => setSuggestions({ files: response.data?.files || [], graph: response.data?.graph || null }))
+      .catch(() => {});
+    return () => { controller.abort(); requestId.current = -1; };
+  }, [repo.repo_name]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => inputRef.current?.select(), 20);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  // Moving between the report and a file keeps focus where the reader is.
+  useEffect(() => {
+    if (viewing) {
+      backRef.current?.focus();
+      return undefined;
+    }
+    const key = returnRow.current;
+    if (key) bodyRef.current?.querySelector(`[data-impact-row="${CSS.escape(key)}"]`)?.focus();
+    return undefined;
+  }, [viewing]);
+
+  // Escape inside a file goes back to the report; a second Escape closes.
+  useEffect(() => {
+    if (!viewing) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key !== 'Escape') return;
+      event.stopPropagation();
+      event.preventDefault();
+      setViewing(null);
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [viewing]);
+
+  const run = async (target = path, options = {}) => {
+    const filePath = String(target || '').trim();
+    if (!filePath) return;
+    const deep = options.indirect ?? indirect;
+    const name = (options.symbol ?? symbol).trim();
+    const request = ++requestId.current;
+    setCopy({ status: '', text: '' });
+    setState((current) => ({ ...current, loading: true, error: '' }));
+    try {
+      const response = await getChangeImpact(repo.repo_name, { filePath, depth: deep ? MAX_IMPACT_DEPTH : 1, symbol: name });
+      if (request !== requestId.current) return;
+      setState({ loading: false, result: { ...response.data, requestedSymbol: name }, error: '' });
+    } catch (error) {
+      if (request !== requestId.current) return;
+      setState({ loading: false, result: null, error: errorMessage(error, 'Impact analysis failed. Check the file path and try again.') });
+    }
+  };
+
   const submit = (event) => {
     event.preventDefault();
-    if (path.trim()) void analyzeImpact(repo, path.trim());
+    void run();
   };
-  const FileLink = ({ value }) => (
-    <button type="button" onClick={() => { openFile({ path: value }); onClose(); }} className="flex w-full items-center gap-2 rounded-lg px-2 py-1 text-left font-mono text-[12.5px] text-ink-2 hover:bg-surface-2 hover:text-ink">
-      <FileCode2 className="h-3.5 w-3.5 shrink-0 text-ink-3" aria-hidden="true" /> <span className="truncate">{value}</span>
-    </button>
-  );
+  const choose = (filePath) => {
+    setPath(filePath);
+    void run(filePath);
+  };
+  const setDepth = (deep) => {
+    setIndirect(deep);
+    if (result?.target_file) void run(result.target_file, { indirect: deep });
+  };
+  const open = (file) => {
+    returnRow.current = file.key;
+    setViewing(file);
+  };
+  const openInPanel = () => {
+    openFile({ path: viewing.path, start: viewing.start || null, end: viewing.end || viewing.start || null });
+    onClose();
+  };
+  const copyReport = async () => {
+    const text = impactMarkdown(result, { symbol: result.requestedSymbol });
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopy({ status: 'copied', text: '' });
+      window.setTimeout(() => setCopy((current) => (current.status === 'copied' ? { status: '', text: '' } : current)), 1800);
+    } catch {
+      // No clipboard (permissions, insecure context): show the text to copy by hand.
+      setCopy({ status: 'manual', text });
+    }
+  };
+
+  const groups = useMemo(() => groupDependents(result), [result]);
+  const testFunctions = useMemo(() => groupTestFunctions(result?.affected_tests?.functions || []), [result]);
+  const graph = result?.graph || suggestions.graph;
+  const example = examplePath(suggestions.files, rootFiles?.[0]);
+  const tests = result?.affected_tests;
+  const requestedSymbol = result?.requestedSymbol || '';
+  const totalDependents = groups.reduce((sum, group) => sum + group.total, 0);
+  // Tests further away than the chosen depth (only reported for direct analysis).
+  const moreTests = result?.depth === 1 ? Number(tests?.indirect_count) || 0 : 0;
+
   return (
-    <Modal open onClose={onClose} size="md" title="Change impact" description="Which indexed files import a file, and what it imports. Only imports resolved inside this repository are shown.">
-      <form onSubmit={submit} className="flex gap-2">
-        <label htmlFor="impact-input" className="sr-only">File path</label>
-        <input id="impact-input" value={path} autoFocus autoComplete="off" spellCheck={false} onChange={(event) => setPath(event.target.value)} placeholder="src/lib/auth.ts" className="h-10 min-w-0 flex-1 rounded-xl border border-line bg-surface px-3 font-mono text-[13px] text-ink outline-none focus:border-accent" />
-        <Button type="submit" variant="primary" loading={impactAnalysisLoading} disabled={!path.trim()}>Analyze</Button>
-      </form>
-      {!impactAnalysis && !impactAnalysisError && !impactAnalysisLoading && (
-        <p className="mt-3 text-[12.5px] text-ink-3">Enter a path relative to the repository root, as shown in the folder map or a citation.</p>
-      )}
-      {impactAnalysisError && <p className="mt-3 text-[13px] text-danger" role="alert">{impactAnalysisError}</p>}
-      {impactAnalysis && (
-        <div className="mt-5 space-y-4" aria-live="polite">
-          <p className="text-sm font-medium text-ink">{impactAnalysis.summary}</p>
-          <div>
-            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-ink-3">
-              Imported by ({impactAnalysis.truncated || (impactAnalysis.dependent_count ?? 0) > impactAnalysis.dependent_files.length
-                ? `${formatCount(impactAnalysis.dependent_count ?? impactAnalysis.dependent_files.length)} files, showing ${formatCount(impactAnalysis.dependent_files.length)}`
-                : impactAnalysis.dependent_files.length})
-            </p>
-            {impactAnalysis.dependent_files.length ? impactAnalysis.dependent_files.map((value) => <FileLink key={value} value={value} />) : <p className="text-[13px] text-ink-3">No resolved dependents.</p>}
+    <Modal
+      open
+      onClose={onClose}
+      size={viewing ? 'xl' : 'lg'}
+      title="Change impact"
+      description="Which indexed files and tests depend on a file, from the imports resolved inside this repository."
+      initialFocusRef={inputRef}
+    >
+      {viewing ? (
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button ref={backRef} variant="secondary" size="sm" icon={ArrowLeft} onClick={() => setViewing(null)}>Back to impact</Button>
+            <p className="min-w-0 flex-1 text-[12.5px] text-ink-2">{viewing.caption}</p>
+            <Button variant="ghost" size="sm" icon={PanelRight} onClick={openInPanel}>Open in side panel</Button>
           </div>
-          {impactAnalysis.imported_files?.length > 0 && (
+          <div className="h-[min(62dvh,640px)]">
+            <FileViewer
+              repoName={repo.repo_name}
+              path={viewing.path}
+              startLine={viewing.start || null}
+              endLine={viewing.end || viewing.start || null}
+              githubUrl={result?.github_url || repo.github_url}
+              commitSha={result?.commit_sha || repo.commit_sha}
+            />
+          </div>
+        </div>
+      ) : (
+        <div ref={bodyRef}>
+          <form onSubmit={submit} className="space-y-2.5">
             <div>
-              <p className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-ink-3">Imports ({impactAnalysis.imported_files.length})</p>
-              {impactAnalysis.imported_files.map((value) => <FileLink key={value} value={value} />)}
+              <label htmlFor="impact-input" className="text-[12.5px] font-medium text-ink-2">File</label>
+              <div className="mt-1 flex gap-2">
+                <input id="impact-input" ref={inputRef} value={path} autoComplete="off" spellCheck={false} onChange={(event) => setPath(event.target.value)} placeholder={example} className="h-10 min-w-0 flex-1 rounded-xl border border-line bg-surface px-3 font-mono text-[13px] text-ink outline-none focus:border-accent" />
+                <Button type="submit" variant="primary" loading={state.loading} disabled={!path.trim()}>Analyze</Button>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-end gap-x-4 gap-y-2">
+              <div className="min-w-[12rem] flex-1">
+                <label htmlFor="impact-symbol" className="text-[12.5px] font-medium text-ink-2">Symbol <span className="font-normal text-ink-3">(optional)</span></label>
+                <input id="impact-symbol" value={symbol} autoComplete="off" spellCheck={false} onChange={(event) => setSymbol(event.target.value)} placeholder="Function or class name, to find the tests that use it" className="mt-1 h-9 w-full rounded-xl border border-line bg-surface px-3 font-mono text-[12.5px] text-ink outline-none placeholder:font-sans focus:border-accent" />
+              </div>
+              <label className="flex h-9 items-center gap-2 text-[13px] text-ink-2">
+                <input type="checkbox" checked={indirect} onChange={(event) => setDepth(event.target.checked)} className="h-4 w-4 accent-[var(--color-accent)]" />
+                Include indirect (up to {MAX_IMPACT_DEPTH} levels)
+              </label>
+            </div>
+          </form>
+
+          {!result && !state.error && !state.loading && (
+            <div className="mt-3 space-y-2 text-[12.5px] text-ink-3">
+              <p>Enter a path from the repository root, or part of one: a file name, or a path without its extension.</p>
+              {suggestions.files.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span>Most imported:</span>
+                  {suggestions.files.map((file) => (
+                    <button key={file.file_path} type="button" onClick={() => choose(file.file_path)} className="rounded-full border border-line bg-surface-2 px-2 py-0.5 font-mono text-[11.5px] text-ink-2 hover:border-line-strong hover:text-ink" title={`Imported by ${file.dependent_count} files`}>
+                      {file.file_path}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {graph?.rebuilding && (
+            <p className="mt-3 flex gap-2 rounded-xl bg-warning-soft px-3 py-2 text-[12.5px] text-ink-2" role="status">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
+              <span>The import graph is being rebuilt from the index. Until it finishes, package imports (and the tests that use them) may be missing. Analyze again in a minute.</span>
+            </p>
+          )}
+          {graph?.rebuilt && !graph?.rebuilding && (
+            <p className="mt-3 text-[12px] text-ink-3" role="status">The import graph was rebuilt from the indexed files to include package imports.</p>
+          )}
+          {state.error && <p className="mt-3 text-[13px] text-danger" role="alert">{state.error}</p>}
+
+          {result?.ambiguous && (
+            <div className="mt-5" aria-live="polite">
+              <p className="text-sm font-medium text-ink">{result.summary}</p>
+              <ul className="mt-2 divide-y divide-line rounded-xl border border-line" aria-label={`Files matching ${result.query}`}>
+                {result.candidates.map((candidate) => (
+                  <li key={candidate.file_path}>
+                    <button type="button" onClick={() => choose(candidate.file_path)} className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left hover:bg-surface-2">
+                      <span className="truncate font-mono text-[12.5px] text-ink">{candidate.file_path}</span>
+                      <span className="shrink-0 text-[12px] text-ink-3">imported by {formatCount(candidate.dependent_count)}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {result.candidate_count > result.candidates.length && (
+                <p className="mt-2 text-[12px] text-ink-3">Showing {formatCount(result.candidates.length)} of {formatCount(result.candidate_count)}. Type more of the path to narrow it down.</p>
+              )}
+            </div>
+          )}
+
+          {result?.target_file && (
+            <div className="mt-5 space-y-5" aria-live="polite">
+              <div className="space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    data-impact-row="target"
+                    onClick={() => open({
+                      key: 'target', path: result.target_file, start: result.symbol?.defined_at || null,
+                      caption: result.symbol?.defined_at ? `${requestedSymbol} is defined on line ${result.symbol.defined_at}.` : result.target_file,
+                    })}
+                    className="min-w-0 truncate rounded-md font-mono text-[13px] font-semibold text-ink hover:underline"
+                  >
+                    {result.target_file}
+                  </button>
+                  <Button variant="ghost" size="xs" icon={copy.status === 'copied' ? Check : Copy} onClick={copyReport}>
+                    {copy.status === 'copied' ? 'Copied' : 'Copy as Markdown'}
+                  </Button>
+                </div>
+                <p className="text-sm text-ink">{result.summary}</p>
+                {copy.status === 'manual' && (
+                  <textarea readOnly value={copy.text} aria-label="Impact report as Markdown" rows={6} onFocus={(event) => event.target.select()} className="w-full rounded-xl border border-line bg-surface-2 p-2 font-mono text-[11.5px] text-ink-2" />
+                )}
+                <p className="sr-only" aria-live="polite">{copy.status === 'copied' ? 'Report copied as Markdown.' : ''}</p>
+              </div>
+
+              <section aria-label="Imported by">
+                <SectionTitle>
+                  Imported by ({result.depth > 1 ? `${formatCount(totalDependents)} files, up to ${result.depth} levels` : formatCount(totalDependents)})
+                </SectionTitle>
+                {groups.length ? groups.map((group) => (
+                  <DependentGroup key={group.depth} group={group} showDepth={result.depth > 1} onOpen={open} />
+                )) : <p className="px-2 text-[13px] text-ink-3">No indexed file imports it.</p>}
+                {result.depth === 1 && result.indirect_beyond_depth > 0 && (
+                  <button type="button" onClick={() => setDepth(true)} className="mt-1 px-2 text-[12.5px] font-medium text-accent-strong hover:underline">
+                    Include {formatCount(result.indirect_beyond_depth)} indirect {result.indirect_beyond_depth === 1 ? 'dependent' : 'dependents'}
+                  </button>
+                )}
+              </section>
+
+              <section aria-label="Affected tests">
+                <SectionTitle aside={<Badge tone="neutral">Static analysis</Badge>}>
+                  Affected tests ({formatCount(tests?.count || 0)}{moreTests ? ` direct, ${formatCount(moreTests)} indirect` : ''})
+                </SectionTitle>
+                <p className="mb-1.5 px-2 text-[12px] leading-relaxed text-ink-3">
+                  Test files that import this file{result.depth > 1 ? ', directly or through other files' : ''}. Found from imports and names, not by running tests, so this is not coverage.
+                </p>
+                {requestedSymbol && result.symbol && tests?.count > 0 && (
+                  <div className="mb-2">
+                    <p className="px-2 text-[12.5px] font-medium text-ink-2">
+                      Test functions for <span className="font-mono">{requestedSymbol}</span>
+                      {result.symbol.mentions === 0 && <span className="font-normal text-warning"> · not found in {result.target_file}</span>}
+                    </p>
+                    {testFunctions.length ? testFunctions.map((file) => (
+                      <div key={file.filePath} className="mt-1">
+                        <p className="truncate px-2 font-mono text-[11.5px] text-ink-3">{file.filePath}</p>
+                        <ul>
+                          {file.items.map((item) => (
+                            <ImpactRow
+                              key={`${item.name}:${item.line}`}
+                              rowKey={`fn:${file.filePath}:${item.line}`}
+                              path={item.name}
+                              line={item.line}
+                              detail={testMatchLabel(item, requestedSymbol)}
+                              badge={<Badge tone={item.kind === 'reference' ? 'accent' : 'neutral'} className="mt-0.5">{item.kind === 'reference' ? 'uses it' : 'name'}</Badge>}
+                              onOpen={() => open({
+                                key: `fn:${file.filePath}:${item.line}`, path: file.filePath, start: item.line,
+                                end: item.reference_line && item.reference_line - item.line <= 40 ? item.reference_line : item.line,
+                                caption: `${item.name}, line ${item.line}: ${testMatchLabel(item, requestedSymbol)}.`,
+                              })}
+                            />
+                          ))}
+                        </ul>
+                      </div>
+                    )) : <p className="px-2 text-[12.5px] text-ink-3">No test in these files uses {requestedSymbol} or is named after it.</p>}
+                  </div>
+                )}
+                {requestedSymbol && result.symbol && tests?.files?.length > 0 && (
+                  <p className="mt-3 px-2 text-[12.5px] font-medium text-ink-2">Test files <span className="font-normal text-ink-3">({formatCount(tests.count)})</span></p>
+                )}
+                {tests?.files?.length ? (
+                  <ul>
+                    {tests.files.map((file) => (
+                      <ImpactRow
+                        key={file.file_path}
+                        rowKey={`test:${file.file_path}`}
+                        path={file.file_path}
+                        line={file.line_number}
+                        detail={file.depth > 1 ? `${depthLabel(file.depth).toLowerCase()}, via ${file.via}` : 'imports it directly'}
+                        onOpen={() => open({
+                          key: `test:${file.file_path}`, path: file.file_path, start: file.line_number,
+                          caption: `${file.file_path} imports ${file.via} on line ${file.line_number}.`,
+                        })}
+                      />
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="px-2 text-[13px] text-ink-3">{moreTests ? 'No test imports it directly.' : 'No test file imports it.'}</p>
+                )}
+                {tests?.truncated && <p className="px-2 pt-1 text-[12px] text-ink-3">Showing {formatCount(tests.files.length)} of {formatCount(tests.count)}.</p>}
+                {moreTests > 0 && (
+                  <button type="button" onClick={() => setDepth(true)} className="mt-1 px-2 text-left text-[12.5px] font-medium text-accent-strong hover:underline">
+                    Include the {formatCount(moreTests)} test {moreTests === 1 ? 'file' : 'files'} that import it through other files{requestedSymbol ? ` and search them for ${requestedSymbol}` : ''}
+                  </button>
+                )}
+              </section>
+
+              {result.imports?.length > 0 && (
+                <section aria-label="Imports">
+                  <SectionTitle>Imports ({result.imports.length})</SectionTitle>
+                  <ul>
+                    {result.imports.map((item) => (
+                      <ImpactRow
+                        key={item.file_path}
+                        rowKey={`import:${item.file_path}`}
+                        path={item.file_path}
+                        detail={`imported on line ${item.line_number}`}
+                        onOpen={() => open({ key: `import:${item.file_path}`, path: item.file_path, caption: `${result.target_file} imports this file on line ${item.line_number}.` })}
+                      />
+                    ))}
+                  </ul>
+                </section>
+              )}
+              <p className="text-[12px] leading-relaxed text-ink-3">{result.method}</p>
             </div>
           )}
         </div>
