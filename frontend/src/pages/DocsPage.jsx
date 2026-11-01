@@ -127,10 +127,10 @@ const SECTIONS = [
         items: [
           ['Instant code search', 'Search the indexed code by keyword and see the matching files and lines right away.'],
           ['Repository overview', 'See the languages, a folder map and suggested questions to start with.'],
-          ['Change-impact analysis', 'Pick a file to see which files import it, before you change it.'],
+          ['Change-impact analysis', 'Pick a file to see which files import it (directly, or up to three levels away), which test files reach it and, if you name a function, the tests that use it. A file name that matches several files asks you to choose. It is static analysis of imports: nothing is run, so it is not test coverage.'],
         ],
       },
-      { type: 'callout', title: 'Tip', text: 'Use impact analysis before an edit: the files that import the one you are changing are the call sites to check.' },
+      { type: 'callout', title: 'Tip', text: 'Use impact analysis before an edit: the files that import the one you are changing are the call sites to check, and the affected tests are the ones to run. Copy as Markdown puts the report, linked at the indexed commit, in a pull request.' },
     ],
   },
   {
