@@ -399,6 +399,29 @@ class ConversationApiTests(EndpointTestCase):
                 self.assertEqual(getattr(self.client, method)(url).status_code, 404)
 
 
+    def test_new_chat_in_an_older_client_hides_nothing_and_its_next_question_starts_a_conversation(self):
+        # Tabs opened before conversations existed send no conversation id,
+        # and their "New chat" calls DELETE /conversations/{repo}.
+        older = self.done(self.ask("How does login work?")[0])["conversation"]
+        newer = self.done(self.ask("How does logout work?", new=True)[0])["conversation"]
+        for _ in range(2):  # a second click before asking adds nothing
+            self.assertEqual(self.client.delete(f"/api/conversations/{REPO_NAME}").json(), {"cleared": True})
+        self.assertEqual([item["id"] for item in self.threads()["conversations"]], [newer["id"], older["id"]])
+        self.assertEqual(run(self.store.fetch_one("SELECT COUNT(*) AS n FROM conversations"))["n"], 3)
+
+        calls = []
+        response, _ = self.ask("Where is it called?", calls=calls)
+        fresh = self.done(response)["conversation"]
+        self.assertNotIn(fresh["id"], (older["id"], newer["id"]))
+        self.assertEqual(fresh["title"], "Where is it called?")
+        self.assertEqual(calls[0][0][2], [])
+        self.assertEqual(self.done(self.ask("And who calls that?")[0])["conversation"]["id"], fresh["id"])
+        self.assertEqual(
+            [(item["id"], item["title"], item["message_count"]) for item in self.threads()["conversations"]],
+            [(fresh["id"], "Where is it called?", 4), (newer["id"], "How does logout work?", 2),
+             (older["id"], "How does login work?", 2)],
+        )
+
     def test_conversation_queries_read_only_that_conversation_through_its_index(self):
         # Production has no planner statistics (no ANALYZE), like this file.
         # Without the conversation among the leading index columns SQLite

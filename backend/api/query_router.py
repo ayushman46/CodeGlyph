@@ -781,11 +781,16 @@ async def find_conversation(store, repo_id: str, user_id: str, conversation_id: 
     return await store.fetch_one(f"SELECT {columns} FROM conversations c WHERE {where}", [conversation_id, repo_id, user_id])
 
 
-async def latest_conversation(store, repo_id: str, user_id: str) -> dict | None:
-    """The conversation a repository opens with: the one most recently asked in."""
+async def latest_conversation(store, repo_id: str, user_id: str, *, include_empty: bool = False) -> dict | None:
+    """The conversation a repository opens with: the one most recently asked in.
+
+    `include_empty` also counts a conversation with no messages yet, such as
+    the new chat of DELETE /conversations/{repo}.
+    """
+    has_messages = "" if include_empty else f" AND {_HAS_MESSAGES}"
     return await store.fetch_one(
         f"SELECT {_CONVERSATION_COLUMNS} FROM conversations c WHERE c.repo_id = ? AND c.user_id = ? "
-        f"AND c.deleted_at IS NULL AND {_HAS_MESSAGES} ORDER BY c.updated_at DESC, c.id DESC LIMIT 1",
+        f"AND c.deleted_at IS NULL{has_messages} ORDER BY c.updated_at DESC, c.id DESC LIMIT 1",
         [repo_id, user_id],
     )
 
@@ -838,7 +843,9 @@ async def resolve_conversation(store, repo: dict, req, user_id: str) -> dict:
             )
         return row
     try:
-        return await latest_conversation(store, repo["id"], user_id) or {"id": None}
+        # Clients that send no id continue the newest conversation, including
+        # the empty one their "New chat" (DELETE /conversations/{repo}) made.
+        return await latest_conversation(store, repo["id"], user_id, include_empty=True) or {"id": None}
     except Exception as error:
         # Continuity is not required to answer: the answer starts a new conversation.
         logger.warning("Latest conversation unavailable for repository %s: %s", repo["id"], type(error).__name__)
@@ -860,7 +867,14 @@ async def save_exchange(store, *, repo_id: str, user_id: str, conversation: dict
             [conversation_id, repo_id, user_id, conversation["title"], now, now],
         )
     else:
-        await executor("UPDATE conversations SET updated_at = ? WHERE id = ? AND user_id = ?", [now, conversation_id, user_id])
+        # A conversation made empty by DELETE /conversations/{repo} takes its
+        # title from its first question.
+        title = conversation.get("title") or conversation_title(question)
+        conversation = {**conversation, "title": title}
+        await executor(
+            "UPDATE conversations SET updated_at = ?, title = CASE WHEN title = '' THEN ? ELSE title END WHERE id = ? AND user_id = ?",
+            [now, title, conversation_id, user_id],
+        )
     await save_message(store, repo_id=repo_id, user_id=user_id, role="user", content=question, conversation_id=conversation_id)
     await save_message(
         store, repo_id=repo_id, user_id=user_id, role="assistant", content=answer,
@@ -1503,25 +1517,23 @@ async def get_conversation(
 
 @router.delete("/conversations/{repo_name}")
 async def clear_conversation(repo_name: str, current_user=Depends(get_current_user)):
-    """Hide every conversation of one repository (the "new chat" of older clients).
+    """Start a new chat for clients from before conversations existed.
 
-    Nothing is erased: the returned ids can each be restored with
-    POST /conversations/{repo}/threads/{id}/restore.
+    Nothing is hidden or erased: every conversation stays in the list. This
+    adds an empty conversation (listed once it has messages), and the next
+    question sent without a conversation_id goes into it.
     """
     try:
         store, repo = await _repository_for(repo_name, current_user.id)
-        await adopt_unthreaded_messages(store, repo["id"], current_user.id)
-        rows = await store.fetch_all(
-            "SELECT id FROM conversations WHERE repo_id = ? AND user_id = ? AND deleted_at IS NULL",
-            [repo["id"], current_user.id],
-        )
-        ids = [str(row["id"]) for row in rows]
-        if ids:
+        latest = await latest_conversation(store, repo["id"], current_user.id, include_empty=True)
+        # An empty title means a new chat nobody has asked in yet: reuse it.
+        if not latest or latest.get("title"):
+            now = timestamp()
             await store.execute(
-                f"UPDATE conversations SET deleted_at = ? WHERE user_id = ? AND id IN ({', '.join('?' for _ in ids)})",
-                [timestamp(), current_user.id, *ids],
+                "INSERT INTO conversations (id, repo_id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, '', ?, ?)",
+                [uuid4().hex, repo["id"], current_user.id, now, now],
             )
-        return {"cleared": True, "conversation_ids": ids}
+        return {"cleared": True}
     except Exception as error:
         raise _conversation_http_error(error, "clear conversation history") from error
 

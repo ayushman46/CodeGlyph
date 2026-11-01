@@ -175,7 +175,7 @@ All routes require a Supabase bearer token except health/readiness and the GitHu
 | GET | `/api/conversations/{repo}/threads` | Saved conversations: title, dates, message and proposal counts |
 | PATCH / DELETE | `/api/conversations/{repo}/threads/{id}` | Rename / delete (hidden, not erased) |
 | POST | `/api/conversations/{repo}/threads/{id}/restore` | Undo a delete |
-| DELETE | `/api/conversations/{repo}` | Hide all of a repository's conversations (for older clients; returns the ids to restore) |
+| DELETE | `/api/conversations/{repo}` | New chat for older clients: hides and erases nothing; the next question sent without `conversation_id` starts a new conversation |
 | GET | `/api/edits/{id}` | Saved edit proposal with a fresh editing ticket |
 | GET | `/api/github/status`, `/api/github/login`, `/api/github/callback` | GitHub connection (callback redirects to `{GITHUB_FRONTEND_ORIGIN}/github/callback`) |
 | POST | `/api/github/complete` | SPA finishes the OAuth connection with the fragment code and the user's bearer token |
