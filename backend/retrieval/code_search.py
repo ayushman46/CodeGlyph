@@ -941,3 +941,199 @@ async def find_symbols(store, repo_id: str, query: str, *, limit: int = 20, stag
         if len(results) >= limit:
             break
     return results[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Exact evidence for questions (every place, subclasses, overrides)
+# ---------------------------------------------------------------------------
+
+# Candidate sections read for one exact evidence search. Small enough to stay
+# cheap on a large repository; a search that reaches it reports "at least".
+EVIDENCE_CANDIDATE_ROWS = 400
+# Files whose whole text is read to name the declaration each line is in.
+EVIDENCE_LABEL_FILES = 16
+_EVIDENCE_FILE_ROWS = 600
+
+
+def _fts_tokens_expression(needles: list[str]) -> str | None:
+    """An FTS5 expression for sections that may contain any needle (word tokens, as indexed)."""
+    phrases = []
+    for needle in needles:
+        tokens = _FTS_TOKEN.findall(str(needle).lower())
+        if tokens:
+            phrases.append(f'content : "{" ".join(tokens)}"')
+    return " OR ".join(dict.fromkeys(phrases)) or None
+
+
+async def evidence_candidate_rows(store, repo_id: str, needles: list[str], *, staging_prefix: str | None = None,
+                                  extra_sql: str = "", extra_args: list | None = None,
+                                  limit: int = EVIDENCE_CANDIDATE_ROWS) -> tuple[list[dict], bool]:
+    """Sections (with text) that may contain one of ``needles``, in file and line order.
+
+    The full-text index finds them (``_set_timeout`` is indexed as ``set``,
+    ``timeout``); a substring scan is the fallback for an index without it.
+    Returns the rows and whether ``limit`` cut the list short.
+    """
+    stage_sql, stage_args = ("", []) if not staging_prefix else (" AND c.id NOT LIKE ?", [f"{staging_prefix}%"])
+    columns = "c.id, c.file_path, c.start_line, c.end_line, c.language, c.symbols, c.content"
+    expression = _fts_tokens_expression(needles)
+    rows: list[dict] | None = None
+    if expression:
+        try:
+            rows = await store.fetch_all(
+                f"SELECT {columns} FROM chunks_fts JOIN chunks c ON c.rowid = chunks_fts.rowid "
+                f"WHERE chunks_fts MATCH ? AND c.repo_id = ?{stage_sql}{extra_sql} "
+                "ORDER BY c.file_path, c.start_line LIMIT ?",
+                [expression, repo_id, *stage_args, *(extra_args or []), limit + 1],
+            )
+        except Exception as error:
+            logger.debug("Exact evidence full-text candidates unavailable (%s)", type(error).__name__)
+            rows = None
+    if rows is None:
+        likes = [needle for needle in dict.fromkeys(needles) if needle]
+        if not likes:
+            return [], False
+        clause = " OR ".join("c.content LIKE ? ESCAPE '\\'" for _ in likes)
+        rows = await store.fetch_all(
+            f"SELECT {columns} FROM chunks c WHERE c.repo_id = ? AND ({clause}){stage_sql}{extra_sql} "
+            "ORDER BY c.file_path, c.start_line LIMIT ?",
+            [repo_id, *[f"%{_escape_like(needle)}%" for needle in likes], *stage_args, *(extra_args or []), limit + 1],
+        )
+    return list(rows[:limit]), len(rows) > limit
+
+
+def matching_lines(rows: list[dict], pattern: re.Pattern) -> dict[str, dict[int, str]]:
+    """``{path: {line: text}}`` for every line of ``rows`` that ``pattern`` matches (overlaps counted once)."""
+    found: dict[str, dict[int, str]] = {}
+    for row in rows:
+        path = str(row.get("file_path") or "")
+        start = int(row.get("start_line") or 1)
+        for offset, line in enumerate(str(row.get("content") or "").split("\n")):
+            if len(line) <= _MAX_DECLARATION_LINE and pattern.search(line):
+                found.setdefault(path, {})[start + offset] = line
+    return found
+
+
+async def indexed_file_lines(store, repo_id: str, paths: list[str], *, staging_prefix: str | None = None,
+                             max_rows: int = _EVIDENCE_FILE_ROWS) -> dict[str, dict[int, str]]:
+    """The indexed lines of a few files, rebuilt from their sections (``{path: {line: text}}``)."""
+    wanted = list(dict.fromkeys(path for path in paths if path))[:EVIDENCE_LABEL_FILES]
+    if not wanted:
+        return {}
+    stage_sql, stage_args = ("", []) if not staging_prefix else (" AND id NOT LIKE ?", [f"{staging_prefix}%"])
+    rows = await store.fetch_all(
+        f"SELECT file_path, start_line, content FROM chunks WHERE repo_id = ? "
+        f"AND file_path IN ({', '.join('?' for _ in wanted)}){stage_sql} ORDER BY file_path, start_line LIMIT ?",
+        [repo_id, *wanted, *stage_args, max_rows],
+    )
+    files: dict[str, dict[int, str]] = {}
+    for row in rows:
+        lines = files.setdefault(str(row.get("file_path") or ""), {})
+        start = int(row.get("start_line") or 1)
+        for offset, line in enumerate(str(row.get("content") or "").split("\n")):
+            lines.setdefault(start + offset, line)
+    return files
+
+
+def outline_from_lines(lines: dict[int, str], path: str) -> list[dict]:
+    """``file_outline`` of a file rebuilt by ``indexed_file_lines`` (missing lines are blank)."""
+    if not lines:
+        return []
+    last = max(lines)
+    return file_outline("\n".join(lines.get(number, "") for number in range(1, last + 1)), path)
+
+
+def enclosing_declaration(outline: list[dict], line: int) -> str | None:
+    """The declarations around ``line``, outermost first: ``Client.__init__``.
+
+    Uses the file's outline (indentation and braces), so a line in
+    ``Client.__init__`` is never labelled with another class's ``__init__``.
+    Markdown headings are not declarations.
+    """
+    chain = [
+        entry["name"] for entry in sorted(outline, key=lambda item: item["depth"])
+        if not re.fullmatch(r"h[1-6]", str(entry.get("kind", ""))) and entry["line"] <= line <= entry["end_line"]
+    ]
+    return ".".join(chain) or None
+
+
+def subclass_pattern(base: str) -> re.Pattern:
+    """Declarations that inherit from ``base``.
+
+    Python ``class X(Base)`` / ``class X(module.Base, Mixin)``, JS/TS/Java
+    ``class X extends Base`` / ``implements Base``, ``interface X extends
+    Base``, Kotlin/C#/Swift ``class X : Base`` and Ruby ``class X < Base``.
+    """
+    name = rf"(?:[A-Za-z_$][\w$]*\.)*{re.escape(base)}(?![\w$])"
+    head = r"\b(?:class|interface|struct|record|object|enum)\s+[A-Za-z_$][\w$]*(?:\s*<[^>{(\n]*>)?"
+    return re.compile(
+        rf"^\s*(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:export|default|public|private|protected|internal|abstract|final|"
+        rf"sealed|open|data|static|partial)\s+)*class\s+[A-Za-z_]\w*\s*(?:\[[^\]\n]*\])?\s*\((?:[^()\n]*[,\s(])?\s*{name}\s*(?:\[[^\]\n]*\])?\s*[,)]"
+        rf"|{head}\s+extends\s+(?:[\w$.]+(?:<[^>{{\n]*>)?\s*,\s*)*{name}"
+        rf"|{head}(?:\s+extends\s+[\w$.<>, ]+?)?\s+implements\s+(?:[\w$.]+(?:<[^>{{\n]*>)?\s*,\s*)*{name}"
+        rf"|{head}\s*:\s*(?:[\w$.]+(?:<[^>{{\n]*>)?(?:\(\))?\s*,\s*)*{name}"
+        rf"|^\s*class\s+[A-Z][\w:]*\s*<\s*(?:[\w]+::)*{re.escape(base)}\b",
+        re.MULTILINE,
+    )
+
+
+def _declared_class(line: str) -> str | None:
+    found = re.search(r"\b(?:class|interface|struct|record|object|enum)\s+([A-Za-z_$][\w$]*)", line)
+    return found.group(1) if found else None
+
+
+async def find_subclass_declarations(store, repo_id: str, base: str, *, staging_prefix: str | None = None,
+                                     limit: int = EVIDENCE_CANDIDATE_ROWS) -> tuple[list[dict], bool]:
+    """Every indexed declaration that inherits from ``base`` (one level).
+
+    Returns ``[{file_path, line, name, text, rows}]`` in file and line order
+    (``rows`` are the sections that hold the declaration, for its body) and
+    whether the candidate sections were cut short.
+    """
+    if not base or not _IDENTIFIER.fullmatch(base):
+        return [], False
+    rows, capped = await evidence_candidate_rows(
+        store, repo_id, [base], staging_prefix=staging_prefix,
+        extra_sql=" AND (c.content LIKE ? OR c.content LIKE ? OR c.content LIKE ?)",
+        extra_args=["%class%", "%interface%", "%struct%"], limit=limit,
+    )
+    pattern = subclass_pattern(base)
+    found: dict[tuple[str, int], dict] = {}
+    for row in rows:
+        path = str(row.get("file_path") or "")
+        start = int(row.get("start_line") or 1)
+        for offset, line in enumerate(str(row.get("content") or "").split("\n")):
+            if len(line) > _MAX_DECLARATION_LINE or not pattern.search(line):
+                continue
+            name = _declared_class(line)
+            if not name:
+                continue
+            entry = found.setdefault((path, start + offset), {
+                "file_path": path, "line": start + offset, "name": name, "text": line, "rows": [],
+            })
+            entry["rows"].append(row)
+    ordered = sorted(found.values(), key=lambda item: (is_support_path(item["file_path"]), item["file_path"], item["line"]))
+    return ordered, capped
+
+
+def member_declarations(rows: list[dict], class_line: int, names: list[str]) -> list[tuple[int, str, str]]:
+    """``(line, name, text)`` of methods named ``names`` declared in the class body that starts at ``class_line``."""
+    wanted = set(names)
+    lines: dict[int, str] = {}
+    for row in rows:
+        start = int(row.get("start_line") or 1)
+        for offset, line in enumerate(str(row.get("content") or "").split("\n")):
+            lines.setdefault(start + offset, line)
+    if class_line not in lines:
+        return []
+    numbers = sorted(number for number in lines if number >= class_line)
+    ordered = [lines[number] for number in numbers]
+    end = numbers[0] + _block_end(ordered, 0, _indent(ordered[0])) - 1
+    found = []
+    for number in numbers[1:]:
+        if number > end:
+            break
+        declared = line_declaration(lines[number])
+        if declared and declared[0] in wanted:
+            found.append((number, declared[0], lines[number]))
+    return found

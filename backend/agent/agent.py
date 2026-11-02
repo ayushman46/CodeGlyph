@@ -33,6 +33,66 @@ def answer_word_budget(max_tokens: int | None) -> int:
     return max(250, int((max_tokens or 2_400) * 0.4) // 50 * 50)
 
 
+def _names(values) -> str:
+    return ", ".join(f"`{value}`" for value in values or []) or "the name"
+
+
+def exact_search_notes(plan: dict) -> list[str]:
+    """Prompt notes for exact-search and change-impact evidence in the plan."""
+    notes: list[str] = []
+    usage = plan.get("exact_search") or {}
+    if usage.get("matches"):
+        total, shown, omitted = int(usage["matches"]), int(usage.get("shown") or 0), int(usage.get("omitted") or 0)
+        at_least = "at least " if usage.get("candidates_capped") else ""
+        notes.append(
+            f"An exact search of the indexed code for {_names(usage.get('names'))} found {at_least}{total} matching "
+            f"lines in {usage.get('files', 0)} files; the evidence shows {shown} of them as short windows whose "
+            "retrieval reason starts with \"Exact search\" (each window header names the declaration it is in). "
+            "List every one of those places with its citation, grouped by file, and say what each does."
+        )
+        if omitted or at_least:
+            notes.append(
+                f"The list is partial: {omitted} matching lines{' (or more)' if at_least else ''} were left out for length. "
+                f"Say plainly that the list is partial and that {omitted} more matching lines exist, and never call it complete."
+            )
+    elif usage:
+        notes.append(f"An exact search of the indexed code for {_names(usage.get('names'))} found no matching line.")
+    subclasses = plan.get("subclass_search") or {}
+    if subclasses.get("bases"):
+        bases = _names(subclasses.get("bases"))
+        found = int(subclasses.get("found") or 0)
+        if found:
+            notes.append(
+                f"An exact search found {found} class declarations that inherit from {bases}; the evidence shows "
+                f"{subclasses.get('shown', 0)} of them (retrieval reason \"inherits from\"). Name each subclass with its "
+                "citation; never say that nothing subclasses it."
+                + (" More candidates exist than were searched, so the list may be partial." if subclasses.get("candidates_capped") else "")
+            )
+        else:
+            notes.append(
+                f"An exact search of the whole indexed code found no class declaration that inherits from {bases} "
+                "(Python `class X(Base)`, `extends`/`implements`, `class X : Base`). Say that the search found none."
+            )
+    if subclasses.get("methods"):
+        methods = _names(subclasses.get("methods"))
+        overrides = int(subclasses.get("overrides") or 0)
+        notes.append(
+            f"Declarations of {methods} found inside those subclasses: {overrides}; they are in the evidence "
+            "(retrieval reason \"declares\")." if overrides else
+            f"None of the subclasses found declares {methods}, so nothing found overrides them; say so, naming the "
+            "subclasses that were checked."
+        )
+    docs = plan.get("docs_mentions") or {}
+    if docs.get("matches"):
+        notes.append(
+            f"Documentation lines that mention {_names(docs.get('names'))} are in the evidence (retrieval reason "
+            "\"Documentation that mentions\"); cite them for the documentation part of the answer."
+        )
+    elif docs:
+        notes.append(f"An exact search of the documentation files found no mention of {_names(docs.get('names'))}.")
+    return notes
+
+
 def build_answer_messages(
     question: str,
     initial_context: str,
@@ -121,6 +181,7 @@ The selected workflow is **{plan.get('label', workflow)}**. Its focus is: {workf
             f"The evidence starts with a generated listing of {plan['directory_listing']} from the repository file index. "
             "Describe the folder from that listing (its subfolders, file counts and kinds of files), then cite representative files."
         )
+    notes.extend(exact_search_notes(plan))
     if plan.get("follow_up"):
         notes.append("This is a follow-up question; the evidence was retrieved using the earlier topic of the conversation.")
     if plan.get("semantic_search") in {"unavailable", "timed_out"}:

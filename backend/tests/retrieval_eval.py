@@ -206,6 +206,29 @@ CASES = [
         "expect": [("httpx/_client.py", 1)],
         "first": ("httpx/_client.py", 1),
     },
+    # Round 2 (simulated customers): exhaustive usage, subclasses, change risk.
+    {
+        "id": "R2-05 httpx every timeout site",
+        "user": "sim-dev", "repo": "httpx", "workflow": "general",
+        "question": "Find every place that reads or applies the timeout configuration",
+        "expect": [("httpx/_client.py", 212), ("httpx/_client.py", 254), ("httpx/_client.py", 259),
+                   ("httpx/_client.py", 371), ("httpx/_client.py", 377), ("httpx/_client.py", 584),
+                   ("httpx/_client.py", 591), ("httpx/_client.py", 910), ("httpx/_client.py", 1625)],
+    },
+    {
+        "id": "R2-12 flask subclasses of Flask",
+        "user": "sim-lead", "repo": "flask", "workflow": "general",
+        "question": "Does anything subclass Flask or override make_response or finalize_request?",
+        "expect": [("tests/test_subclassing.py", 7), ("tests/test_config.py", 202), ("tests/test_reqctx.py", 185),
+                   ("tests/test_helpers.py", 69), ("tests/test_templating.py", 406)],
+    },
+    {
+        "id": "R2-11 flask go/no-go docs for make_response",
+        "user": "sim-lead", "repo": "flask", "workflow": "general",
+        "question": "Give me a go/no-go risk summary for changing make_response in src/flask/app.py: what could break, "
+                    "which tests cover it, and is it documented?",
+        "expect": [("src/flask/app.py", 1267), ("docs/api.rst", 203), ("docs/quickstart.rst", 574)],
+    },
     {
         "id": "review: trace is a term, not a stopword",
         "user": "sim-dev", "repo": "httpx", "workflow": "general",

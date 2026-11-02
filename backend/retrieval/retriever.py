@@ -388,7 +388,8 @@ def question_requests_overview_files(query: str, requested_paths: list[str]) -> 
 
 
 def is_impact_question(query: str) -> bool:
-    return bool(IMPACT_QUESTION_PATTERN.search(query))
+    """What depends on X / what breaks if X changes, including go/no-go and risk wording."""
+    return bool(IMPACT_QUESTION_PATTERN.search(query) or CHANGE_RISK_PATTERN.search(query))
 
 
 def extract_issue_reference(query: str) -> str | None:
@@ -2443,7 +2444,18 @@ async def retrieve_context(
         store, repo_id, query, top_k, workflow,
         staging_prefix=staging_prefix, retrieval_query=retrieval_query, boost_paths=boost_paths,
     )
-    return exclude_staged(chunks, staging_prefix)
+    chunks = exclude_staged(chunks, staging_prefix)
+    if workflow != "editing" and (chunks or not extract_requested_file_paths(query)):
+        # Exhaustive, subclass and change-risk questions also get the exact
+        # search's matching lines as compact windows, ahead of the ranked
+        # sections so the context budget cannot cut them.
+        evidence_plan = next(
+            (chunk["_evidence_plan"] for chunk in chunks if isinstance(chunk.get("_evidence_plan"), dict)), None,
+        ) or build_evidence_plan(query, workflow)
+        lead, docs = await exact_question_evidence(store, repo_id, query, evidence_plan, staging_prefix=staging_prefix)
+        if lead or docs:
+            chunks = [*lead, *chunks[:DOC_MENTION_AFTER], *docs, *chunks[DOC_MENTION_AFTER:]]
+    return chunks
 
 
 # Fusion constants. Reciprocal-rank fusion votes are 1/(RRF_K + rank), about
@@ -3254,6 +3266,519 @@ async def _retrieve_context(
     if not editing_mode and final_chunks:
         _note_unretrieved_names(evidence_plan, {"names": symbol_names, "qualified": qualified}, final_chunks)
     return final_chunks
+
+
+# ---------------------------------------------------------------------------
+# Exact evidence: every place a name is used, subclasses and overrides, and
+# the documentation that mentions a name a change question is about
+# ---------------------------------------------------------------------------
+
+# "Find every place that reads the timeout", "list all call sites of X",
+# "where is X used/read/applied": the answer must list sites, so the exact
+# search's matching lines are evidence, not only the ranked sections.
+EXHAUSTIVE_QUESTION_PATTERN = re.compile(
+    r"\b(?:every|each|all(?:\s+(?:of\s+)?the)?)\s+(?:[\w-]+\s+){0,2}?(?:places?|sites?|usages?|uses|references?|"
+    r"callers?|occurrences?|locations?|spots?|instances?|reads?|writes?|assignments?|mentions?|lines?)\b|"
+    r"\bwhere\s+(?:is|are|does|do)\s+[^?.!]{1,60}?\s(?:used|read|applied|referenced|called|set|accessed|consumed|"
+    r"assigned|configured|mutated)\b|\bwhere\s+else\b",
+    re.IGNORECASE,
+)
+# "the timeout configuration", "the retries option": the word names a
+# setting, and its code forms (``self._timeout``, ``_set_timeout``,
+# ``self.timeout``, ``timeout.as_dict()``, ``"timeout"``) are what to find.
+_CONFIG_WORD = re.compile(
+    r"\b([a-z][a-z0-9]{2,30})\s+(?:configuration|config|settings?|options?|parameters?|params?|values?|flags?|"
+    r"attributes?|property|properties|fields?|variables?|keys?|arguments?|args)\b",
+    re.IGNORECASE,
+)
+_WHERE_WORD_USED = re.compile(
+    r"\bwhere\s+(?:is|are)\s+(?:the\s+)?([a-z][a-z0-9]{2,30})\s+(?:used|read|applied|referenced|set|accessed|configured)\b",
+    re.IGNORECASE,
+)
+_NOT_CONFIG_WORDS = {
+    "the", "this", "that", "these", "those", "which", "what", "some", "any", "every", "each", "default", "global",
+    "same", "other", "custom", "new", "old", "current", "given", "its", "their", "your", "our", "all", "config",
+    "configuration", "setting", "settings", "option", "options", "environment", "env", "user", "app", "application",
+}
+# "Does anything subclass Flask?", "classes that extend Base", "what
+# implements Handler", "does anything override make_response?".
+SUBCLASS_QUESTION_PATTERN = re.compile(
+    r"\bsub-?class(?:es|ed|ing)?\b|\binherit(?:s|ed|ing)?\b|\binheritance\b|\bderive[sd]?\s+from\b|\bextends?\b|"
+    r"\bextending\b|\bchild\s+class(?:es)?\b|\bimplementations\s+of\b|\bimplement(?:s|ers?)\b|\boverrid(?:e|es|ing|den)\b",
+    re.IGNORECASE,
+)
+_OVERRIDE_WORD = re.compile(r"\boverrid(?:e|es|ing|den)\b|\bre-?implement(?:s|ed|ing)?\b", re.IGNORECASE)
+_NAME_TOKEN = r"`?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)`?(?:\(\))?"
+_BASE_LEAD = re.compile(
+    r"\b(?:sub-?class(?:es|ed|ing)?(?:\s+of)?|inherit(?:s|ed|ing)?(?:\s+from)?|derive[sd]?\s+from|extends?|extending|"
+    r"implementations\s+of|implements|implementers\s+of|child\s+class(?:es)?\s+of)\s+(?:the\s+|a\s+|an\s+)?"
+    + _NAME_TOKEN,
+    re.IGNORECASE,
+)
+_OVERRIDE_LEAD = re.compile(r"\b(?:overrid(?:e|es|ing|den)|re-?implement(?:s|ed|ing)?)\s+(?:the\s+)?" + _NAME_TOKEN, re.IGNORECASE)
+_NAME_CONTINUATION = re.compile(r"\s*(?:,|\bor\b|\band\b|/)\s*(?:the\s+)?" + _NAME_TOKEN, re.IGNORECASE)
+_ASK_WORDS = {
+    "anything", "something", "any", "it", "this", "that", "them", "these", "those", "from", "of", "classes", "class",
+    "methods", "method", "functions", "function", "which", "what", "other", "another", "one", "ones", "its",
+}
+# Bounds that keep exact evidence compact: matching lines shown, characters
+# of window text, and lines of context around each match.
+EXACT_EVIDENCE_LINES = 36
+EXACT_EVIDENCE_CHARACTERS = 7000
+EXACT_EVIDENCE_WINDOW_LINES = 16
+SUBCLASS_EVIDENCE_WINDOWS = 24
+DOC_MENTION_WINDOWS = 4
+# Documentation mentions follow this many of the best ranked sections.
+DOC_MENTION_AFTER = 3
+# "Go/no-go", "what would break", "blast radius", "is it safe to change",
+# "the risk of changing": impact questions in other words.
+CHANGE_RISK_PATTERN = re.compile(
+    r"\bgo\s*/\s*no[- ]go\b|\bno[- ]go\b|\bgo\s+or\s+no[- ]go\b|\bwhat\s+(?:would|could|will|might)\s+break\b|"
+    r"\bblast\s+radius\b|\bsafe\s+to\s+(?:change|modify|remove|rename|refactor|delete)\b|"
+    r"\brisks?\b[^.?!\n]{0,40}\b(?:chang|modif|renam|remov|refactor|delet)\w*|"
+    r"\b(?:chang|modif|renam|remov|refactor|delet)\w*\b[^.?!\n]{0,60}\brisks?\b",
+    re.IGNORECASE,
+)
+
+
+def is_exhaustive_question(query: str) -> bool:
+    return bool(EXHAUSTIVE_QUESTION_PATTERN.search(str(query or "")))
+
+
+def exhaustive_search_names(query: str) -> tuple[list[str], list[str]]:
+    """``(identifiers, setting_words)`` an exhaustive question asks about.
+
+    Code names come first (``_set_timeout``, ``Flask.make_response`` gives
+    ``make_response``). Without one, a word that names a setting ("the
+    timeout configuration", "where is retries used") is searched in its code
+    forms instead.
+    """
+    names = list(dict.fromkeys([
+        *extract_question_identifiers(query), *(member for _, member in extract_qualified_names(query)),
+    ]))[:3]
+    if names:
+        return names, []
+    text = strip_answer_instructions(query)
+    words = [
+        match.group(1).lower() for pattern in (_CONFIG_WORD, _WHERE_WORD_USED) for match in pattern.finditer(text)
+    ]
+    words = [word for word in dict.fromkeys(words) if word not in _NOT_CONFIG_WORDS and word not in QUERY_STOPWORDS]
+    return [], words[:2]
+
+
+def exhaustive_pattern(names: list[str], words: list[str]) -> re.Pattern | None:
+    """Lines that use ``names`` as whole identifiers, or ``words`` in their code forms."""
+    parts = [rf"(?<![\w$]){re.escape(name)}(?![\w$])" for name in names]
+    for word in words:
+        escaped = re.escape(word)
+        parts.extend([
+            rf"_{escaped}(?![a-z0-9])",                  # self._timeout, _set_timeout
+            rf"^(?:[A-Z][A-Z0-9]*_)*{re.escape(word.upper())}(?:_[A-Z0-9]+)*\s*[:=]",  # DEFAULT_TIMEOUT_CONFIG = ...
+            rf"(?<=[\w$)\]])\.{escaped}(?![\w$])",       # self.timeout
+            rf"(?<![\w$.]){escaped}\.(?=[A-Za-z_])",     # timeout.as_dict(), @timeout.setter
+            rf"[\"']{escaped}[\"']",                    # extensions["timeout"]
+        ])
+    return re.compile("|".join(parts), re.MULTILINE) if parts else None
+
+
+def _name_list(match: re.Match, text: str) -> list[str]:
+    names = [match.group(1)]
+    cursor = match.end()
+    while True:
+        more = _NAME_CONTINUATION.match(text, cursor)
+        if not more:
+            break
+        names.append(more.group(1))
+        cursor = more.end()
+    return names
+
+
+def _class_like(name: str) -> bool:
+    last = name.rsplit(".", 1)[-1]
+    return bool(re.match(r"[A-Z_$]", last)) and last.lower() not in _ASK_WORDS
+
+
+def subclass_question_targets(query: str) -> tuple[list[str], list[str]]:
+    """``(base classes, method names)`` a subclass/override question names.
+
+    "Does anything subclass Flask or override make_response or
+    finalize_request?" gives ``(["Flask"], ["make_response", "finalize_request"])``.
+    ``Flask.make_response`` names both the class and the method.
+    """
+    text = _without_file_paths(strip_answer_instructions(query))
+    if not SUBCLASS_QUESTION_PATTERN.search(text):
+        return [], []
+    bases: list[str] = []
+    methods: list[str] = []
+    for match in _BASE_LEAD.finditer(text):
+        for name in _name_list(match, text):
+            if _class_like(name) or "`" in text[match.start():match.end()]:
+                bases.append(name.rsplit(".", 1)[-1])
+            else:
+                break
+    if _OVERRIDE_WORD.search(text):
+        for match in _OVERRIDE_LEAD.finditer(text):
+            for name in _name_list(match, text):
+                if name.lower() in _ASK_WORDS:
+                    break
+                if "." in name:
+                    owner, member = name.rsplit(".", 1)
+                    bases.append(owner.rsplit(".", 1)[-1])
+                    methods.append(member)
+                else:
+                    methods.append(name)
+        for owner, member in extract_qualified_names(text):
+            bases.append(owner)
+            methods.append(member)
+    for name in extract_question_identifiers(text):
+        if name in bases or name in methods:
+            continue
+        if re.match(r"[A-Z]", name):
+            bases.append(name)
+        elif _OVERRIDE_WORD.search(text):
+            methods.append(name)
+    bases = [name for name in dict.fromkeys(bases) if len(name) >= 2 and name.lower() not in _ASK_WORDS]
+    methods = [name for name in dict.fromkeys(methods) if len(name) >= 3 and name.lower() not in _ASK_WORDS]
+    return bases[:2], methods[:3]
+
+
+def _evidence_window(path: str, lines: dict[int, str], first: int, last: int, *, language: str | None,
+                     label: str | None, method: str, reason: str, evidence_plan: dict) -> Dict | None:
+    first = max(first, min(lines) if lines else first)
+    last = min(last, max(lines) if lines else last)
+    if last < first or any(number not in lines for number in range(first, last + 1)):
+        return None
+    return {
+        "id": f"{method}:{path}#L{first}-L{last}",
+        "file_path": path,
+        "start_line": first,
+        "end_line": last,
+        "language": language or "",
+        "symbols": [label] if label else [],
+        "content": "\n".join(lines[number] for number in range(first, last + 1)),
+        "_retrieval_methods": [method],
+        "_retrieval_reasons": [reason],
+        "_evidence_plan": evidence_plan,
+        "_relevance_score": 1.0,
+    }
+
+
+def _group_lines(numbers: list[int], *, context: int = 1, max_lines: int = EXACT_EVIDENCE_WINDOW_LINES) -> list[tuple[int, int, list[int]]]:
+    """Matching lines grouped into windows ``(first, last, matched)`` with ``context`` lines around them."""
+    groups: list[tuple[int, int, list[int]]] = []
+    for number in sorted(set(numbers)):
+        first, last = number - context, number + context
+        # A gap of one or two lines is shown rather than split into two windows.
+        if groups and first <= groups[-1][1] + 3 and last - groups[-1][0] + 1 <= max_lines:
+            groups[-1] = (groups[-1][0], last, [*groups[-1][2], number])
+        else:
+            # Windows never overlap, so no line is shown twice.
+            groups.append((max(first, groups[-1][1] + 1) if groups else first, last, [number]))
+    return groups
+
+
+def _line_list(numbers: list[int]) -> str:
+    return ("line " if len(numbers) == 1 else "lines ") + ", ".join(str(number) for number in numbers)
+
+
+async def _read_files(store, repo_id: str, paths: list[str],
+                      staging_prefix: str | None) -> tuple[dict[str, dict[int, str]], dict[str, list[Dict]]]:
+    """The indexed lines and the outline of a few files, to cut windows and label them."""
+    from retrieval.code_search import indexed_file_lines, outline_from_lines
+
+    try:
+        files = await indexed_file_lines(store, repo_id, paths, staging_prefix=staging_prefix)
+    except Exception as error:
+        logger.debug("Exact evidence file text unavailable (%s)", type(error).__name__)
+        return {}, {}
+    return files, {path: outline_from_lines(lines, path) for path, lines in files.items()}
+
+
+def _evidence_scope(evidence_plan: dict):
+    """Which paths exact evidence may use: tests unless excluded, docs only when asked for."""
+    tests_ok = not evidence_plan.get("tests_excluded")
+    docs_ok = bool(evidence_plan.get("docs_requested")) and not evidence_plan.get("docs_excluded")
+
+    def allowed(path: str) -> bool:
+        if is_overview_file(path) or (is_doc_path(path) and not docs_ok):
+            return False
+        return tests_ok or not is_test_path(path)
+    return allowed
+
+
+_TYPE_KINDS = {"class", "struct", "interface", "record", "type", "typealias", "enum", "dataclass", "model"}
+SETTING_TYPE_WINDOW_LINES = 20
+
+
+async def _setting_type_declarations(store, repo_id: str, words: list[str], allowed, staging_prefix: str | None) -> list[Dict]:
+    """Types named after a setting word (``timeout`` -> ``class Timeout``), at most one per word."""
+    from retrieval.code_search import find_symbols
+
+    found: list[Dict] = []
+    for word in words:
+        try:
+            items = await find_symbols(store, repo_id, word, limit=8, staging_prefix=staging_prefix)
+        except Exception as error:
+            logger.debug("Setting type lookup failed (%s)", type(error).__name__)
+            continue
+        for item in items:
+            if item["name"].lower() == word and item["kind"] in _TYPE_KINDS and allowed(item["path"]):
+                found.append({**item, "word": word})
+                break
+    return found
+
+
+async def exhaustive_usage_evidence(store, repo_id: str, query: str, evidence_plan: dict, *,
+                                    staging_prefix: str | None = None) -> list[Dict]:
+    """Every line that uses the names an exhaustive question asks about, as compact windows.
+
+    Source files come before tests; matches past the line and character
+    budget are counted, not shown, and the plan records how many were left
+    out so the answer can say the list is partial.
+    """
+    from retrieval.code_search import enclosing_declaration, evidence_candidate_rows, matching_lines
+
+    names, words = exhaustive_search_names(query)
+    pattern = exhaustive_pattern(names, words)
+    if pattern is None:
+        return []
+    rows, capped = await evidence_candidate_rows(store, repo_id, [*names, *words], staging_prefix=staging_prefix)
+    rows = exclude_staged(rows, staging_prefix)
+    allowed = _evidence_scope(evidence_plan)
+    matches = {path: found for path, found in matching_lines(rows, pattern).items() if allowed(path)}
+    file_lines: dict[str, dict[int, str]] = {}
+    languages: dict[str, str] = {}
+    for row in rows:
+        path = str(row.get("file_path") or "")
+        if path in matches:
+            languages.setdefault(path, str(row.get("language") or ""))
+            start = int(row.get("start_line") or 1)
+            for offset, line in enumerate(str(row.get("content") or "").split("\n")):
+                file_lines.setdefault(path, {}).setdefault(start + offset, line)
+    total = sum(len(found) for found in matches.values())
+    label = ", ".join(f"`{name}`" for name in names) or ", ".join(
+        f"`{word}` (as `_{word}`, `.{word}`, `{word}.` or `\"{word}\"`)" for word in words
+    )
+    summary = {
+        "names": names or words, "kind": "identifier" if names else "setting", "matches": total,
+        "files": len(matches), "shown": 0, "omitted": total, "candidates_capped": capped,
+    }
+    evidence_plan["exact_search"] = summary
+    if not total:
+        return []
+    # Source before tests and docs; files with the most matching lines first.
+    ordered_paths = sorted(matches, key=lambda path: (is_test_path(path) or is_doc_path(path), -len(matches[path]), path))
+    planned: list[tuple[str, int, int, list[int]]] = []
+    shown_lines = characters = 0
+    for path in ordered_paths:
+        for first, last, matched in _group_lines(list(matches[path])):
+            first = max(first, min(file_lines[path]))
+            last = min(last, max(file_lines[path]))
+            size = sum(len(file_lines[path].get(number, "")) + 1 for number in range(first, last + 1))
+            if shown_lines + len(matched) > EXACT_EVIDENCE_LINES or characters + size > EXACT_EVIDENCE_CHARACTERS:
+                break
+            planned.append((path, first, last, matched))
+            shown_lines += len(matched)
+            characters += size
+        else:
+            continue
+        break
+    windows: list[Dict] = []
+    shown = 0
+    setting_types = await _setting_type_declarations(store, repo_id, words, allowed, staging_prefix)
+    files, outlines = await _read_files(
+        store, repo_id, list(dict.fromkeys([*(item["path"] for item in setting_types), *(item[0] for item in planned)])),
+        staging_prefix,
+    )
+    for item in setting_types:
+        # The type that holds the setting ("class Timeout"), from its
+        # declaration through the start of its body (its constructor).
+        outline = outlines.get(item["path"]) or []
+        end = next((entry["end_line"] for entry in outline if entry["line"] == item["line"]), item["line"])
+        window = _evidence_window(
+            item["path"], files.get(item["path"]) or {}, item["line"], min(end, item["line"] + SETTING_TYPE_WINDOW_LINES - 1), language=None,
+            label=enclosing_declaration(outline, item["line"]), method="exact_search",
+            reason=f"Declares `{item['name']}`, the type that holds the {item['word']} setting", evidence_plan=evidence_plan,
+        )
+        if window:
+            windows.append(window)
+    for path, first, last, matched in planned:
+        # Every declaration the window's matching lines are in (a window can
+        # end one method and start the next).
+        enclosing = list(dict.fromkeys(
+            name for name in (enclosing_declaration(outlines.get(path) or [], number) for number in matched) if name
+        ))
+        reason = f"Exact search for {label}: {_line_list(matched)}" + (
+            f", inside {', '.join(f'`{name}`' for name in enclosing)}" if enclosing else ""
+        )
+        window = _evidence_window(path, file_lines[path], first, last, language=languages.get(path), label=None,
+                                  method="exact_search", reason=reason, evidence_plan=evidence_plan)
+        if window:
+            window["symbols"] = enclosing
+            windows.append(window)
+            shown += len(matched)
+    summary.update(shown=shown, omitted=total - shown)
+    return windows
+
+
+async def subclass_evidence(store, repo_id: str, query: str, evidence_plan: dict, *,
+                            staging_prefix: str | None = None) -> list[Dict]:
+    """Declarations that inherit from the classes a question names, and the
+    same-named methods inside them when it asks about overrides."""
+    from retrieval.code_search import enclosing_declaration, find_subclass_declarations, find_symbols, member_declarations
+
+    bases, methods = subclass_question_targets(query)
+    if not bases and not methods:
+        return []
+    allowed = _evidence_scope(evidence_plan)
+    windows: list[Dict] = []
+    summary: dict = {"bases": bases, "methods": methods, "found": 0, "shown": 0, "overrides": 0,
+                     "candidates_capped": False}
+    evidence_plan["subclass_search"] = summary
+    declarations: list[dict] = []
+    for base in bases:
+        found, capped = await find_subclass_declarations(store, repo_id, base, staging_prefix=staging_prefix)
+        summary["candidates_capped"] = summary["candidates_capped"] or capped
+        for entry in found:
+            if allowed(entry["file_path"]) and all(
+                (entry["file_path"], entry["line"]) != (other["file_path"], other["line"]) for other in declarations
+            ):
+                declarations.append({**entry, "base": base})
+    summary["found"] = len(declarations)
+    overrides: list[tuple[dict, int, str]] = []
+    if methods:
+        for entry in declarations:
+            for line, name, _text in member_declarations(entry["rows"], entry["line"], methods):
+                overrides.append((entry, line, name))
+        if not bases:
+            # No class named: every declaration of the method, with the class it is in.
+            for method in methods:
+                for item in await find_symbols(store, repo_id, method, limit=12, staging_prefix=staging_prefix):
+                    if item["name"] == method and allowed(item["path"]):
+                        overrides.append(({"file_path": item["path"], "name": item.get("container") or "", "rows": []},
+                                          int(item["line"]), method))
+    summary["overrides"] = len(overrides)
+    paths = list(dict.fromkeys([*(entry["file_path"] for entry in declarations[:SUBCLASS_EVIDENCE_WINDOWS]),
+                                *(entry["file_path"] for entry, _line, _name in overrides)]))
+    files, outlines = await _read_files(store, repo_id, paths, staging_prefix)
+    characters = 0
+    for entry in declarations[:SUBCLASS_EVIDENCE_WINDOWS]:
+        lines = files.get(entry["file_path"]) or {}
+        body_end = next((item["end_line"] for item in outlines.get(entry["file_path"], [])
+                         if item["line"] == entry["line"]), entry["line"])
+        enclosing = enclosing_declaration(outlines.get(entry["file_path"]) or [], entry["line"])
+        window = _evidence_window(
+            entry["file_path"], lines, entry["line"], min(body_end, entry["line"] + 3), language=None, label=enclosing,
+            method="subclass", reason=f"Exact search: `{entry['name']}` inherits from `{entry['base']}` (line {entry['line']})",
+            evidence_plan=evidence_plan,
+        )
+        if window and characters + len(window["content"]) <= EXACT_EVIDENCE_CHARACTERS:
+            characters += len(window["content"])
+            windows.append(window)
+    summary["shown"] = len(windows)
+    for entry, line, name in overrides[:SUBCLASS_EVIDENCE_WINDOWS]:
+        lines = files.get(entry["file_path"]) or {}
+        enclosing = enclosing_declaration(outlines.get(entry["file_path"]) or [], line)
+        owner = entry.get("name") or (enclosing.rsplit(".", 2)[0] if enclosing and "." in enclosing else "")
+        window = _evidence_window(
+            entry["file_path"], lines, line, line + 2, language=None, label=enclosing, method="override",
+            reason=f"Exact search: declares `{name}`" + (f" in `{owner}`" if owner else "") + f" (line {line})",
+            evidence_plan=evidence_plan,
+        )
+        if window:
+            windows.append(window)
+    return windows
+
+
+# Release notes mention every renamed name; reference docs and guides come first.
+_CHANGELOG_NAME = re.compile(r"(?:^|/)(?:changes|changelog|history|news|release[-_]?notes)[^/]*$", re.IGNORECASE)
+_DOC_PATH_LIKES = ("%.md", "%.mdx", "%.rst", "%.txt", "%.adoc", "docs/%", "doc/%", "%/docs/%", "%/doc/%")
+
+
+async def doc_mention_evidence(store, repo_id: str, query: str, evidence_plan: dict, *,
+                               staging_prefix: str | None = None) -> list[Dict]:
+    """Documentation lines that mention the code name a change/risk question is about.
+
+    "Is it safe to change make_response?" should see ``docs/api.rst`` and
+    the quickstart that use it, instead of concluding no docs exist.
+    """
+    from retrieval.code_search import evidence_candidate_rows, matching_lines
+
+    if evidence_plan.get("docs_excluded"):
+        return []
+    names = list(dict.fromkeys([
+        *(member for _, member in extract_qualified_names(query)), *extract_question_identifiers(query),
+    ]))[:2]
+    if not names:
+        return []
+    pattern = re.compile("|".join(rf"(?<![\w$]){re.escape(name)}(?![\w$])" for name in names))
+    doc_sql = " OR ".join("lower(c.file_path) LIKE ?" for _ in _DOC_PATH_LIKES)
+    rows, _capped = await evidence_candidate_rows(
+        store, repo_id, names, staging_prefix=staging_prefix, extra_sql=f" AND ({doc_sql})", extra_args=list(_DOC_PATH_LIKES),
+    )
+    rows = [row for row in exclude_staged(rows, staging_prefix)
+            if is_doc_path(str(row.get("file_path") or "")) and not is_overview_file(str(row.get("file_path") or ""))]
+    matches = matching_lines(rows, pattern)
+    total = sum(len(found) for found in matches.values())
+    evidence_plan["docs_mentions"] = {"names": names, "matches": total, "files": len(matches), "shown": 0}
+    if not total:
+        return []
+    file_lines: dict[str, dict[int, str]] = {}
+    for row in rows:
+        path = str(row.get("file_path") or "")
+        start = int(row.get("start_line") or 1)
+        for offset, line in enumerate(str(row.get("content") or "").split("\n")):
+            file_lines.setdefault(path, {}).setdefault(start + offset, line)
+    windows: list[Dict] = []
+    shown = 0
+    # One window per file first (the most files), then more from the same files.
+    groups = {
+        path: _group_lines(list(found))
+        for path, found in sorted(matches.items(), key=lambda item: (bool(_CHANGELOG_NAME.search(item[0])), item[0]))
+    }
+    for round_index in range(max(len(items) for items in groups.values())):
+        for path, items in groups.items():
+            if round_index >= len(items) or len(windows) >= DOC_MENTION_WINDOWS:
+                continue
+            first, last, matched = items[round_index]
+            window = _evidence_window(
+                path, file_lines[path], first, last, language=None, label=None, method="doc_mention",
+                reason=f"Documentation that mentions {', '.join(f'`{name}`' for name in names)}: {_line_list(matched)}",
+                evidence_plan=evidence_plan,
+            )
+            if window:
+                windows.append(window)
+                shown += len(matched)
+    evidence_plan["docs_mentions"]["shown"] = shown
+    return windows
+
+
+async def exact_question_evidence(store, repo_id: str, query: str, evidence_plan: dict, *,
+                                  staging_prefix: str | None = None) -> tuple[list[Dict], list[Dict]]:
+    """The exact-search evidence a question needs: ``(lead, docs)``.
+
+    ``lead`` (every matching line, subclasses and overrides) answers the
+    question itself and goes first; ``docs`` (documentation that mentions
+    the name a change question is about) supports it and follows the best
+    ranked sections.
+    """
+    jobs: dict[str, object] = {}
+    if is_exhaustive_question(query):
+        jobs["usages"] = exhaustive_usage_evidence(store, repo_id, query, evidence_plan, staging_prefix=staging_prefix)
+    if SUBCLASS_QUESTION_PATTERN.search(query):
+        jobs["subclasses"] = subclass_evidence(store, repo_id, query, evidence_plan, staging_prefix=staging_prefix)
+    if is_impact_question(query):
+        jobs["docs"] = doc_mention_evidence(store, repo_id, query, evidence_plan, staging_prefix=staging_prefix)
+    lead: list[Dict] = []
+    docs: list[Dict] = []
+    if not jobs:
+        return lead, docs
+    for key, result in zip(jobs, await asyncio.gather(*jobs.values(), return_exceptions=True)):
+        if isinstance(result, Exception):
+            logger.warning("Exact evidence search failed for %s (%s)", repo_id, type(result).__name__)
+            continue
+        (docs if key == "docs" else lead).extend(result)
+    return lead, docs
 
 
 # ---------------------------------------------------------------------------

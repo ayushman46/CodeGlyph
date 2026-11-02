@@ -1518,7 +1518,7 @@ async def continue_answer_events(store, repo: dict, req, user_id: str, *, stream
 
 _PLAN_KEYS_FROM_RETRIEVAL = (
     "follow_up_terms", "absent_terms", "ignored_file_like_terms", "missing_files", "strict_target_relaxed",
-    "semantic_search", "directory_listing", "unretrieved_identifiers",
+    "semantic_search", "directory_listing", "unretrieved_identifiers", "exact_search", "subclass_search", "docs_mentions",
 )
 
 
