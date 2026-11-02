@@ -18,11 +18,25 @@ None available (checked 2026-11-02): GitHub repo `ayushman46/CodeGlyph` has 0 st
 ## Environment
 - Scripts in the session scratchpad `sim/`: `backend.sh` (API :8000), `frontend.sh` (test UI :5180).
 
-## Findings
-_(pending customer simulations)_
+## Findings — simulation round 1 (2026-11-02, simulated, 6 personas, 28 min)
+Raw reports + synthesized backlog: scratchpad `sim/round1.json`; screenshots in `sim/agents/<persona>/`.
+- Verdicts: first-time user "would come back"; developer, maintainer, onboarding engineer "side tool, not trusted"; tech lead "would not use for a go/no-go"; admin "would not adopt for the team: there is nothing to administer".
+- Trust: long answers cut off mid-sentence under an all-clear badge (answer cap 1,400 tokens, `length` ignored); invented methods/imports shown as "references checked"; real indexed lines flagged "not in the indexed snapshot"; Detailed model leaked reasoning / took ~90 s.
+- Retrieval: naming a big file retrieves only its first ~700 lines (`path_hint_chunks` orders by line); natural questions miss obvious files, then answers claim the code/tests don't exist.
+- Finding code: "exact" search matches any token, caps 3 lines/section; ⌘K can't jump to files or symbols; no file tree; @-mention can't find files by name; search line clicks open the wrong line; no deep links.
+- Impact: `import flask` / src-layout packages unresolved, so tests never appear; ambiguous names merged; no transitive or affected-tests view.
+- Conversations: "New chat" permanently deletes the only thread (no confirm/undo/history).
+- Access: no members, sharing, roles or removal; the "Team" plan only adds storage.
+- Onboarding/indexing: overview stale after indexing (cache never invalidated), contradictory progress numbers, no queue position, typo'd repos leave failed entries.
+- Edit & PR: "checks passed" shown for patches whose tests were never run.
 
-## Backlog
-_(pending)_
+## Backlog (49 items; top of list, value/effort)
+Bugs: BUG-01 New chat deletes (5/S) · BUG-02 truncation (5/M) · BUG-03 search exactness (5/M) · BUG-04 file-head retrieval (5/M) · BUG-05 unverified identifiers (5/M) · BUG-06 wrong evidence + false absence (5/L) · BUG-07 wrong warning text (4/S) · BUG-08 "checks passed" (4/S) · BUG-09 Detailed reasoning leak (4/M) · BUG-10 package imports (4/M) · BUG-11..15 (3/S).
+Features: FEAT-01 ⌘K files/symbols (5/M) · FEAT-02 enclosing symbol (4/M) · FEAT-03 file tree (4/M) · FEAT-04 multiple conversations (4/L) · FEAT-05 transitive impact + affected tests (4/L) · FEAT-06 team access (4/XL) · FEAT-08 queue ETA · FEAT-09 copy with permalinks · FEAT-10 deep links · FEAT-14 Start here · FEAT-15 share link.
+Deferred (need owner input or infrastructure): FEAT-07 sandboxed test runs (cost/security), seat-based billing for teams, SSO, FEAT-18 compare refs, FEAT-19 ownership/blame.
+
+## Batch 1 plan (parallel engineering tracks, one worktree each)
+T1 answer trust (BUG-02/05/07/09 + absence wording) · T2 retrieval (BUG-04/06) · T3 navigation (BUG-03/11/12, FEAT-01/03/10/02) · T4 conversations (BUG-01, FEAT-04/09) · T5 impact (BUG-10/15, FEAT-05) · T6 team access (FEAT-06/15) · T7 onboarding + indexing UX (FEAT-14/08, BUG-13/14, UX-07/04) · T8 Edit & PR honesty (BUG-08/16, FEAT-13).
 
 ## Changes
 - Dev tooling: `scripts/dev_server.py` accepts `local:<id>` bearer tokens; the e2e/test build reads `ci-e2e-user` (frontend/src/api/supabase.js, test builds only).
@@ -31,4 +45,6 @@ _(pending)_
 _(pending)_
 
 ## Next step
-Run the six customer simulations against :5180 / :8000.
+Batch 1 is running as workflow run `wf_f9352695-2a0` (8 tracks → review → fix; branches `track/t1-answer-trust` … `track/t8-edit-honesty`, one git worktree each, live checks on ports 8101–8108 / 5301–5308 against copies of `sim/sim-snapshot-r1.db`).
+When it finishes: merge each `track/*` branch into `ux-polish-and-pr-flow` (hot spots: query_router.py, useStore.js, RepoWorkspace.jsx, api/client.js, database.py MIGRATIONS, Sidebar.jsx, explore_router.py, repository_state.py), run all suites, restart `sim/backend.sh` + `sim/frontend.sh`, then run customer round 2 on the acceptance scenarios.
+If this session ends first: re-run the workflow with `resumeFromRunId` (see the Workflow tool output) or inspect `git branch --list 'track/*'` and `git worktree list` to merge whatever finished.
