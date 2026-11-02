@@ -27,7 +27,7 @@ import Badge from '../ui/Badge';
 import Button from '../ui/Button';
 import Menu from '../ui/Menu';
 import { toast } from '../ui/Toast';
-import Composer from './Composer';
+import Composer, { readComposerPreferences } from './Composer';
 import ConversationList from './ConversationList';
 import DiffView from './DiffView';
 import { REVIEW_LABEL, isEditRun } from './EditProposalCard';
@@ -573,6 +573,12 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
   const askRef = useRef(ask);
   askRef.current = ask;
   const askFromReply = useCallback((question, options) => askRef.current(question, options), []);
+  // A suggested question uses the workflow and model chosen in the composer
+  // (it used to go out as General / Fast while Onboarding was selected).
+  const askSuggestion = useCallback((question) => {
+    const { workflow, model } = readComposerPreferences();
+    askRef.current(question, { workflow, modelProfile: model });
+  }, []);
 
   const lastUser = [...messages].reverse().find((message) => message.role === 'user');
   const lastMessage = messages[messages.length - 1];
@@ -833,7 +839,7 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
                 notQueryable ? progressPanel : (
                   <RepoOverview
                     repo={repo}
-                    onAsk={(question) => ask(question, { workflow: 'general', modelProfile: 'fast' })}
+                    onAsk={askSuggestion}
                     onOpenCoverage={() => onRequestDialog('coverage', repo)}
                   />
                 )
@@ -865,7 +871,7 @@ const RepoWorkspace = ({ repo, onRequestDialog }) => {
                         <RepoOverview
                           repo={repo}
                           compact
-                          onAsk={(question) => ask(question, { workflow: 'general', modelProfile: 'fast' })}
+                          onAsk={askSuggestion}
                           onShowOverview={() => setTab('overview')}
                         />
                       </div>

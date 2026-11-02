@@ -181,6 +181,16 @@ test('a dotted method name is searched by its own name, so a real method is foun
   expect(asked).toEqual(['handle_request']);
 });
 
+test('a suggested question uses the workflow and model chosen in the composer (R2-09)', async ({ page }) => {
+  await page.addInitScript(() => window.localStorage.setItem('ci-composer', JSON.stringify({ mode: 'ask', workflow: 'onboarding', model: 'detailed' })));
+  await mockApi(page);
+  const payloads = await routeStream(page, () => [['done', done({ answer: `Routes are defined in \`${CITED_PATH}:L42-L118\`.` })]]);
+  await page.goto('/app/r/cal.com');
+  await page.getByRole('button', { name: /Where are the API routes defined/ }).first().click();
+  await expect.poll(() => payloads.length).toBe(1);
+  expect(payloads[0]).toMatchObject({ workflow: 'onboarding', model_profile: 'detailed' });
+});
+
 test('a failed Detailed answer names the failure and offers Retry with Fast', async ({ page }) => {
   await mockApi(page);
   const payloads = await routeStream(page, (payload) => (payload.model_profile === 'detailed' ? [['done', done({

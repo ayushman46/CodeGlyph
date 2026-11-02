@@ -57,6 +57,9 @@ const MENTION_SEARCH_MIN = 2;
 const MENTION_SEARCH_DELAY_MS = 150;
 const MENTION_POOL_LIMIT = 600;
 
+/** The composer's saved choices (mode, workflow, answer model), also used by suggested questions. */
+export const readComposerPreferences = () => readPreferences();
+
 const readPreferences = () => {
   try {
     const value = JSON.parse(window.localStorage.getItem(PREFERENCES_KEY) || '{}');
