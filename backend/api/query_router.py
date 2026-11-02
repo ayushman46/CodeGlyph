@@ -20,7 +20,7 @@ from starlette.background import BackgroundTask
 
 from agent.agent import ModelSwitch, run_agent_loop, stream_agent_answer, stream_answer_continuation
 from agent.code_edit import create_edit_ticket, edit_file_paths
-from agent.editor import EditRequest, run_code_edit
+from agent.editor import EditRequest, recent_proposal_for, run_code_edit
 from agent.nemotron import AnswerRestart, LLMProviderError, TruncatedAnswer
 from api.answer_trust import (
     annotate_history_names,
@@ -62,6 +62,34 @@ _EDIT_ACTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _ISSUE_LINK = re.compile(r"github\.com/[^/\s]+/[^/\s]+/issues/\d+", re.IGNORECASE)
+# A question about the change proposed in this conversation ("how does the
+# revised patch handle bytes keys?"). Its diff is not in the index.
+_PROPOSAL_QUESTION = re.compile(
+    r"\b(?:proposal|proposed|patch|diff|revision|revised|your (?:fix|change|changes|edit)|the (?:fix|change) you)\b",
+    re.IGNORECASE,
+)
+_PROPOSAL_EVIDENCE_CHARACTERS = 8000
+
+
+def proposal_evidence(proposal: dict) -> dict:
+    """The conversation's latest proposal as generated evidence: each file's
+    changes as search/replace text. Not a citation (it is not indexed code)."""
+    parts = [f"Proposal: {proposal.get('title') or 'untitled'}"]
+    if proposal.get("summary"):
+        parts.append(str(proposal["summary"]))
+    for item in proposal.get("files") or []:
+        parts.append(f"--- {item.get('file_path')} ({item.get('action') or 'modify'})")
+        for change in item.get("changes") or []:
+            if not isinstance(change, dict):
+                continue
+            old, new = str(change.get("old") or ""), str(change.get("new") or "")
+            parts.append(f"Replaces:\n{old}\nWith:\n{new}" if old else f"Adds:\n{new}")
+    text = "\n".join(parts)
+    if len(text) > _PROPOSAL_EVIDENCE_CHARACTERS:
+        text = text[:_PROPOSAL_EVIDENCE_CHARACTERS] + "\n[The rest of the proposal is not shown.]"
+    paths = [str(item.get("file_path")) for item in proposal.get("files") or [] if item.get("file_path")]
+    return {"_synthetic": "proposal_changes", "file_path": ", ".join(paths) or "the proposal", "content": text,
+            "start_line": 1, "end_line": 1}
 # Follow-up detection. A question is a follow-up only when it leans on the
 # previous turn: it starts with a connective ("and where is that called?")
 # or refers back with a pronoun while naming almost nothing of its own
@@ -1158,6 +1186,18 @@ async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool,
         # documentation or repository-overview requests.
         if not evidence_plan.get("overview_files_allowed"):
             chunks = [chunk for chunk in chunks if not is_overview_file(str(chunk.get("file_path", "")))]
+        if workflow != "editing" and history and _PROPOSAL_QUESTION.search(question):
+            # Questions about the change proposed in this conversation see
+            # its diff (round 2: "how does the revised proposal handle bytes
+            # keys?" got "cannot determine").
+            try:
+                proposal = await recent_proposal_for(store, repo["id"], user_id, history)
+            except Exception:
+                logger.debug("Proposal lookup for a follow-up failed", exc_info=True)
+                proposal = None
+            if proposal:
+                chunks = [proposal_evidence(proposal), *chunks]
+                evidence_plan["proposal_in_evidence"] = proposal.get("id")
         _merge_retrieval_plan(evidence_plan, chunks)
         if retrieval_query:
             evidence_plan["follow_up"] = True

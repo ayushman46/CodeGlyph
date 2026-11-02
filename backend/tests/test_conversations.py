@@ -381,6 +381,37 @@ class ConversationApiTests(EndpointTestCase):
         run(self.store.execute("UPDATE conversations SET updated_at = '2099-01-01T00:00:00+00:00' WHERE id = ?", ["e" * 32]))
         self.assertEqual(self.client.get(f"/api/conversations/{REPO_NAME}").json()["conversation"]["id"], kept["id"])
 
+    def test_a_question_about_the_proposal_sees_its_changes(self):
+        """Round 2 (maintainer): asking how the revised proposal handles a case
+        got "cannot determine": the proposal's diff is not indexed code."""
+        proposal = sample_proposal()
+        repo = run(fetch_owned_repository(self.store, USER, REPO_NAME))
+        run(persist_proposal(self.store, proposal, repo=repo, repo_name=REPO_NAME, user_id=USER))
+
+        async def fake_edit(request):
+            return "## Clear the session on logout", [{"tool": "code_edit", "input": {"proposal_id": proposal["id"]}}], proposal
+
+        with patch("api.query_router.retrieve_context", AsyncMock(return_value=[AUTH_CHUNK, SESSION_CHUNK])), \
+             patch("api.query_router.run_code_edit", fake_edit), \
+             patch("api.query_router.persist_proposal", AsyncMock()):
+            response = self.client.post("/api/query/stream", json={
+                "repo_name": REPO_NAME, "question": "Fix logout so it clears the session", "workflow": "editing",
+                "new_conversation": True,
+            })
+        thread = self.done(response)["conversation"]["id"]
+
+        def context_for(question, **kwargs):
+            calls = []
+            self.done(self.ask(question, calls=calls, **kwargs)[0])
+            return calls[-1][0][1]
+
+        context = context_for("How does the patch treat inactive users?", conversation_id=thread)
+        self.assertIn("Generated proposal changes for src/auth.py, src/session.py", context)
+        self.assertIn("is not None and user.active", context)
+        # Only questions about the proposal, and only in its own conversation.
+        self.assertNotIn("user.active", context_for("Where are sessions created?", conversation_id=thread))
+        self.assertNotIn("user.active", context_for("How does the patch treat inactive users?", new=True))
+
     def test_a_proposal_stays_reachable_from_its_conversation(self):
         proposal = sample_proposal()
         repo = run(fetch_owned_repository(self.store, USER, REPO_NAME))
