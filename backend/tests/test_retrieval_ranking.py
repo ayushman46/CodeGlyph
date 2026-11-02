@@ -675,3 +675,35 @@ class FusionNoiseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AbsentTermTests(unittest.TestCase):
+    """Round 2: answers said 'the term "tour" does not appear in the indexed
+    code' because every unmatched question word was probed and reported."""
+
+    def test_only_words_that_name_something_are_probed(self):
+        names = retriever.term_names_something
+        for term, question in (("rabbitmq", "Where does this publish to RabbitMQ?"),
+                               ("kafka", "Does it consume from Kafka topics?"),
+                               ("tour", "Where is `tour` defined?"),
+                               ("my_handler", "who calls my_handler")):
+            with self.subTest(term=term):
+                self.assertTrue(names(term, question))
+        for term, question in (("tour", "Give me a tour of the request lifecycle."),
+                               ("summary", "Summary of the blast radius of changing make_response?"),
+                               ("blast", "Summary of the blast radius of changing make_response?"),
+                               ("radius", "Summary of the blast radius of changing make_response?")):
+            with self.subTest(term=term):
+                self.assertFalse(names(term, question))
+
+    def test_ordinary_words_never_reach_the_index_probe(self):
+        sparse = [chunk("src/app.py", 1, "def make_response(rv):\n    return rv")]
+        probe = AsyncMock(return_value=[])
+        with patch.object(retriever, "embed_query", side_effect=EmbeddingUnavailableError("offline")), \
+             patch.object(retriever, "sparse_search", AsyncMock(return_value=sparse)), \
+             patch.object(retriever, "absent_question_terms", probe):
+            run(retriever.retrieve_context(FakeStore([]), "r", "Give a tour and summary of make_response; does it use RabbitMQ?", top_k=4))
+        probed = [term for call in probe.await_args_list for term in call.args[2]]
+        self.assertIn("rabbitmq", probed)
+        for word in ("tour", "summary"):
+            self.assertNotIn(word, probed)

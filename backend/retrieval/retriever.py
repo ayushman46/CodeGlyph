@@ -2368,6 +2368,32 @@ async def called_definition_chunks(
     return found
 
 
+def term_names_something(term: str, question: str) -> bool:
+    """Whether a question word could name a technology, product, file or code.
+
+    Only those are worth reporting as absent from the index. Ordinary words
+    ("tour", "summary", "blast radius") were reported too, and answers
+    then said "the term tour does not appear in the indexed code" (round 2).
+    A name is written capitalised (RabbitMQ, Kafka), code-shaped
+    (snake_case, digits, dots, dashes) or quoted.
+    """
+    term = str(term or "").strip()
+    if not term:
+        return False
+    if re.search(r"[_\d.\-]", term):
+        return True
+    text = str(question or "")
+    escaped = re.escape(term)
+    if re.search(rf"[`'\"]{escaped}[`'\"]", text, re.IGNORECASE):
+        return True
+    for match in re.finditer(rf"(?<![\w$]){escaped}(?![\w$])", text, re.IGNORECASE):
+        written = match.group(0)
+        sentence_start = not text[:match.start()].strip() or text[:match.start()].rstrip()[-1:] in ".?!:"
+        if any(character.isupper() for character in written[1:]) or (written[0].isupper() and not sentence_start):
+            return True
+    return False
+
+
 async def absent_question_terms(store, repo_id: str, terms: list[str]) -> list[str]:
     """Question terms with no match anywhere in this repository's index.
 
@@ -2886,7 +2912,7 @@ async def _retrieve_context(
         haystack = " ".join(
             f"{chunk.get('file_path') or ''} {chunk.get('content') or ''}".lower() for chunk in sparse_chunks
         )
-        unmatched = [term for term in question_terms if term not in haystack]
+        unmatched = [term for term in question_terms if term not in haystack and term_names_something(term, query)]
         if unmatched:
             try:
                 absent_terms = await absent_question_terms(store, repo_id, unmatched)
