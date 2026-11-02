@@ -526,6 +526,10 @@ const useStore = create((set, get) => ({
     queryController?.abort();
     historyController = null;
     queryController = null;
+    // Forget the conversation that was open: a reload before the new chat's
+    // first answer is saved must open the newest conversation (where a
+    // question left mid-answer is kept), not the old one (round 3).
+    rememberConversation(repoName, null);
     set((state) => ({
       messages: [], conversation: null, newChat: true, isHistoryLoading: false, historyError: '', historyHasMore: false,
       historyCursor: null, isLoadingOlder: false, isQuerying: false, queryEpoch: state.queryEpoch + 1, sources: closedSources(),

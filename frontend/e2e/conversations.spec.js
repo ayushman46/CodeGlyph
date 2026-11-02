@@ -65,6 +65,19 @@ test('New chat keeps the conversation; History lists both and reopens the first 
   expect(state.conversations.find((item) => item.id === TRIAGE).messages).toHaveLength(6);
 });
 
+test('a reload after New chat opens the newest conversation, not the one that was open (round 3)', async ({ page }) => {
+  await mockApi(page, { conversations: [triage(), onboarding()] });
+  await page.goto(`/app/r/cal.com?c=${ONBOARDING}`);
+  await expect(page.getByText('Start with apps/web and packages/features.')).toBeVisible();
+  await page.getByRole('button', { name: 'New chat' }).click();
+  await expect(page.getByText('What do you want to know about cal.com?')).toBeVisible();
+  expect(await page.evaluate(() => window.localStorage.getItem('ci-conversation:cal.com'))).toBeNull();
+  await page.reload();
+  // The server's newest conversation (where a question left mid-answer is saved), not the remembered one.
+  await expect(page.getByText('Why are confirmation emails sent in the wrong timezone?')).toBeVisible();
+  await expect(page.getByText('Start with apps/web and packages/features.')).toHaveCount(0);
+});
+
 test('deleting a conversation asks first, and Undo restores it', async ({ page }) => {
   const state = await mockApi(page, { conversations: [triage(), onboarding()] });
   await page.goto(`/app/r/cal.com?c=${ONBOARDING}`);
