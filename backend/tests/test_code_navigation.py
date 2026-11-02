@@ -497,6 +497,22 @@ class SymbolTests(NavigationStoreCase):
             [179, 275, 295, 307, 454],
         )
 
+    async def test_a_qualified_name_finds_that_classs_member(self):
+        """⌘K "Client.get" found nothing (round 2): names were matched whole."""
+        repo_id, _count = await self.add_repo("click", CLICK_FILES)
+        for query, line in (("StringParamType.convert", 307), ("Choice.convert", 454), ("ParamType.convert", 179),
+                            ("Choice::convert", 454), ("Command.parse_args", 1396)):
+            with self.subTest(query=query):
+                found = await code_search.find_symbols(self.store, repo_id, query)
+                self.assertEqual([(item["name"], item["line"]) for item in found], [(query.split(".")[-1].split("::")[-1], line)])
+                self.assertEqual(found[0]["container"], query.split(".")[0].split("::")[0])
+        # An unknown class falls back to every member with the name.
+        fallback = await code_search.find_symbols(self.store, repo_id, "Nothing.convert", limit=10)
+        self.assertEqual(
+            [item["line"] for item in fallback if item["path"] == "src/click/types.py" and item["name"] == "convert"],
+            [179, 275, 295, 307, 454],
+        )
+
     def test_match_tiers(self):
         self.assertEqual(symbol_match_tier("ParamType", "ParamType"), 0)
         self.assertEqual(symbol_match_tier("ParamType", "paramtype"), 1)

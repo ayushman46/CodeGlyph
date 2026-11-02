@@ -189,6 +189,21 @@ export const pathScore = (path, query) => {
 };
 
 /**
+ * A declaration's score for the palette: its own name, or its qualified
+ * name when the query names the class too (`Client.get`, `Choice::convert`);
+ * a member of another class still matches its name, lower.
+ */
+export const qualifiedSymbolScore = (symbol, query) => {
+  const plain = symbolScore(symbol?.name, query);
+  const needle = String(query || '').trim().replace(/::|#/g, '.');
+  if (!needle.includes('.')) return plain;
+  const qualified = symbol?.container ? symbolScore(`${symbol.container}.${symbol.name}`, needle) : 0;
+  // A class the index does not know: its members by name, ranked lower.
+  const member = Math.round(symbolScore(symbol?.name, needle.split('.').pop()) * 0.6);
+  return Math.max(plain, qualified, member);
+};
+
+/**
  * How well a declared name matches the query, 0–100: the exact name, the
  * same name in another case, a prefix, a word inside the name
  * (`timeout` in `_set_timeout`, `Type` in `ParamType`), anywhere.

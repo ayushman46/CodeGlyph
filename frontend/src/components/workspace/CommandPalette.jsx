@@ -6,7 +6,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { listRepositoryFiles, searchRepositorySymbols } from '../../api/client';
-import { commandScore as score, pathScore, symbolLabel, symbolScore } from '../../lib/codeNav';
+import { commandScore as score, pathScore, qualifiedSymbolScore, symbolLabel } from '../../lib/codeNav';
 import { parseRepositoryInput } from '../../lib/format';
 import { statusSentence } from '../../lib/phase';
 import { canManage } from '../../lib/sharing';
@@ -143,7 +143,7 @@ const CommandPalette = ({ open, onClose, onAddRepository, currentRepo = null, on
     const codeItems = [
       ...code.symbols.map((symbol) => ({
         id: `symbol-${symbol.path}-${symbol.line}`, label: symbolLabel(symbol), detail: symbol.container ? `in ${symbol.container}` : '',
-        hint: `${symbol.path}:${symbol.line}`, icon: Braces, group: 'Symbol', score: symbolScore(symbol.name, query),
+        hint: `${symbol.path}:${symbol.line}`, icon: Braces, group: 'Symbol', score: qualifiedSymbolScore(symbol, query),
         run: () => openFile({ path: symbol.path, start: symbol.line, end: symbol.line, from: 'symbol' }),
       })),
       ...code.files.map((file) => ({

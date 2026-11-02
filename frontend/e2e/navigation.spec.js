@@ -68,6 +68,25 @@ test('⌘K jumps to a declaration at its exact line and to a file by name (FEAT-
   await expect(viewer(page, 'packages/features/bookings/lib/getBooking.ts')).toBeVisible();
 });
 
+test('⌘K finds a method named with its class (R2-06)', async ({ page }) => {
+  await mockApi(page);
+  const asked = [];
+  await page.route('**/api/repos/cal.com/symbols**', (route) => {
+    asked.push(new URL(route.request().url()).searchParams.get('q'));
+    return route.fulfill(json({ symbols: [{ name: 'handleConfirmation', kind: 'function', path: CITED_PATH, line: 42, container: 'Booking' }] }));
+  });
+  await page.goto('/app/r/cal.com');
+  await expect(page.getByRole('textbox', { name: 'Ask about this codebase' })).toBeVisible();
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+K' : 'Control+K');
+  await page.getByRole('combobox', { name: 'Search commands' }).fill('Booking.handleConfirmation');
+  const first = page.getByRole('listbox', { name: 'Commands' }).getByRole('option').first();
+  await expect(first).toContainText('function handleConfirmation');
+  await expect(first).toContainText('in Booking');
+  await page.keyboard.press('Enter');
+  await expect(viewer(page).getByText('Line 42', { exact: true })).toBeVisible();
+  expect(asked).toContain('Booking.handleConfirmation');
+});
+
 test.describe('on a phone', () => {
   test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
 

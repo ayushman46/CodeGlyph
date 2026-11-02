@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  commandScore, enclosingSymbols, fileLinkKey, highlightParts, isMarkdownPath, pathScore, readFileLink,
+  commandScore, enclosingSymbols, fileLinkKey, highlightParts, isMarkdownPath, pathScore, qualifiedSymbolScore, readFileLink,
   resolveRepositoryLink, searchSummary, symbolLabel, symbolScore, viewerLink, writeFileLink,
 } from './codeNav.js';
 
@@ -101,4 +101,16 @@ test('palette scores put a file named like the query, and an exact symbol, first
   assert.equal(commandScore('cal.com', 'cal'), 90);
   assert.ok(commandScore('Toggle dark mode', 'dark') > 60);
   assert.equal(commandScore('Pricing', 'zz'), 0);
+});
+
+test('a qualified query scores the member of that class (round 2: ⌘K "Client.get" found nothing)', () => {
+  const get = { name: 'get', container: 'Client' };
+  assert.equal(qualifiedSymbolScore(get, 'Client.get'), 100);
+  assert.equal(qualifiedSymbolScore(get, 'Client::get'), 100);
+  assert.equal(qualifiedSymbolScore(get, 'get'), 100);
+  assert.ok(qualifiedSymbolScore(get, 'Client.ge') > 0);
+  // Another class's member, or one without a known class, still matches by name, ranked lower.
+  assert.equal(qualifiedSymbolScore({ name: 'get', container: 'Headers' }, 'Client.get'), 60);
+  assert.equal(qualifiedSymbolScore({ name: 'get' }, 'Client.get'), 60);
+  assert.equal(qualifiedSymbolScore({ name: 'post', container: 'Client' }, 'Client.get'), 0);
 });

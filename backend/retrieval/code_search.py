@@ -826,16 +826,64 @@ def _container(lines: list[str], index: int) -> str | None:
     return None
 
 
+# ``Client.get``, ``Router::route``, ``Foo#bar``: a member named through its class.
+_QUALIFIED_NAME = re.compile(r"^([A-Za-z_$][\w$]*)(?:\.|::|#)([A-Za-z_$][\w$]*)$")
+
+
+async def _declared_inside(store, repo_id: str, path: str, owner_line: int, member_line: int,
+                           staging_prefix: str | None) -> bool:
+    """Whether no top-level declaration starts between a class and a later member, so the member is in it."""
+    stage_sql, stage_args = ("", []) if not staging_prefix else (" AND id NOT LIKE ?", [f"{staging_prefix}%"])
+    rows = await store.fetch_all(
+        f"SELECT start_line, content FROM chunks WHERE repo_id = ? AND file_path = ?{stage_sql} "
+        "AND start_line <= ? AND end_line >= ? LIMIT 200",
+        [repo_id, path, *stage_args, member_line, owner_line],
+    )
+    for row in rows:
+        start = int(row.get("start_line") or 1)
+        for index, line in enumerate(str(row.get("content") or "").split("\n")):
+            if owner_line < start + index < member_line and _indent(line) == 0 and line_declaration(line):
+                return False
+    return True
+
+
+async def _qualified_symbols(store, repo_id: str, owner: str, member: str, *, limit: int,
+                             staging_prefix: str | None) -> list[dict]:
+    """``member`` declared inside a class (or other declaration) named ``owner``."""
+    owners = [item for item in await find_symbols(store, repo_id, owner, limit=10, staging_prefix=staging_prefix)
+              if item["name"] == owner]
+    if not owners:
+        return []
+    members = [item for item in await find_symbols(store, repo_id, member, limit=60, staging_prefix=staging_prefix)
+               if item["name"] == member]
+    found: list[dict] = []
+    for item in members:
+        for declared in owners:
+            if (declared["path"] == item["path"] and declared["line"] < item["line"]
+                    and await _declared_inside(store, repo_id, item["path"], declared["line"], item["line"], staging_prefix)):
+                found.append({**item, "container": owner})
+                break
+        if len(found) >= limit:
+            break
+    return found
+
+
 async def find_symbols(store, repo_id: str, query: str, *, limit: int = 20, staging_prefix: str | None = None) -> list[dict]:
     """Declarations whose name matches ``query``, each with the line that declares it.
 
     Returns ``{name, kind, path, line, container}`` items, best first: exact
     names, then prefixes, then names containing the query; source before
-    tests and docs.
+    tests and docs. A qualified name (``Client.get``) finds that member of
+    that class, or every member with the name when the class has none.
     """
     needle = str(query or "").strip()
     if len(needle) < 2 or len(needle) > 120:
         return []
+    qualified = _QUALIFIED_NAME.match(needle)
+    if qualified:
+        owner, member = qualified.groups()
+        found = await _qualified_symbols(store, repo_id, owner, member, limit=limit, staging_prefix=staging_prefix)
+        return found or await find_symbols(store, repo_id, member, limit=limit, staging_prefix=staging_prefix)
     stage_sql, stage_args = ("", []) if not staging_prefix else (" AND id NOT LIKE ?", [f"{staging_prefix}%"])
     rows = await store.fetch_all(
         f"SELECT rowid AS row_id, file_path, start_line, symbols FROM chunks WHERE repo_id = ?{stage_sql} "

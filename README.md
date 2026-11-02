@@ -173,7 +173,7 @@ All routes require a Supabase bearer token except health/readiness and the GitHu
 | GET | `/api/repos/{repo}/overview` | Languages, folder map, key files, suggested questions, `start_here` (entry, core folder, cited commands, reading path) |
 | GET | `/api/repos/{repo}/search?q=` | Exact code search: one result per file with every matching line (`"quoted phrase"` matches exactly) |
 | GET | `/api/repos/{repo}/files?q=` / `?dir=` | Indexed files by name or partial path, or one folder of the file tree |
-| GET | `/api/repos/{repo}/symbols?q=` | Declarations by name, each at its exact line |
+| GET | `/api/repos/{repo}/symbols?q=` | Declarations by name, each at its exact line (`Class.method` finds that class's member) |
 | GET | `/api/repos/{repo}/file?path=` | One file at the indexed commit, with an outline of its declarations |
 | GET | `/api/repos/{repo}/impact?file_path=&depth=&symbol=` | Files that import a file (`depth` 1-3), the affected test files, test functions for `symbol`, and what it imports. A path matching several files returns `ambiguous` with `candidates` (`candidates_complete: false` when there are too many to list) |
 | GET | `/api/repos/{repo}/impact/suggestions` | The most imported files (also upgrades an import graph built by an older resolver, from the index) |
