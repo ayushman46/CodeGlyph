@@ -105,6 +105,35 @@ test('deleting a conversation asks first, and Undo restores it', async ({ page }
   await expect(page).toHaveURL(new RegExp(`[?&]c=${ONBOARDING}`));
 });
 
+test('a conversation deleted earlier can be restored from Recently deleted', async ({ page }) => {
+  const deletedAt = new Date(Date.now() - DAY).toISOString();
+  const state = await mockApi(page, { conversations: [{ ...triage(), deleted_at: deletedAt }, onboarding()] });
+  await page.goto('/app/r/cal.com');
+  await expect(page.getByText('Start with apps/web and packages/features.')).toBeVisible();
+
+  const rows = await historyRows(page);
+  await expect(rows).toHaveCount(1);
+  const history = page.getByRole('dialog', { name: 'Conversations' });
+  await history.getByRole('button', { name: 'Recently deleted' }).click();
+  const deleted = history.getByRole('list', { name: 'Recently deleted conversations' });
+  await expect(deleted.getByRole('listitem')).toHaveCount(1);
+  await expect(deleted).toContainText('Confirmation email timezone');
+  await expect(deleted).toContainText('Deleted yesterday');
+  await expect(deleted).toContainText('4 messages · 1 proposal');
+  expect(state.conversationRequests).toContain('GET /conversations/cal.com/threads?deleted=true&limit=20');
+
+  await deleted.getByRole('button', { name: 'Restore “Confirmation email timezone”' }).click();
+  await expect(page.getByRole('region', { name: 'Notifications' })).toContainText('Conversation restored');
+  await expect(history.getByText('Nothing deleted.', { exact: false })).toBeVisible();
+  expect(state.conversations.find((item) => item.id === TRIAGE).deleted_at).toBeNull();
+  // Back in the list, above the older conversation, and it opens with its messages.
+  const listed = history.getByRole('list', { name: 'Conversations' }).getByRole('listitem');
+  await expect(listed).toHaveCount(2);
+  await expect(listed.nth(0)).toContainText('Confirmation email timezone');
+  await listed.nth(0).getByRole('button', { name: /^Confirmation email timezone/ }).click();
+  await expect(page.getByText('Why are confirmation emails sent in the wrong timezone?')).toBeVisible();
+});
+
 test('a conversation can be renamed, and the repository reopens the one last open', async ({ page }) => {
   const state = await mockApi(page, { conversations: [triage(), onboarding()] });
   await page.goto('/app/r/cal.com');

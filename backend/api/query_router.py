@@ -768,6 +768,8 @@ def _conversation_payload(row: dict | None) -> dict | None:
     if not row or not row.get("id"):
         return None
     payload = {key: row.get(key) for key in ("id", "title", "created_at", "updated_at")}
+    if row.get("deleted_at"):
+        payload["deleted_at"] = row["deleted_at"]
     for key in ("message_count", "proposal_count"):
         if key in row:
             payload[key] = int(row.get(key) or 0)
@@ -1543,24 +1545,28 @@ async def list_conversations(
     repo_name: str,
     limit: int = Query(default=50, ge=1, le=200),
     before: str | None = Query(default=None, max_length=200),
+    deleted: bool = Query(default=False),
     current_user=Depends(get_current_user),
 ):
     """The user's saved conversations for one repository, most recently active first.
 
     Each has its title, dates, and message and proposal counts. `before` is
-    the `next_before` cursor of the previous page.
+    the `next_before` cursor of the previous page. `deleted=true` lists the
+    deleted ones instead, most recently deleted first, so they can be restored.
     """
     try:
         store, repo = await _repository_for(repo_name, current_user.id)
         await adopt_unthreaded_messages(store, repo["id"], current_user.id)
-        where, params = "c.repo_id = ? AND c.user_id = ? AND c.deleted_at IS NULL", [repo["id"], current_user.id]
+        order = "deleted_at" if deleted else "updated_at"
+        where = "c.repo_id = ? AND c.user_id = ? AND c.deleted_at " + ("IS NOT NULL" if deleted else "IS NULL")
+        params = [repo["id"], current_user.id]
         if before:
-            updated_at, _, last_id = before.partition("|")
-            where += " AND (c.updated_at < ? OR (c.updated_at = ? AND c.id < ?))"
-            params += [updated_at, updated_at, last_id]
+            value, _, last_id = before.partition("|")
+            where += f" AND (c.{order} < ? OR (c.{order} = ? AND c.id < ?))"
+            params += [value, value, last_id]
         rows = await store.fetch_all(
-            f"SELECT {_CONVERSATION_COLUMNS}, {_CONVERSATION_COUNTS} FROM conversations c "
-            f"WHERE {where} AND {_HAS_MESSAGES} ORDER BY c.updated_at DESC, c.id DESC LIMIT ?",
+            f"SELECT {_CONVERSATION_COLUMNS}, c.deleted_at, {_CONVERSATION_COUNTS} FROM conversations c "
+            f"WHERE {where} AND {_HAS_MESSAGES} ORDER BY c.{order} DESC, c.id DESC LIMIT ?",
             [*params, limit + 1],
         )
         has_more = len(rows) > limit
@@ -1568,7 +1574,7 @@ async def list_conversations(
         return {
             "conversations": page,
             "has_more": has_more,
-            "next_before": f"{page[-1]['updated_at']}|{page[-1]['id']}" if has_more and page else None,
+            "next_before": f"{page[-1][order]}|{page[-1]['id']}" if has_more and page else None,
         }
     except Exception as error:
         raise _conversation_http_error(error, "list conversations") from error

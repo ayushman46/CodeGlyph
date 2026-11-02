@@ -12,7 +12,7 @@ It is built for the first hours in an unfamiliar codebase: new engineers onboard
 - **Accurate retrieval.** File-level semantic search, keyword search with prefix matching and path weighting, path-aware ranking for component questions, the import graph for impact questions, and follow-up awareness for short questions like "where is it called?".
 - **Code editing and pull requests.** Describe a change or paste a GitHub issue URL. The agent plans the change across files (call sites, types, styles, tests, new files when needed), reads the current files from GitHub, writes exact search/replace hunks, validates every hunk against the real file, and shows the result inline in the chat. The review screen has unified and split diffs, in-place editing with a live diff, a prefilled pull request, `.patch` download, and one-click PR creation (a branch in the repository, or a fork when you lack write access). Nothing is pushed without your review.
 - **Exploration tools.** Repository overview (languages, folder map, key files, suggested questions), instant code search, and change-impact analysis.
-- **Saved conversations.** Each repository keeps several conversations. New chat starts a fresh one without deleting anything; History lists them with titles, dates and message and proposal counts, and reopens any of them with its proposals. Follow-ups use only the open conversation. Deleting asks first and can be undone. Conversations are private to the user who asked.
+- **Saved conversations.** Each repository keeps several conversations. New chat starts a fresh one without deleting anything; History lists them with titles, dates and message and proposal counts, and reopens any of them with its proposals. Follow-ups use only the open conversation. Deleting asks first, can be undone, and a deleted conversation can be restored later from Recently deleted. Conversations are private to the user who asked.
 - Light and dark themes, a command palette (`⌘K` / `Ctrl+K`), keyboard-first chat, and a responsive layout down to phone width.
 
 ## Architecture
@@ -172,7 +172,7 @@ All routes require a Supabase bearer token except health/readiness and the GitHu
 | POST | `/api/query` | Grounded answer (JSON) |
 | POST | `/api/query/stream` | Grounded answer as server-sent events (`stage`, `citations`, `token`, `done`, `error`) |
 | GET | `/api/conversations/{repo}?conversation_id=&limit=&before=` | One conversation's messages, newest page first (the latest conversation without an id). Questions continue one with `conversation_id`, or start one with `new_conversation: true`; `done` returns it |
-| GET | `/api/conversations/{repo}/threads` | Saved conversations: title, dates, message and proposal counts |
+| GET | `/api/conversations/{repo}/threads` | Saved conversations: title, dates, message and proposal counts (`deleted=true`: the deleted ones, to restore) |
 | PATCH / DELETE | `/api/conversations/{repo}/threads/{id}` | Rename / delete (hidden, not erased) |
 | POST | `/api/conversations/{repo}/threads/{id}/restore` | Undo a delete |
 | DELETE | `/api/conversations/{repo}` | New chat for older clients: hides and erases nothing; the next question sent without `conversation_id` starts a new conversation |

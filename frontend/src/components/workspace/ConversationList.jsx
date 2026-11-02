@@ -1,6 +1,6 @@
-import { History, MessageSquareText, Pencil, SquarePen, Trash2 } from 'lucide-react';
+import { ChevronDown, History, MessageSquareText, Pencil, RotateCcw, SquarePen, Trash2 } from 'lucide-react';
 import { useEffect, useId, useRef, useState } from 'react';
-import { errorMessage } from '../../api/client';
+import { errorMessage, listConversations } from '../../api/client';
 import { cleanTitle, conversationDate, conversationSummary, titleProblem } from '../../lib/conversations';
 import useStore from '../../store/useStore';
 import Button from '../ui/Button';
@@ -73,11 +73,107 @@ const RenameRow = ({ item, onDone }) => {
   );
 };
 
+/** How many deleted conversations "Recently deleted" shows. */
+const DELETED_LIMIT = 20;
+
+/**
+ * "Recently deleted" at the foot of the list: deleted conversations, newest
+ * deletion first, each with Restore. Undo in the toast lasts seconds; this
+ * keeps a deleted conversation recoverable afterwards.
+ */
+const DeletedConversations = ({ repoName }) => {
+  const restoreConversation = useStore((state) => state.restoreConversation);
+  const [expanded, setExpanded] = useState(false);
+  const [state, setState] = useState({ items: [], loading: false, error: '', loaded: false });
+  const [restoring, setRestoring] = useState(null);
+  const listId = useId();
+
+  const load = async () => {
+    setState((current) => ({ ...current, loading: true, error: '' }));
+    try {
+      const response = await listConversations(repoName, { params: { deleted: true, limit: DELETED_LIMIT } });
+      setState({ items: response.data.conversations || [], loading: false, error: '', loaded: true });
+    } catch (error) {
+      setState((current) => ({ ...current, loading: false, error: errorMessage(error, 'Deleted conversations could not be loaded.') }));
+    }
+  };
+
+  const toggle = () => {
+    setExpanded(!expanded);
+    if (!expanded) void load();
+  };
+
+  const restore = async (item) => {
+    setRestoring(item.id);
+    try {
+      await restoreConversation(item.id, { repoName });
+      setState((current) => ({ ...current, items: current.items.filter((entry) => entry.id !== item.id) }));
+      toast.success('Conversation restored', { description: item.title });
+    } catch (error) {
+      toast.error('Could not restore the conversation', { description: errorMessage(error, 'Please try again.') });
+    } finally {
+      setRestoring(null);
+    }
+  };
+
+  return (
+    <div className="border-t border-line p-1">
+      <button
+        type="button"
+        onClick={toggle}
+        aria-expanded={expanded}
+        aria-controls={listId}
+        className="flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] font-medium text-ink-3 transition-colors hover:bg-surface-2 hover:text-ink-2"
+      >
+        Recently deleted
+        <ChevronDown className={`size-3.5 transition-transform ${expanded ? 'rotate-180' : ''}`} aria-hidden="true" />
+      </button>
+      {expanded && (
+        <div id={listId}>
+          {state.loading && !state.loaded && <p className="m-0 px-2.5 py-2 text-[12px] text-ink-3" role="status">Loading…</p>}
+          {state.error && <p className="m-0 px-2.5 py-2 text-[12px] text-danger" role="alert">{state.error}</p>}
+          {state.loaded && !state.items.length && !state.error && (
+            <p className="m-0 px-2.5 py-2 text-[12px] leading-relaxed text-ink-3">Nothing deleted. Conversations you delete stay here so you can restore them.</p>
+          )}
+          {state.items.length > 0 && (
+            <ul className="m-0 flex list-none flex-col gap-0.5 p-0" aria-label="Recently deleted conversations">
+              {state.items.map((item) => (
+                <li key={item.id} className="flex items-center gap-2 rounded-lg px-2.5 py-1.5">
+                  <span className="flex min-w-0 flex-1 flex-col">
+                    <span className="truncate text-[12.5px] text-ink-2">{item.title || 'Untitled conversation'}</span>
+                    <span className="text-[11.5px] leading-4 text-ink-3">
+                      Deleted <time dateTime={item.deleted_at} title={fullDate(item.deleted_at)}>{conversationDate(item.deleted_at).replace(/^(Today|Yesterday)/, (word) => word.toLowerCase())}</time>
+                      {' · '}
+                      {conversationSummary(item)}
+                    </span>
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="xs"
+                    icon={RotateCcw}
+                    loading={restoring === item.id}
+                    disabled={Boolean(restoring) && restoring !== item.id}
+                    aria-label={`Restore “${item.title}”`}
+                    onClick={() => restore(item)}
+                  >
+                    Restore
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 /**
  * The selected repository's saved conversations: a "History" button in the
  * chat header that opens the list (title, last activity, message and
  * proposal counts). Choosing one opens it; each can be renamed or deleted.
- * Deleting asks first and offers Undo, because nothing is erased.
+ * Deleting asks first and offers Undo, because nothing is erased; deleted
+ * ones can also be restored later from "Recently deleted".
  */
 const ConversationList = ({ repoName, onNewChat, onOpen }) => {
   const list = useStore((state) => state.conversationList);
@@ -259,6 +355,7 @@ const ConversationList = ({ repoName, onNewChat, onOpen }) => {
               </div>
             )}
           </div>
+          <DeletedConversations key={repoName} repoName={repoName} />
         </PopoverPopup>
       </Popover>
 
@@ -280,7 +377,7 @@ const ConversationList = ({ repoName, onNewChat, onOpen }) => {
           <p className="m-0">
             It leaves your history{deletingSummary ? `, with its ${deletingSummary}` : ''}. Your other conversations are not affected.
           </p>
-          <p className="m-0 text-ink-3">You can undo this from the notification that appears next.</p>
+          <p className="m-0 text-ink-3">You can undo this from the notification that appears next, or restore it later from Recently deleted in History.</p>
           {deleteError && <p className="m-0 text-danger" role="alert">{deleteError}</p>}
         </div>
       </Modal>

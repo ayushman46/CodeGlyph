@@ -282,6 +282,35 @@ class ConversationApiTests(EndpointTestCase):
         self.assertEqual([item["id"] for item in self.threads()["conversations"]], [newer["id"], older["id"]])
         self.assertEqual(self.client.get(f"/api/conversations/{REPO_NAME}").json()["conversation"]["id"], newer["id"])
 
+    def test_deleted_conversations_are_listed_for_restoring_after_undo_is_gone(self):
+        older = self.done(self.ask("How does login work?", new=True)[0])["conversation"]
+        newer = self.done(self.ask("How does logout work?", new=True)[0])["conversation"]
+        kept = self.done(self.ask("How does signup work?", new=True)[0])["conversation"]
+        url = f"/api/conversations/{REPO_NAME}/threads"
+        self.assertEqual(self.client.get(url, params={"deleted": "true"}).json()["conversations"], [])
+        self.client.delete(f"{url}/{newer['id']}")
+        self.client.delete(f"{url}/{older['id']}")
+        # An empty conversation (a new chat nobody asked in) is never listed.
+        self.client.delete(f"/api/conversations/{REPO_NAME}")
+
+        first = self.client.get(url, params={"deleted": "true", "limit": 1}).json()
+        self.assertEqual([item["id"] for item in first["conversations"]], [older["id"]])
+        self.assertEqual(first["conversations"][0]["message_count"], 2)
+        self.assertTrue(first["conversations"][0]["deleted_at"])
+        self.assertTrue(first["has_more"])
+        rest = self.client.get(url, params={"deleted": "true", "limit": 1, "before": first["next_before"]}).json()
+        self.assertEqual([item["id"] for item in rest["conversations"]], [newer["id"]])
+        self.assertFalse(rest["has_more"])
+        # Other users never see them.
+        self.current_user = SimpleNamespace(id="someone-else")
+        self.assertEqual(self.client.get(url, params={"deleted": "true"}).status_code, 404)
+        self.current_user = SimpleNamespace(id=USER)
+
+        self.client.post(f"{url}/{older['id']}/restore")
+        self.assertEqual([item["id"] for item in self.client.get(url, params={"deleted": "true"}).json()["conversations"]], [newer["id"]])
+        self.assertEqual([item["id"] for item in self.threads()["conversations"]], [kept["id"], older["id"]])
+        self.assertNotIn("deleted_at", self.threads()["conversations"][0])
+
     def test_rename_trims_the_title_and_rejects_empty_or_long_ones(self):
         conversation = self.done(self.ask(ISSUE_QUESTION, new=True)[0])["conversation"]
         url = f"/api/conversations/{REPO_NAME}/threads/{conversation['id']}"
@@ -304,8 +333,13 @@ class ConversationApiTests(EndpointTestCase):
         self.assertEqual(self.client.delete(url).status_code, 404)
         self.assertEqual(self.client.post(f"{url}/restore").status_code, 404)
         self.assertEqual(self.client.get(f"/api/conversations/{REPO_NAME}/threads").json()["conversations"], [])
+        self.current_user = SimpleNamespace(id=USER)
+        self.client.delete(url)
+        self.current_user = SimpleNamespace(id=OTHER)
+        self.assertEqual(self.client.get(f"/api/conversations/{REPO_NAME}/threads", params={"deleted": "true"}).json()["conversations"], [])
         self.assertEqual(self.client.get(f"/api/conversations/{REPO_NAME}").json()["conversation"], None)
         self.current_user = SimpleNamespace(id=USER)
+        self.client.post(f"{url}/restore")
         self.assertEqual(self.threads()["conversations"][0]["title"], "How does login work?")
 
     def test_history_pages_stay_inside_one_conversation(self):
@@ -447,6 +481,7 @@ class ConversationApiTests(EndpointTestCase):
 
         with patch.object(self.store, "fetch_all", recording_all), patch.object(self.store, "fetch_one", recording_one):
             self.threads()
+            self.client.get(f"/api/conversations/{REPO_NAME}/threads", params={"deleted": "true"})
             url = f"/api/conversations/{REPO_NAME}"
             page = self.client.get(url, params={"conversation_id": first["id"], "limit": 2}).json()
             self.client.get(url, params={"conversation_id": first["id"], "limit": 2, "before": page["next_before"]})
@@ -456,13 +491,17 @@ class ConversationApiTests(EndpointTestCase):
         kinds = {
             "history list": "AS message_count", "page": "SELECT id, role, content", "follow-up history": "SELECT role, content, citations",
             "unthreaded check": "conversation_id IS NULL", "latest": "ORDER BY c.updated_at DESC, c.id DESC LIMIT 1",
+            "recently deleted": "deleted_at IS NOT NULL",
         }
         seen = set()
         for sql, args in {(sql, tuple(args)) for sql, args in recorded if "chat_messages" in sql}:
             plan = [row["detail"] for row in run(fetch_all(f"EXPLAIN QUERY PLAN {sql}", list(args)))]
             with self.subTest(sql=sql[:100], plan=plan):
                 self.assertFalse([line for line in plan if "chat_messages_by_repo_user" in line or line.startswith("SCAN")])
-                self.assertFalse([line for line in plan if "TEMP B-TREE" in line])
+                # Recently deleted orders by deleted_at, then id: SQLite sorts
+                # only the ties on deleted_at, among one user's deleted ones.
+                allowed = {"USE TEMP B-TREE FOR RIGHT PART OF ORDER BY"} if "deleted_at IS NOT NULL" in sql else set()
+                self.assertFalse([line for line in plan if "TEMP B-TREE" in line and line not in allowed])
                 self.assertTrue([line for line in plan if "INDEX chat_messages_by_conversation (repo_id=? AND user_id=? AND conversation_id=?)" in line])
                 if "AS message_count" in sql:
                     # The count and the has-messages check never read a message row.

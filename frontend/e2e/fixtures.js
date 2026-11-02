@@ -191,6 +191,7 @@ const conversationRow = (item) => ({
   id: item.id, title: item.title, created_at: item.created_at, updated_at: item.updated_at,
   message_count: item.messages.length,
   proposal_count: item.messages.filter((message) => message.tool_calls?.some((call) => call.tool === 'code_edit')).length,
+  ...(item.deleted_at ? { deleted_at: item.deleted_at } : {}),
 });
 
 /** The /conversations endpoints of one repository, in memory (see backend/api/query_router.py). */
@@ -215,6 +216,11 @@ const conversationRoutes = (state, route, path, method, url) => {
       messages: conversation.messages, has_more: false, next_before: null,
       conversation: { id: conversation.id, title: conversation.title, created_at: conversation.created_at, updated_at: conversation.updated_at },
     });
+  }
+  if (isThreads && !id && method === 'GET' && url.searchParams.get('deleted') === 'true') {
+    const deleted = state.conversations.filter((item) => item.deleted_at)
+      .sort((a, b) => b.deleted_at.localeCompare(a.deleted_at) || b.id.localeCompare(a.id));
+    return json(route, { conversations: deleted.map(conversationRow), has_more: false, next_before: null });
   }
   if (isThreads && !id && method === 'GET') return json(route, { conversations: active().map(conversationRow), has_more: false, next_before: null });
   const conversation = id ? find(id) : null;
