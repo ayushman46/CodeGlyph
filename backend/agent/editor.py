@@ -88,6 +88,7 @@ from agent.quality import (
     is_test_path,
     js_imports,
     public_profile,
+    quotes_source,
     reproduction_cases,
     style_profile,
     style_warnings,
@@ -3041,6 +3042,12 @@ Rules:
         closes_issue = bool(issue_link) and (self.issue_confirmed or bool(_CLOSING_INTENT.search(self._issue_source())))
         draft_title = str(payload.get("title") or "").strip()
         edit_paths = [item["file_path"] for item in files]
+        changed_before = set(edit_paths)
+        # A block the issue quotes from the repository's own files is the
+        # code under discussion, not a way to reproduce the problem.
+        sources = [item["before"] for item in files if isinstance(item.get("before"), str)] + [
+            loaded[path].content for path in loaded if path not in changed_before and path not in self.revision_starts]
+        cases = [case for case in cases if not quotes_source(case["code"], sources)]
         review = await self._self_review(request_text, files, checks, completeness, draft_title, renames, cases=cases)
         checks = review["checks"]
         if review.get("completeness") is not None:
@@ -3203,10 +3210,13 @@ Rules:
             if covered:
                 continue
             code = case["code"]
+            reported = f" (the issue reports: {case['note']})" if case.get("note") else ""
             if "\n" in code:
-                code = " ".join(line.strip() for line in code.split("\n") if line.strip())
-            final.append(f"Check the case from {issue_link or 'the issue'}: {_code_span(code)}"
-                         + (f" (the issue reports: {case['note']})" if case.get("note") else ""))
+                # Several lines (a loop, a with block, a script) stay a block.
+                fence = "~~~" if "```" in code else "```"
+                final.append(f"Check the case from {issue_link or 'the issue'}{reported}:\n{fence}\n{code}\n{fence}")
+            else:
+                final.append(f"Check the case from {issue_link or 'the issue'}: {_code_span(code)}{reported}")
         return {
             "tests_run": False, "command": command, "suite_command": suite,
             "command_source": str(self.conventions.get("test_command_source") or ""),
@@ -3441,7 +3451,8 @@ def format_proposal_markdown(proposal: dict) -> str:
         )])
     if proposal.get("validation"):
         lines.extend(["", "## How to verify"])
-        lines.extend(f"- {step}" for step in proposal["validation"])
+        # A step with a code block keeps it inside its list item.
+        lines.extend("- " + str(step).replace("\n", "\n  ") for step in proposal["validation"])
     if proposal.get("incomplete"):
         lines.extend(["", "**This change may be incomplete:** some planned files were not changed (see above). "
                       "Review them before opening a pull request."])

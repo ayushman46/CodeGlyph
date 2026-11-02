@@ -20,8 +20,8 @@ import test_answers_and_editing as base
 from agent import conventions as repo_conventions
 from agent.code_edit import apply_hunks, git_blob_sha
 from agent.conventions import clear_conventions_cache
-from agent.editor import EditRequest, format_proposal_markdown, run_code_edit, wants_revision
-from agent.quality import case_covered, reproduction_cases
+from agent.editor import EditRequest, format_proposal_markdown, previous_proposal_for, run_code_edit, wants_revision
+from agent.quality import case_covered, quotes_source, reproduction_cases
 from agent.review import NO_PROBLEMS_FOUND, build_review_messages
 from api.query_router import get_conversation_history, persist_proposal, save_message
 from api.repository_state import fetch_owned_repository
@@ -187,6 +187,71 @@ class ReproductionCaseTests(unittest.TestCase):
         mention = ("`tests/test_basic.py::test_werkzeug_passthrough_errors` mocks `werkzeug.serving.run_simple` and stores "
                    "`kwargs.get(\"passthrough_errors\")` in `rv`, but nothing reads `rv` afterwards.")
         self.assertEqual(reproduction_cases(mention), [])
+
+    def test_compound_statements_stay_whole_with_their_indentation(self):
+        loop = ('```python\nimport requests\n\nfor key in [1, 2]:\n'
+                '    requests.Request("POST", "http://x", files={key: b"x"}).prepare()\n```')
+        self.assertEqual(reproduction_cases(loop), [{
+            "code": 'for key in [1, 2]:\n    requests.Request("POST", "http://x", files={key: b"x"}).prepare()', "note": ""}])
+        block = '```python\nwith httpx.Client() as client:\n    client.get("http://localhost:1")  # hangs\n```'
+        self.assertEqual(reproduction_cases(block), [{
+            "code": 'with httpx.Client() as client:\n    client.get("http://localhost:1")', "note": "hangs"}])
+        branches = '```python\ntry:\n    requests.get("http://x", timeout=-1)\nexcept ValueError as error:\n    print(error)  # prints nothing\n```'
+        self.assertEqual(reproduction_cases(branches)[0]["code"],
+                         'try:\n    requests.get("http://x", timeout=-1)\nexcept ValueError as error:\n    print(error)')
+        # A class (or a decorated view) and the code that uses it are one script.
+        self.assertEqual([case["code"] for case in reproduction_cases("```python\nclass Foo:\n    pass\n\nFoo() == 1\n```")],
+                         ["class Foo:\n    pass\nFoo() == 1"])
+        app = ('```python\nimport flask\napp = flask.Flask(__name__)\n@app.route("/")\ndef index():\n    return None\n'
+               'app.test_client().get("/")  # TypeError\n```')
+        self.assertEqual(reproduction_cases(app), [{
+            "code": 'app = flask.Flask(__name__)\n@app.route("/")\ndef index():\n    return None\napp.test_client().get("/")',
+            "note": "TypeError"}])
+        # Bracketed lines are one statement; independent calls stay separate cases.
+        calls = '```python\nrequests.post(\n    "http://x",\n    files={1: b"x"},\n)  # fails\nrequests.post("http://x", files={"1": b"x"})  # works\n```'
+        self.assertEqual([(case["code"], case["note"]) for case in reproduction_cases(calls)],
+                         [('requests.post(\n    "http://x",\n    files={1: b"x"},\n)', "fails"),
+                          ('requests.post("http://x", files={"1": b"x"})', "works")])
+        # A block inside a list item keeps its own indentation only.
+        listed = '1. Run:\n   ```python\n   requests.get("http://x", params={1: 2})  # fails\n   ```'
+        self.assertEqual(reproduction_cases(listed), [{"code": 'requests.get("http://x", params={1: 2})', "note": "fails"}])
+
+    def test_a_multi_line_string_is_kept_as_written(self):
+        # Its lines (blank or unindented) are text, not statements; brackets
+        # and comments after it still count.
+        body = ('```python\nimport requests\nrequests.post("http://x", data="""\na=1\n\n(b\n""")  # 400\n'
+                'requests.get("http://x")  # works\n```')
+        self.assertEqual([(case["code"], case["note"]) for case in reproduction_cases(body)],
+                         [('requests.post("http://x", data="""\na=1\n\n(b\n""")', "400"),
+                          ('requests.get("http://x")', "works")])
+        script = '```python\ndata = """\nline1\n"""\nrequests.post("http://x", data=data)  # 400\n```'
+        self.assertEqual(reproduction_cases(script), [{
+            "code": 'data = """\nline1\n"""\nrequests.post("http://x", data=data)', "note": "400"}])
+
+    def test_quoted_source_is_not_a_case(self):
+        # Copied from inside a function (indented), a return outside any def,
+        # only definitions, or a block cut off after its header.
+        for block in ("        for k, v in files.items():\n            # support for explicit filename\n            ft = None",
+                      "if not body:\n    return None\nreturn body.decode()",
+                      "def _encode_files(files, data):\n    return []",
+                      "self.headers = {}\nself.body = None",
+                      "for k, v in files.items():\n    if isinstance(v, (tuple, list)):"):
+            self.assertEqual(reproduction_cases(f"```python\n{block}\n```"), [], block)
+        # Dedented lines of the repository's own file are found there.
+        excerpt = "for k, v in files.items():\n    fn = guess_filename(v) or k\n    rf = RequestField(name=k, data=v, filename=fn)"
+        self.assertTrue(quotes_source(excerpt, [MODELS]))
+        self.assertFalse(quotes_source(CASES[2][0], [MODELS]))
+        self.assertFalse(quotes_source("fp = v", [MODELS]))  # too short to tell
+
+    def test_a_block_introduced_as_the_repositorys_code_is_not_a_case_unless_it_is_to_be_run(self):
+        call = 'rf = RequestField(name=k, data=fdata, filename=fn, headers=fh)'
+        for lead in ("The code at [models.py#L245](https://github.com/psf/requests/blob/main/src/requests/models.py#L245) "
+                     "has the problem:", "The function in src/requests/models.py does this:"):
+            self.assertEqual(reproduction_cases(f"{lead}\n\n```python\n{call}\n```"), [], lead)
+        # "Save this code in app.py and run it" introduces the reproduction itself.
+        app = 'import flask\napp = flask.Flask(__name__)\n\n@app.route("/")\ndef index():\n    return None'
+        self.assertEqual([case["code"] for case in reproduction_cases(f"Save this code in app.py and run it:\n\n```python\n{app}\n```")],
+                         ['app = flask.Flask(__name__)\n@app.route("/")\ndef index():\n    return None'])
 
     def test_a_step_that_already_runs_a_case_covers_it(self):
         step = "python -c \"import requests; requests.Request('POST', 'http://x', files={1: b'x'}).prepare(); print('ok')\""
@@ -425,6 +490,30 @@ class VerificationTests(EditHonestyCase):
         self.assertEqual(result.proposal["verification"]["command"], "python -m pytest tests")
         self.assertEqual(result.proposal["validation"][0], "python -m pytest tests -k multipart")
         self.assertEqual(len(result.proposal["validation"]), 1 + len(CASES))
+
+    def test_a_loop_case_stays_a_code_block_and_quoted_source_is_left_out(self):
+        loop = 'for key in [1, 2]:\n    requests.Request("POST", "http://x", files={key: b"x"}).prepare()'
+        body = ("The filename fallback is the raw key. The code in models.py:\n\n```python\nfor k, v in files.items():\n"
+                "    fn = guess_filename(v) or k\n    rf = RequestField(name=k, data=v, filename=fn)\n```\n\n"
+                f"Reproduce:\n\n```python\nimport requests\n\n{loop}  # AttributeError\n```\n")
+        issue = {**ISSUE, "body": body}
+        responses = [plan("src/requests/models.py"),
+                     edit([{"file_path": "src/requests/models.py", "action": "modify", "changes": [NAME_FIX, FILE_NAME_FIX, FALLBACK_FIX]}]),
+                     review_ok()]
+        result = self.edit("Fix https://github.com/psf/requests/issues/7634", responses, issue=issue, review=True)
+        proposal = result.proposal
+        # Only the reproduction is a case; the lines quoted from models.py are not.
+        self.assertEqual(proposal["verification"]["cases"], [{"code": loop, "note": "AttributeError", "covered": False}])
+        # How to verify keeps the loop runnable: a code block, not one joined line.
+        step = f"Check the case from #7634 (the issue reports: AttributeError):\n```\n{loop}\n```"
+        self.assertIn(step, proposal["validation"])
+        indented = step.replace("\n", "\n  ")
+        self.assertIn(f"- {indented}", result.markdown)
+        self.assertIn(f"- {indented}", proposal["pr_body"])
+        review_prompt = result.model.calls[-1]["messages"][1]["content"]
+        cases_part = review_prompt.split("Reproduction cases quoted in the issue")[1].split("\n\n")[0]
+        self.assertIn("- this script  (reported: AttributeError):\n    for key in [1, 2]:\n        requests.Request(", cases_part)
+        self.assertNotIn("guess_filename", cases_part)
 
     def test_a_small_change_is_still_reviewed_when_the_issue_quotes_cases(self):
         responses = [plan("src/requests/models.py"),

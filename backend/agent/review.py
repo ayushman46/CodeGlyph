@@ -128,6 +128,15 @@ def _changed_lines(before: str, after: str) -> list[int]:
     return sorted(index + 1 for index in added_line_indices(before or "", after or ""))[:200] or [1]
 
 
+def _case_line(case: dict) -> str:
+    """One reproduction case for the prompt; a multi-line case (a loop, a script) keeps its lines, indented."""
+    code = str(case.get("code") or "")
+    reported = f"  (reported: {case['note']})" if case.get("note") else ""
+    if "\n" not in code:
+        return f"- {code}{reported}"
+    return f"- this script{reported}:\n" + "\n".join(f"    {line}" for line in code.split("\n"))
+
+
 def build_review_messages(*, request_text: str, conventions_text: str, findings: list[str], files: list[dict],
                           related: list[dict], title: str = "", template: str = "", conventional: bool = False,
                           cases: list[dict] | None = None) -> list[dict]:
@@ -177,8 +186,7 @@ def build_review_messages(*, request_text: str, conventions_text: str, findings:
         head += ("Reproduction cases quoted in the issue. Nothing was run: trace EACH case through the PROPOSED CONTENT "
                  "step by step (every argument it passes, including fallbacks such as default names) and add one "
                  "verification line per case saying what it does after the change:\n"
-                 + "\n".join(f"- {case['code']}" + (f"  (reported: {case['note']})" if case.get("note") else "")
-                             for case in cases[:12]) + "\n\n")
+                 + "\n".join(_case_line(case) for case in cases[:12]) + "\n\n")
     # Changed files get the budget first; related source is shown before
     # them (read the source, then judge the change) when it still fits.
     used = len(REVIEW_SYSTEM) + len(head)

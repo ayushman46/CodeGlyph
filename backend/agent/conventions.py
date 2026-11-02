@@ -702,8 +702,9 @@ def _section_kind(heading: str) -> str:
 
 
 def _bullets(items: list[str], *, boxes: bool = False) -> str:
+    """A Markdown list; an item's further lines (a code block) are indented to stay inside it."""
     prefix = "- [ ] " if boxes else "- "
-    return "\n".join(f"{prefix}{item}" for item in items if str(item).strip())
+    return "\n".join(f"{prefix}{str(item).rstrip()}".replace("\n", "\n  ") for item in items if str(item).strip())
 
 
 def change_lines(files: list[dict]) -> list[str]:

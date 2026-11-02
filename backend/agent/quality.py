@@ -26,11 +26,13 @@ import difflib
 import importlib
 import json
 import logging
+import math
 import os
 import platform
 import posixpath
 import re
 import subprocess
+import textwrap
 import threading
 import tomllib
 import weakref
@@ -1659,7 +1661,7 @@ def fts_phrase(text: str) -> str:
 # G8: verification (nothing is run here; the cases to check by hand)
 # ===========================================================================
 
-_FENCE_OPEN = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})[ \t]*([^\s`]*)[^\n]*$")
+_FENCE_OPEN = re.compile(r"^([ \t]{0,3})(`{3,}|~{3,})[ \t]*([^\s`]*)[^\n]*$")
 # Fenced blocks in these languages are data or output, never a case to run.
 _DATA_LANGUAGES = frozenset({
     "json", "jsonc", "json5", "yaml", "yml", "toml", "ini", "cfg", "conf", "text", "txt", "plain", "plaintext", "log",
@@ -1668,13 +1670,40 @@ _DATA_LANGUAGES = frozenset({
 _SHELL_LANGUAGES = frozenset({"sh", "bash", "shell", "zsh", "console", "shell-session", "shellsession", "terminal"})
 _OUTPUT_LINE = re.compile(
     r"^\s*(?:Traceback \(most recent call last\)|File \"|During handling of|The above exception|"
-    r"[A-Za-z_][\w.]*(?:Error|Exception|Warning)\b\s*(?::|$)|at \S+ \(|\^+\s*$|~+\s*$)"
+    r"[A-Za-z_][\w.]*(?:Error|Exception|Warning)\b\s*(?::|$)|at \S+ \(|\^+\s*$|~+\s*$|"
+    r"(?:Expected|Actual|Output|Result)\b[^:=(\n]{0,40}:\s|"
+    # logging's default format and http.client's debug lines
+    r"(?:DEBUG|INFO|WARNING|ERROR|CRITICAL):[\w.]*:|(?:send|reply|header):\s|"
+    # printed "Label Words: value" and HTTP header lines ("Content-Disposition: ...")
+    r"[A-Z][a-z]+(?: [A-Z]?[a-z]+){1,3}:\s|[A-Z][a-z]*(?:-[A-Z][a-z]*)+:\s|"
+    # a sentence: five or more plain words, no code punctuation
+    r"[A-Z][a-z']*(?:[ ,]+[A-Za-z'’-]+){4,}[.:!?]?(?:\s+[A-Z][\w ,'’-]*[.:!?]?)*\s*$)"
 )
 _SETUP_LINE = re.compile(
     r"^\s*(?:import\s|from\s+\S+\s+import\s|(?:const|let|var)\s+[\w{}\s,]+=\s*(?:await\s+)?(?:require|import)\(|"
     r"require\(|package\s+\w|using\s|#include\b|use\s+[\w:]+;|"
-    r"(?:\$\s*)?(?:pip3?|python3?\s+-m\s+pip|npm|yarn|pnpm|bun|poetry|uv|cargo|go)\s+(?:install|add|i|get|sync)\b)"
+    r"(?:\$\s*)?(?:pip3?|python3?\s+-m\s+pip|npm|yarn|pnpm|bun|poetry|uv|cargo|go)\s+(?:install|add|i|get|sync)\b|"
+    # Version and environment reports ("python -m requests.help", "pip freeze").
+    r"(?:\$\s*)?(?:python3?\s+(?:-m\s+[\w.]+\.help\b|--version|-V\b)|pip3?\s+(?:freeze|list|show)\b|"
+    r"(?:node|npm)\s+(?:-v|--version)\b))"
 )
+# A shell prompt: "$ cmd", "user@host:~/dir$ cmd".
+_SHELL_PROMPT = re.compile(r"^\s*(?:[\w.-]+(?:@[\w.-]+)?:[^\s$]*)?\$\s+(?=\S)")
+# A paragraph that introduces the repository's own code ("The code at
+# [src/requests/cookies.py#L349-L356](https://github.com/.../blob/...) has
+# the following problem:"): the block after it is quoted source.
+_SOURCE_LEAD = re.compile(
+    r"github\.com/[\w.-]+/[\w.-]+/blob/|\b[\w./-]+\.[A-Za-z]{1,5}#L\d+"
+    r"|\b(?:the\s+)?(?:code|snippet|source|implementation|function|method)\s+(?:at|in|from)\s+`?[\w./-]+\.[A-Za-z]{1,5}\b",
+    re.IGNORECASE,
+)
+# ... unless it asks to run or reproduce the block ("Save this code in app.py
+# and run it:"), which makes the block a reproduction.
+_REPRO_LEAD = re.compile(r"\b(?:repro\w*|mre|save|put|paste|create|write|run|running|execute|steps)\b", re.IGNORECASE)
+# A unified diff (a patch the issue suggests), never a case.
+_DIFF_LINE = re.compile(r"^(?:diff --git |@@ -\d+(?:,\d+)? \+\d+|--- a/|\+\+\+ b/)", re.MULTILINE)
+# A statement with none of these is a sentence or plain output, not code.
+_CODE_CHARACTER = re.compile(r"[()=\[\]{}.;:$<>/'\"`]")
 _COMMENT_LINE = re.compile(r"^\s*(?:#(?!!)|//|/\*|\*/|--\s|;;)")
 _ASSIGNED_NAME = re.compile(r"^\s*(?:(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=(?!=)")
 _INLINE_CALL = re.compile(r"^[A-Za-z_$][\w$.]*\(.*\)(?:\.[A-Za-z_$][\w$]*\(.*\))*;?$")
@@ -1684,7 +1713,18 @@ _OUTCOME_WORDS = re.compile(
     re.IGNORECASE,
 )
 REPRODUCTION_CASE_LIMIT = 12
-_CASE_CHARACTERS = 300
+# A case longer than this is cut at a line boundary (never inside a line of code).
+_CASE_CHARACTERS = 1_500
+_PYTHON_LANGUAGES = frozenset({"python", "py", "python3", "pycon", "ipython"})
+# A top-level line that continues the statement above it: Python's else/elif/
+# except/finally, or a chained call on its own line (".then(...)").
+_CONTINUES = re.compile(r"^(?:(?:elif|else|except|finally)\b|\.[A-Za-z_$])")
+_DEFINITION = re.compile(r"^(?:@|(?:export\s+)?(?:async\s+)?(?:def|class|function)\b)")
+_DEFINED_NAME = re.compile(
+    r"^(?:export\s+)?(?:async\s+)?(?:def|class|function\s*\*?)\s*([A-Za-z_$][\w$]*)"
+    r"|^(?:async\s+)?for\s+\(?([\w$\s,]+?)\)?\s+in\b"
+    r"|^(?:async\s+)?with\b.*?\bas\s+([A-Za-z_]\w*)"
+)
 
 
 def _code_scan(line: str, *, slashes: bool = True) -> tuple[int, int | None]:
@@ -1714,28 +1754,78 @@ def _code_scan(line: str, *, slashes: bool = True) -> tuple[int, int | None]:
     return depth, None
 
 
-def _fenced_blocks(text: str) -> list[tuple[str, str]]:
-    """(language, code) for every fenced block of Markdown text."""
-    blocks: list[tuple[str, str]] = []
+def _fenced_blocks(text: str) -> list[tuple[str, str, str]]:
+    """(language, code, lead) for every fenced block of Markdown text, without the fence's own indentation.
+
+    ``lead`` is the paragraph just before the block ("The code at
+    cookies.py#L349 has the following problem:").
+    """
+    blocks: list[tuple[str, str, str]] = []
     lines = str(text or "").replace("\r\n", "\n").split("\n")
     index = 0
+    prose: list[str] = []
     while index < len(lines):
         opened = _FENCE_OPEN.match(lines[index])
         index += 1
         if not opened:
+            # The last paragraph so far (blank lines before the fence keep it).
+            line = lines[index - 1]
+            if line.strip():
+                prose = [*prose, line] if index - 2 >= 0 and lines[index - 2].strip() and prose else [line]
             continue
-        fence, language = opened.group(1), opened.group(2).lower()
+        lead = " ".join(prose)[-600:]
+        prose = []
+        margin, fence, language = len(opened.group(1)), opened.group(2), opened.group(3).lower()
         body: list[str] = []
         while index < len(lines) and not lines[index].strip().startswith(fence):
-            body.append(lines[index])
+            line = lines[index]
+            body.append(line[min(margin, len(line) - len(line.lstrip(" "))):])
             index += 1
         index += 1
-        blocks.append((language, "\n".join(body)))
+        blocks.append((language, "\n".join(body), lead))
     return blocks
 
 
+def _outside_triple_quotes(line: str, open_quote: str = "") -> tuple[str, str]:
+    """(``line`` with its triple-quoted text replaced by ``""``, the triple quote still open after it, or "").
+
+    ``open_quote`` is the triple quote (``\"\"\"`` or ``'''``) already open
+    before the line, as in the middle lines of a multi-line string.
+    """
+    kept: list[str] = []
+    index = 0
+    while True:
+        if open_quote:
+            end = line.find(open_quote, index)
+            if end < 0:
+                return "".join(kept), open_quote
+            kept.append('""')
+            index, open_quote = end + 3, ""
+            continue
+        starts = [(at, quote) for quote in ('"""', "'''") if (at := line.find(quote, index)) >= 0]
+        if not starts:
+            kept.append(line[index:])
+            return "".join(kept), ""
+        at, open_quote = min(starts)
+        kept.append(line[index:at])
+        index = at + 3
+
+
+def _comment_text(line: str) -> str:
+    """The text of a comment line; "" for commented-out code ("# print(x)", "# port = 9050")."""
+    note = re.sub(r"^\s*(?:#|//|/\*|--|;;)\s*", "", line).rstrip("*/ ").strip()
+    return "" if _INLINE_CALL.match(note) or _ASSIGNED_NAME.match(note) else note
+
+
 def _statements(code: str, language: str) -> list[dict]:
-    """Top-level statements of a code block, each with the comment that follows it (the reported result)."""
+    """Top-level statements of a code block, each with the comment that follows it (the reported result).
+
+    A statement keeps its lines and their indentation: a compound statement
+    (``for``/``with``/``def``/``class`` and its indented body, a decorator and
+    what it decorates, ``else``/``except`` branches), lines inside brackets
+    and backslash continuations are one statement. Each statement is
+    ``{code, note, block}``; ``block`` is True for a compound statement.
+    """
     raw = code.split("\n")
     if any(re.match(r"^\s*>>>\s?", line) for line in raw):
         # A REPL transcript: prompt lines are code; an error in the output
@@ -1744,100 +1834,218 @@ def _statements(code: str, language: str) -> list[dict]:
         for line in raw:
             prompt = re.match(r"^\s*(>>>|\.\.\.)\s?(.*)$", line)
             if prompt and prompt.group(1) == "..." and statements:
-                statements[-1]["code"] += "\n" + prompt.group(2)
+                if prompt.group(2).strip():
+                    statements[-1]["code"] += "\n" + prompt.group(2).rstrip()
+                    statements[-1]["block"] = statements[-1]["block"] or prompt.group(2)[:1] in " \t"
             elif prompt and prompt.group(2).strip() and not _SETUP_LINE.match(prompt.group(2)):
-                statements.append({"code": prompt.group(2).strip(), "note": ""})
+                statements.append({"code": prompt.group(2).strip(), "note": "", "block": False})
             elif not prompt and statements and not statements[-1]["note"] and _OUTPUT_LINE.match(line) \
                     and not line.lstrip().startswith(("Traceback", "File ")):
                 statements[-1]["note"] = line.strip()
         return [statement for statement in statements if statement["code"].strip()]
-    if any(re.match(r"^\s*\$\s+\S", line) for line in raw):
-        raw = [re.sub(r"^\s*\$\s+", "", line) for line in raw if re.match(r"^\s*\$\s+\S", line)]
+    raw = textwrap.dedent("\n".join(raw)).split("\n")
+    shell = language in _SHELL_LANGUAGES
+    if any(_SHELL_PROMPT.match(line) for line in raw):
+        shell = True
+        raw = [_SHELL_PROMPT.sub("", line, count=1) for line in raw if _SHELL_PROMPT.match(line)]
+    python = language in _PYTHON_LANGUAGES
+
+    def start() -> dict:
+        return {"lines": [], "note": "", "depth": 0, "open": False, "block": False, "string": ""}
+
     statements: list[dict] = []
-    pending: list[str] = []
-    depth = 0
+    current: dict | None = None
     for line in raw:
-        if not pending:
+        opened = current["string"] if current is not None else ""
+        if opened:
+            # Inside a multi-line string ("""..."""): its lines are text, kept as they are.
+            outside, current["string"] = _outside_triple_quotes(line, opened)
+            if current["string"]:
+                current["lines"].append(line.rstrip())
+                continue
+        else:
             if not line.strip():
                 continue
-            if _COMMENT_LINE.match(line):
-                note = re.sub(r"^\s*(?:#|//|/\*|--|;;)\s*", "", line).rstrip("*/ ").strip()
-                if statements and note and not statements[-1]["note"]:
-                    statements[-1]["note"] = note
-                continue
-            if _SETUP_LINE.match(line) or _OUTPUT_LINE.match(line):
-                continue
-        change, comment_at = _code_scan(line, slashes=language not in {"python", "py", "python3", "pycon", "ipython"})
-        note = ""
-        if comment_at is not None:
-            note = re.sub(r"^(?:#|//)\s*", "", line[comment_at:]).strip()
-            line = line[:comment_at].rstrip()
-        pending.append(line)
-        depth += change
-        if depth > 0 or line.rstrip().endswith("\\"):
+            indented = line[:1] in " \t"
+            inside = current is not None and (current["depth"] > 0 or current["open"])
+            if not inside and not indented:
+                if _COMMENT_LINE.match(line):
+                    note = _comment_text(line)
+                    if current is not None and note and not current["note"]:
+                        current["note"] = note
+                    continue
+                if current is not None and _CONTINUES.match(line):
+                    current["block"] = True
+                elif _SETUP_LINE.match(line) or _OUTPUT_LINE.match(line):
+                    current = None
+                    continue
+                else:
+                    current = start()
+                    statements.append(current)
+            elif current is None:
+                # An indented line with nothing above it to belong to.
+                current = start()
+                statements.append(current)
+            elif indented and not inside:
+                current["block"] = True  # the body of a compound statement
+                if _COMMENT_LINE.match(line):
+                    # A comment in the body that says what happens is the reported result.
+                    note = _comment_text(line)
+                    if note and not current["note"] and (_OUTCOME_WORDS.search(note) or _OUTPUT_LINE.match(note)):
+                        current["note"] = note
+                        continue
+            outside, current["string"] = _outside_triple_quotes(line)
+        # Brackets and a trailing comment count only outside string literals.
+        change, comment_at = _code_scan(outside, slashes=not python)
+        if comment_at is not None and line.endswith(outside[comment_at:]):
+            current["note"] = _comment_text(outside[comment_at:]) or current["note"]
+            line = line[:len(line) - len(outside) + comment_at]
+            outside = outside[:comment_at]
+        current["lines"].append(line.rstrip())
+        current["depth"] = max(0, current["depth"] + change)
+        current["open"] = outside.rstrip().endswith("\\") or (not opened and line.lstrip().startswith("@"))
+    result = []
+    for statement in statements:
+        # Blank lines are kept only inside a multi-line string.
+        lines = list(statement["lines"])
+        while lines and not lines[-1].strip():
+            lines.pop()
+        filled = [line for line in lines if line.strip()]
+        if not filled or (not shell and not _CODE_CHARACTER.search("".join(filled))):
             continue
-        text = "\n".join(pending).strip()
-        pending, depth = [], 0
-        if text:
-            statements.append({"code": text, "note": note})
-    if pending and "\n".join(pending).strip():
-        statements.append({"code": "\n".join(pending).strip(), "note": ""})
-    return statements
+        margin = min(len(line) - len(line.lstrip()) for line in filled)
+        result.append({"code": "\n".join(line[margin:] for line in lines), "note": statement["note"],
+                       "block": statement["block"] or bool(_DEFINITION.match(filled[0].strip()))})
+    return result
+
+
+def _defined_names(code: str) -> set[str]:
+    """Names a statement defines: an assignment, ``def``/``class``/``function``, a ``for`` target, ``with ... as``."""
+    names: set[str] = set()
+    for line in code.split("\n"):
+        if line[:1] in " \t":
+            continue
+        assigned = _ASSIGNED_NAME.match(line)
+        if assigned:
+            names.add(assigned.group(1))
+        defined = _DEFINED_NAME.match(line.strip())
+        if defined:
+            for group in defined.groups():
+                names.update(name for name in re.findall(r"[A-Za-z_$][\w$]*", group or ""))
+    return names
 
 
 def _is_script(statements: list[dict]) -> bool:
-    """True when a statement assigns a name a later one uses: one script, not separate cases."""
+    """True when a statement defines a name a later one uses: one script, not separate cases."""
     for index, statement in enumerate(statements):
-        match = _ASSIGNED_NAME.match(statement["code"])
-        if not match:
-            continue
-        name = re.escape(match.group(1))
-        if any(re.search(rf"(?<![\w$.]){name}(?![\w$])", later["code"]) for later in statements[index + 1:]):
-            return True
+        for name in _defined_names(statement["code"]):
+            pattern = rf"(?<![\w$.]){re.escape(name)}(?![\w$])"
+            if any(re.search(pattern, later["code"]) for later in statements[index + 1:]):
+                return True
     return False
+
+
+def _quoted_source(code: str, statements: list[dict], language: str) -> bool:
+    """Whether a block quotes source code (the library's own lines) rather than showing how to reproduce.
+
+    Signs: its first line of code is indented and the block has structure
+    (an excerpt from inside a function or loop); a ``return``/``yield``
+    outside any ``def``, or
+    ``self.`` outside any ``class`` (Python); it starts with ``except`` or
+    ``else`` or its last line opens a block that is not there (a fragment);
+    or it only defines things and never calls or runs anything.
+    """
+    lines = [line for line in code.split("\n") if line.strip() and not _COMMENT_LINE.match(line)]
+    if not lines:
+        return False
+    depths = [len(line) - len(line.lstrip()) for line in lines]
+    # Indented, with a deeper body below or lines further out: cut from
+    # inside a function. A block indented flat as a whole is read as written.
+    if depths[0] and (depths[0] > min(depths) or max(depths) > depths[0]) \
+            and not lines[0].lstrip().startswith((">>>", "$")):
+        return True
+    lines = [line[min(depths):] for line in lines]
+    joined = "\n".join(lines)
+    python = language in _PYTHON_LANGUAGES or (not language and re.search(
+        r"^\s*(?:def|class|for|with|if|elif|else|try|except|while)\b.*:\s*$", joined, re.MULTILINE))
+    if python:
+        if re.search(r"^\s*(?:return|yield)\b", joined, re.MULTILINE) and not re.search(r"^\s*(?:async\s+)?def\b|\blambda\b", joined, re.MULTILINE):
+            return True
+        if re.search(r"(?<![\w.])self\.", joined) and not re.search(r"^\s*class\b", joined, re.MULTILINE):
+            return True
+        if lines[-1].rstrip().endswith(":") or re.match(r"(?:elif|else|except|finally)\b", lines[0]):
+            return True
+    return all(_DEFINITION.match(statement["code"].lstrip()) for statement in statements)
+
+
+def _is_json(code: str) -> bool:
+    """An untagged block of JSON (``python -m requests.help`` output, a payload)."""
+    stripped = code.strip()
+    if not stripped[:1] in "{[":
+        return False
+    try:
+        json.loads(stripped)
+    except ValueError:
+        return False
+    return True
+
+
+def _clip_case(code: str) -> str:
+    """At most _CASE_CHARACTERS of code, cut after a whole line."""
+    if len(code) <= _CASE_CHARACTERS:
+        return code
+    cut = code[:_CASE_CHARACTERS].rsplit("\n", 1)[0]
+    return f"{cut}\n..." if "\n" in code[:_CASE_CHARACTERS] else code[:_CASE_CHARACTERS].rstrip() + "…"
 
 
 def reproduction_cases(text: str, *, limit: int = REPRODUCTION_CASE_LIMIT) -> list[dict]:
     """The cases an issue quotes to reproduce it, as ``{code, note}`` (at most ``limit``).
 
     Every fenced code block that is not data or output (JSON, tracebacks,
-    version listings) is split into statements; each statement is a case and
-    the comment after it ("# AttributeError: ...", "# works") is its note.
-    A block whose statements build on each other (``s = Session()`` then
-    ``s.get(...)``) is one case. Imports, installs and comments are not
-    cases. Without such a block, inline code spans that are complete calls
-    with literal arguments count, in a sentence that says what they do ("...
-    raises", "... works"). Nothing here is run.
+    version listings) or quoted source (``_quoted_source``) is split into
+    statements; each statement is a case and the comment after it ("#
+    AttributeError: ...", "# works") is its note. A compound statement
+    (``for``/``with`` and its body) is one case and keeps its indentation. A
+    block whose statements build on each other (``s = Session()`` then
+    ``s.get(...)``, a ``class`` then its use) is one case. Imports, installs
+    and comments are not cases. Without such a block, inline code spans
+    that are complete calls with literal arguments count, in a sentence that
+    says what they do ("... raises", "... works"). Nothing here is run.
     """
     cases: list[dict] = []
     seen: set[str] = set()
 
     def add(code: str, note: str = "") -> None:
-        clean = code.strip()
+        clean = code.strip("\n").rstrip()
         key = re.sub(r"\s+", "", clean)
-        if not clean or key in seen or len(cases) >= limit:
+        if not key or key in seen or len(cases) >= limit:
             return
         seen.add(key)
-        cases.append({"code": clean[:_CASE_CHARACTERS], "note": note.strip()[:200]})
+        cases.append({"code": _clip_case(clean), "note": note.strip()[:200]})
 
-    for language, code in _fenced_blocks(text):
+    for language, code, lead in _fenced_blocks(text):
         lines = [line for line in code.split("\n") if line.strip()]
-        if language in _DATA_LANGUAGES or not lines:
+        if language in _DATA_LANGUAGES or not lines or (_SOURCE_LEAD.search(lead) and not _REPRO_LEAD.search(lead)):
             continue
         repl = any(line.lstrip().startswith(">>>") for line in lines)
         if not repl and any(line.lstrip().startswith("Traceback (most recent call last)") for line in lines):
             continue
         if all(_OUTPUT_LINE.match(line) or _COMMENT_LINE.match(line) for line in lines):
             continue
+        if _DIFF_LINE.search(code) or _is_json(code):
+            continue
         statements = _statements(code, language)
-        if not statements:
+        if not statements or (not repl and _quoted_source(code, statements, language)):
             continue
         if _is_script(statements):
-            notes = [statement["note"] for statement in statements if statement["note"]]
-            add("\n".join(statement["code"] for statement in statements), notes[-1] if notes else "")
+            # The script's reported result: the last comment that says what
+            # happens ("# raises KeyError"), else the comment on its last line.
+            notes = [statement["note"] for statement in statements
+                     if statement["note"] and (_OUTCOME_WORDS.search(statement["note"]) or _OUTPUT_LINE.match(statement["note"]))]
+            add("\n".join(statement["code"] for statement in statements), notes[-1] if notes else statements[-1]["note"])
             continue
         for statement in statements:
-            add(re.sub(r"\s*\n\s*", " ", statement["code"]), statement["note"])
+            add(statement["code"], statement["note"])
     if cases:
         return cases
     prose = re.sub(r"(?ms)^[ \t]{0,3}(`{3,}|~{3,}).*?^[ \t]{0,3}\1[^\n]*$", "", str(text or ""))
@@ -1852,6 +2060,26 @@ def reproduction_cases(text: str, *, limit: int = REPRODUCTION_CASE_LIMIT) -> li
             if re.search(r"\d|['\"{\[]", span[span.index("("):]):
                 add(span)
     return cases
+
+
+def quotes_source(code: str, sources: list[str]) -> bool:
+    """Whether a case is lines copied from the repository's own files (``sources``), not a reproduction.
+
+    True when most of its substantial lines (8+ characters) appear, as whole
+    lines, in one of ``sources``; a one-line case must be 20+ characters.
+    """
+    lines = [line.strip() for line in str(code or "").split("\n")]
+    lines = [line for line in lines if len(line) >= 8 and not _COMMENT_LINE.match(line)]
+    if not lines or (len(lines) == 1 and len(lines[0]) < 20):
+        return False
+    for source in sources:
+        if not isinstance(source, str) or not source:
+            continue
+        present = {line.strip() for line in source.split("\n")}
+        found = sum(1 for line in lines if line in present)
+        if found and found >= max(1, math.ceil(len(lines) * 0.6)):
+            return True
+    return False
 
 
 def _comparable(text: str) -> str:
