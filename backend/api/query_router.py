@@ -32,17 +32,21 @@ from api.answer_trust import (
     join_continuation,
     restore_answer_check,
 )
+from api import impact
 from api.auth import get_current_user
 from api.repository_state import fetch_accessible_repository, repository_access_by_id, role_allows
 from config import ModelConfigurationError, get_editing_ticket_secret, query_request_limiter, settings
 from database import DatabaseConfigurationError, assert_turso_schema, explain_database_error, get_turso_store
 from ingest.cloner import RepositoryValidationError, parse_github_repository
+from retrieval.code_search import find_symbols, indexed_file_lines, is_support_path
 from retrieval.retriever import (
     build_evidence_plan,
     build_repo_map,
     escape_like,
+    extract_qualified_names,
     extract_question_identifiers,
     extract_requested_file_paths,
+    is_impact_question,
     is_overview_file,
     retrieve_context,
     search_terms,
@@ -90,6 +94,158 @@ def proposal_evidence(proposal: dict) -> dict:
     paths = [str(item.get("file_path")) for item in proposal.get("files") or [] if item.get("file_path")]
     return {"_synthetic": "proposal_changes", "file_path": ", ".join(paths) or "the proposal", "content": text,
             "start_line": 1, "end_line": 1}
+# Change impact as evidence. A go/no-go or "what would break" question about
+# a file (and a name in it) sees what the Change impact report knows: the
+# files that import it, the test files that reach it, and the test functions
+# that use the name. Static analysis of the import graph, not coverage.
+IMPACT_EVIDENCE_DEPTH = 2
+IMPACT_EVIDENCE_LIMIT = 12
+IMPACT_EVIDENCE_TEST_FILES = 15
+IMPACT_EVIDENCE_TEST_FUNCTIONS = 12
+# Test functions shown as citable windows (the rest are only listed).
+IMPACT_EVIDENCE_TEST_WINDOWS = 6
+IMPACT_GRAPH_WAIT_SECONDS = 5.0
+
+
+def _impact_symbol_candidates(question: str) -> list[str]:
+    """Code names a change question is about, ``Flask.make_response`` as ``make_response``."""
+    return list(dict.fromkeys([
+        *(member for _, member in extract_qualified_names(question)), *extract_question_identifiers(question),
+    ]))[:3]
+
+
+async def _impact_target(store, repo: dict, question: str, requested_files: list[str], names: list[str]) -> str | None:
+    """The one indexed file a change question is about: the file it names, or
+    the only source file that declares the name it asks about."""
+    for requested in requested_files[:2]:
+        matches, complete = await impact.resolve_target(store, repo, requested)
+        if len(matches) == 1 and complete:
+            return matches[0]
+    if requested_files or not names:
+        return None
+    declared = {
+        item["path"] for item in await find_symbols(store, repo["id"], names[0], limit=8,
+                                                    staging_prefix=repo.get("staging_prefix"))
+        if item["name"] == names[0] and not is_support_path(item["path"])
+    }
+    return next(iter(declared)) if len(declared) == 1 else None
+
+
+def _impact_test_windows(functions: list[dict], files: dict[str, dict[int, str]], symbol: str, evidence_plan: dict) -> list[dict]:
+    """Short, citable windows of the first test functions that use ``symbol``."""
+    windows: list[dict] = []
+    for item in functions[:IMPACT_EVIDENCE_TEST_WINDOWS]:
+        lines = files.get(item["file_path"]) or {}
+        start = int(item["line"])
+        reference = int(item.get("reference_line") or start)
+        spans = [(start, reference + 1)] if reference - start <= 10 else [(start, start + 1), (reference - 1, reference + 1)]
+        for first, last in spans:
+            last = min(last, max(lines) if lines else last)
+            if not lines or any(number not in lines for number in range(first, last + 1)):
+                continue
+            reason = (
+                f"Test function `{item['name']}` uses `{symbol}`" if item.get("kind") == "reference"
+                else f"Test function `{item['name']}` is named after `{symbol}`"
+            ) + " (Change impact)"
+            windows.append({
+                "id": f"impact_test:{item['file_path']}#L{first}-L{last}",
+                "file_path": item["file_path"], "start_line": first, "end_line": last, "language": "",
+                "symbols": [str(item["name"])], "content": "\n".join(lines[number] for number in range(first, last + 1)),
+                "_retrieval_methods": ["change_impact"], "_retrieval_reasons": [reason],
+                "_evidence_plan": evidence_plan, "_relevance_score": 1.0,
+            })
+    return windows
+
+
+def _impact_summary_text(report: dict, symbol: str | None) -> str:
+    target = report["target_file"]
+    lines = [
+        f"Static change impact for {target}: resolved imports of the indexed code, {IMPACT_EVIDENCE_DEPTH} levels deep. "
+        "No tests were run, so this is not measured coverage.",
+        f"Summary: {report['summary']}",
+    ]
+    direct = [node for node in report.get("dependents") or [] if node.get("depth") == 1]
+    if direct:
+        shown = ", ".join(f"{node['file_path']}:{node['line_number']}" for node in direct[:IMPACT_EVIDENCE_LIMIT])
+        more = report["dependent_count"] - min(len(direct), IMPACT_EVIDENCE_LIMIT)
+        lines.append(f"Direct importers ({report['dependent_count']}, path:line of the import): {shown}"
+                     + (f", and {more} more" if more > 0 else ""))
+    tests = report.get("affected_tests") or {}
+    files = tests.get("files") or []
+    if files:
+        shown = ", ".join(
+            f"{item['file_path']}" + (f" (via {item['via']})" if item.get("depth", 1) > 1 else f":{item['line_number']}")
+            for item in files[:IMPACT_EVIDENCE_TEST_FILES]
+        )
+        more = int(tests.get("count") or len(files)) - min(len(files), IMPACT_EVIDENCE_TEST_FILES)
+        lines.append(f"Affected test files ({tests.get('count', len(files))}, they import {target} within "
+                     f"{IMPACT_EVIDENCE_DEPTH} levels): {shown}" + (f", and {more} more" if more > 0 else ""))
+    else:
+        lines.append(f"Affected test files: none of the test files imports {target} within {IMPACT_EVIDENCE_DEPTH} levels "
+                     f"({tests.get('indirect_count', 0)} more reach it further away).")
+    if symbol:
+        info = report.get("symbol") or {}
+        if info.get("defined_at"):
+            lines.append(f"`{symbol}` is defined at {target}:{info['defined_at']}.")
+        functions = tests.get("functions") or []
+        using = [item for item in functions if item.get("kind") == "reference"]
+        named = [item for item in functions if item.get("kind") == "name"]
+        if using:
+            lines.append(f"Test functions that use `{symbol}` ({len(using)}): " + "; ".join(
+                f"{item['file_path']}:{item['line']} {item['name']} (uses it at line {item['reference_line']})"
+                for item in using[:IMPACT_EVIDENCE_TEST_FUNCTIONS]
+            ) + ("; and more" if len(using) > IMPACT_EVIDENCE_TEST_FUNCTIONS else ""))
+        else:
+            lines.append(f"Test functions that use `{symbol}`: none found in the affected test files.")
+        if named:
+            lines.append(f"Test functions named after `{symbol}` without using the name ({len(named)}): " + "; ".join(
+                f"{item['file_path']}:{item['line']} {item['name']}" for item in named[:IMPACT_EVIDENCE_TEST_FUNCTIONS]
+            ))
+    return "\n".join(lines)
+
+
+async def change_impact_evidence(store, repo: dict, question: str, evidence_plan: dict) -> list[dict]:
+    """Generated impact evidence (never cited) plus citable windows of the test
+    functions that use the named symbol, for an impact/risk question."""
+    if not is_impact_question(question):
+        return []
+    names = _impact_symbol_candidates(question)
+    target = await _impact_target(store, repo, question, list(evidence_plan.get("requested_files") or []), names)
+    if not target:
+        return []
+    graph = await impact.ensure_current_graph(store, repo, wait_seconds=IMPACT_GRAPH_WAIT_SECONDS)
+    report, symbol = None, None
+    for name in names[:2] or [None]:
+        report = await impact.analyse_impact(
+            store, repo, target, depth=IMPACT_EVIDENCE_DEPTH, symbol=name, limit=IMPACT_EVIDENCE_LIMIT,
+        )
+        if name and (report.get("symbol") or {}).get("mentions"):
+            symbol = name
+            break
+    if names and symbol is None:
+        # None of the names occurs in the file: report the file alone.
+        report = await impact.analyse_impact(store, repo, target, depth=IMPACT_EVIDENCE_DEPTH, symbol=None,
+                                             limit=IMPACT_EVIDENCE_LIMIT)
+    tests = report.get("affected_tests") or {}
+    functions = list(tests.get("functions") or []) if symbol else []
+    evidence_plan["change_impact"] = {
+        "target": target, "symbol": symbol, "depth": IMPACT_EVIDENCE_DEPTH,
+        "direct_importers": report.get("dependent_count", 0), "affected_test_files": tests.get("count", 0),
+        "test_functions": sum(1 for item in functions if item.get("kind") == "reference"),
+        "graph_rebuilding": bool(graph.get("rebuilding")),
+    }
+    evidence = [{
+        "_synthetic": "change_impact_summary", "file_path": target, "content": _impact_summary_text(report, symbol),
+        "start_line": 1, "end_line": 1,
+    }]
+    if functions:
+        shown = functions[:IMPACT_EVIDENCE_TEST_WINDOWS]
+        files = await indexed_file_lines(store, repo["id"], [item["file_path"] for item in shown],
+                                         staging_prefix=repo.get("staging_prefix"))
+        evidence.extend(_impact_test_windows(shown, files, symbol, evidence_plan))
+    return evidence
+
+
 # Follow-up detection. A question is a follow-up only when it leans on the
 # previous turn: it starts with a connective ("and where is that called?")
 # or refers back with a pronoun while naming almost nothing of its own
@@ -1172,20 +1328,38 @@ async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool,
             await annotate_history_names(store, repo["id"], history)
         retrieval_query, boost_paths = build_retrieval_query(question, history)
         yield "stage", {"stage": "retrieving", "detail": "Searching the indexed code"}
-        chunks = await retrieve_context(
-            store,
-            repo["id"],
-            question,
-            top_k=(settings.editing_retrieval_top_k if workflow == "editing" else settings.retrieval_top_k),
-            workflow=workflow,
-            staging_prefix=repo.get("staging_prefix"),
-            retrieval_query=retrieval_query,
-            boost_paths=boost_paths,
-        )
+        # Change impact (importers, affected tests, tests using the name) is
+        # computed beside retrieval for an impact or go/no-go question.
+        impact_task = asyncio.create_task(
+            change_impact_evidence(store, repo, question, evidence_plan)
+        ) if workflow != "editing" and is_impact_question(question) else None
+        try:
+            chunks = await retrieve_context(
+                store,
+                repo["id"],
+                question,
+                top_k=(settings.editing_retrieval_top_k if workflow == "editing" else settings.retrieval_top_k),
+                workflow=workflow,
+                staging_prefix=repo.get("staging_prefix"),
+                retrieval_query=retrieval_query,
+                boost_paths=boost_paths,
+            )
+        except BaseException:
+            if impact_task is not None:
+                impact_task.cancel()
+            raise
         # Final citation boundary: orientation files only for explicit
         # documentation or repository-overview requests.
         if not evidence_plan.get("overview_files_allowed"):
             chunks = [chunk for chunk in chunks if not is_overview_file(str(chunk.get("file_path", "")))]
+        if impact_task is not None:
+            try:
+                impact_chunks = await impact_task
+            except Exception:
+                logger.warning("Change impact evidence unavailable for repository %s", repo["id"], exc_info=True)
+                impact_chunks = []
+            if impact_chunks:
+                chunks = [*impact_chunks, *chunks]
         if workflow != "editing" and history and _PROPOSAL_QUESTION.search(question):
             # Questions about the change proposed in this conversation see
             # its diff (round 2: "how does the revised proposal handle bytes

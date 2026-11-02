@@ -6,7 +6,8 @@
   declaration they are in; past the budget the plan counts what was left out.
 * R2-12: "does anything subclass Flask or override make_response?" gets the
   declarations that inherit from Flask and the same-named methods in them.
-* R2-11: a go/no-go question about a file gets the docs that mention the name.
+* R2-11: a go/no-go question about a file gets the Change impact report as
+  generated evidence (never cited) and the docs that mention the name.
 
 Database tests use a temporary embedded libSQL file seeded through the real
 chunker, so sections overlap and split as in production. No network.
@@ -17,10 +18,11 @@ import unittest
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from agent.agent import exact_search_notes
-from api.query_router import build_context_with_coverage
+from agent.agent import build_answer_messages, exact_search_notes
+from api import query_router
+from api.query_router import build_citations, build_context_with_coverage
 from database import TursoStore, apply_migrations
 from ingest.chunker import chunk_file_content
 from ingest.embedder import EmbeddingUnavailableError
@@ -427,6 +429,60 @@ class ChangeRiskTests(ExactEvidenceStoreCase):
         self.assertEqual([chunk["file_path"] for chunk in docs], ["docs/api.rst", "CHANGES.rst"])
         self.assertEqual(chunks[0]["file_path"], "src/flask/app.py", "the named file still leads")
         self.assertEqual(chunks[0]["_evidence_plan"]["docs_mentions"]["files"], 2)
+
+    async def test_change_impact_is_generated_evidence_and_test_functions_are_citable(self):
+        repo_id = await self.add_repo(FLASK_FILES)
+        repo = {"id": repo_id, "staging_prefix": None, "github_url": "https://github.com/acme/demo"}
+        report = {
+            "target_file": "src/flask/app.py", "summary": "1 indexed file imports src/flask/app.py directly.",
+            "dependents": [{"file_path": "src/flask/__init__.py", "depth": 1, "line_number": 2}], "dependent_count": 1,
+            "affected_tests": {
+                "files": [{"file_path": "tests/test_basic.py", "depth": 2, "via": "src/flask/__init__.py", "line_number": 1}],
+                "count": 1, "indirect_count": 0,
+                "functions": [{"file_path": "tests/test_basic.py", "name": "test_make_response", "line": 4,
+                               "kind": "reference", "reference_line": 5}],
+            },
+            "symbol": {"name": "make_response", "defined_at": 2, "mentions": 2},
+        }
+        question = "Give me a go/no-go risk summary for changing make_response in src/flask/app.py"
+        plan = build_evidence_plan(question)
+        with patch.object(query_router.impact, "resolve_target", new=AsyncMock(return_value=(["src/flask/app.py"], True))), \
+                patch.object(query_router.impact, "ensure_current_graph", new=AsyncMock(return_value={"rebuilding": False})), \
+                patch.object(query_router.impact, "analyse_impact", new=AsyncMock(return_value=report)) as analyse:
+            evidence = await query_router.change_impact_evidence(self.store, repo, question, plan)
+        self.assertEqual(analyse.await_args.kwargs["symbol"], "make_response")
+        summary, *windows = evidence
+        self.assertEqual(summary["_synthetic"], "change_impact_summary")
+        self.assertIn("tests/test_basic.py:4 test_make_response (uses it at line 5)", summary["content"])
+        self.assertIn("tests/test_basic.py (via src/flask/__init__.py)", summary["content"])
+        self.assertIn("not measured coverage", summary["content"])
+        self.assertEqual([(item["file_path"], item["start_line"], item["end_line"]) for item in windows],
+                         [("tests/test_basic.py", 4, 6)])
+        context = build_context_with_coverage(evidence)[0]
+        self.assertTrue(context.startswith("Generated change impact summary for src/flask/app.py:"))
+        # The generated summary is never a citation; the test window is.
+        self.assertEqual([item["file_path"] for item in build_citations(evidence, repo)], ["tests/test_basic.py"])
+        self.assertEqual(plan["change_impact"]["test_functions"], 1)
+        notes = " ".join(exact_search_notes(plan))
+        self.assertIn("static change impact summary for src/flask/app.py and `make_response`", notes)
+        messages = build_answer_messages(question, context, evidence_plan=plan)
+        self.assertIn("Use it for the tests and coverage part", messages[-1]["content"])
+
+    async def test_no_impact_evidence_without_an_impact_question_or_a_single_target(self):
+        repo = {"id": "repo-1", "staging_prefix": None}
+        self.assertEqual(await query_router.change_impact_evidence(self.store, repo, "How does make_response work?", {}), [])
+        with patch.object(query_router.impact, "resolve_target",
+                          new=AsyncMock(return_value=(["a/app.py", "b/app.py"], True))):
+            self.assertEqual(await query_router.change_impact_evidence(
+                self.store, repo, "What would break if I change app.py?", {"requested_files": ["app.py"]}), [])
+
+    async def test_a_change_question_without_a_file_uses_the_only_declaring_source_file(self):
+        repo_id = await self.add_repo(FLASK_FILES)
+        repo = {"id": repo_id, "staging_prefix": None}
+        target = await query_router._impact_target(self.store, repo, "", [], ["finalize_request"])
+        self.assertEqual(target, "src/flask/app.py")
+        # make_response is declared in two source files: no single target.
+        self.assertIsNone(await query_router._impact_target(self.store, repo, "", [], ["make_response"]))
 
 
 if __name__ == "__main__":
