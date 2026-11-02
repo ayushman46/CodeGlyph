@@ -84,5 +84,24 @@ Fixed after round 3 (each with a test that fails without it): New chat forgets t
 Round 3 minor findings left open: "Search code for Client.request" searches bare `request` (513 hits); reference check says "not part of this answer's evidence" for ranges listed as cited sources and shows mixed "573-L586"; a stopped answer can end with a raw backtick fragment; the revoked-link page tells an existing member to ask for a new link; follow-up answers flag a proposal's new test names as "not found in the indexed code"; an onboarding answer said routing lives in examples' index.js (lib/ not retrieved).
 Open, by priority: R2-07 (prompt side) invented paths stated as fact; R2-18 composer mode resets on reopening a thread; R2-15 patches not checked against issue cases (needs sandboxed execution: owner decision, cost/security); R2-20 audit/SSO/team workspace (owner decision).
 
+## Final state (2026-11-02)
+Branch `ux-polish-and-pr-flow` @ the commit after this log entry. Nothing deployed; `main` untouched.
+Final verification: backend 1218 tests OK (2 skipped); frontend unit 370 pass; `vite build` OK; Playwright 78 passed, 3 skipped (screenshot-only); retrieval eval 62/64 targets, 27/29 questions (original 26 questions: 42/47 at the start of batch 1 → 45/47).
+Simulated customer journeys: round 1 (6 personas) mostly failed or unsupported → round 2: 29 of 32 scenarios passed, 3 partially → round 3 (fixes after round 2): 8 of 10 passed, 2 partially → after fixes, live re-check 3 of 3 passed. These are simulated users, not validated demand.
+
+Shipped (customer-facing):
+- Answers: cut-off answers say so with Continue; invented code names and paths flagged (inline, in the footer, and a warning above the answer for files not in the index); honest reference labels; named model failures with Retry with Fast; copy with commit-pinned permalinks; "every place" questions show every match or say how many were omitted; subclass/override questions; go/no-go answers use Change impact and docs; questions about a proposal see its changes; a question left mid-answer is kept.
+- Finding code: exact code search; ⌘K files, symbols and Class.method (also on phones); @ file mentions; file tree; outline and enclosing declaration; links to a file and line.
+- Retrieval: named files read where the question points (and the exact file before namesakes); paired tests; callers, importers, definitions.
+- Change impact: package imports resolved; ambiguous-path picker; indirect dependents by level; affected tests and test functions; Markdown export.
+- Conversations: several per repository; New chat never deletes; History, rename, delete with Undo, Recently deleted.
+- Team access: invite links (viewer/editor, expiry), who joined each link, revoke with confirmation, role changes, removal enforced on the server, shared read-only answers.
+- First run: Start here card; queue position and estimate; consistent progress; mistyped repositories rejected.
+- Edit & PR: "Tests not run" with the real command; issue cases in How to verify; PR templates filled, and the PR body says commands were not run; changelog gaps flagged; revisions of the latest or a named proposal; unsupported PR claims removed.
+
+Needs the owner's decision (not built): sandboxed execution of tests / issue repro cases for Edit & PR (cost and security); audit trail, SSO, team workspaces and seat billing; deploying any of this (Render cold start of ~34 s also needs a plan, keep-alive or a static frontend host). Update `.env`/Render `CODE_EDITING_MODEL` to Ultra with Super VL fallback if adopting the simulation settings. The edit-quality worktree `/Users/ayush/Downloads/codebase_rag-quality` can be deleted. NVIDIA trial terms do not allow production use.
+
+Next priorities: answers that follow an import one hop (index.js → lib/express.js) when asked what a file loads; "Search code for Client.request" should search the qualified method; reference check consistency (cited range vs "not in evidence", mixed "573-L586"); stopped answers ending in a raw backtick; proposal names flagged "not found" in follow-ups; go-to-definition from identifiers in the viewer; live role refresh for open member tabs.
+
 ## Next step
-Customer round 2 on the integrated build, one persona agent at a time (owner's instruction): back up `sim/sim.db`, restart `sim/backend.sh` + `sim/frontend.sh`, then run each persona from `scratchpad/sim/round2/` (briefs generated from `round2.js`): sim-first, sim-dev, sim-onboard, sim-lead, sim-maint, sim-admin (+ sim-teammate). Record each scenario result here, fix failures, re-test.
+Work is complete for this session. To resume: `git log --oneline -40` on `ux-polish-and-pr-flow`; simulation scripts in the session scratchpad `sim/` (backend.sh, frontend.sh; DB backups sim-before-r2.db, sim-before-r3.db); start with the "Next priorities" list above, one agent at a time.
