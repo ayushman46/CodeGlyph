@@ -52,6 +52,15 @@ IMPACT_QUESTION_PATTERN = re.compile(
     r"\bif\s+.+\s+(?:changes?|is\s+removed|is\s+renamed)\b",
     re.IGNORECASE,
 )
+# "What imports X?", "Which modules import X?", "Who uses X?", "X is imported
+# by": the files that import a named file. "What does X import?" and "the
+# imports at the top of X" are about X's own imports and do not match.
+IMPORTER_QUESTION_PATTERN = re.compile(
+    r"\b(?:what|which|who)\b(?:\s+(?!(?:does|do|did|is|are|was|were|can|should|will)\b)[\w-]+){0,3}?\s+"
+    r"(?:imports?|requires?)\b(?!\s+(?:at|in)\b)|"
+    r"\b(?:imported|required)\s+by\b|\bimporters?\b|\bwho\s+uses\b|\bwhere\b[^?!\n]{0,60}\bimported\b",
+    re.IGNORECASE,
+)
 ISSUE_REFERENCE_PATTERN = re.compile(r"\b(?:github\s+)?issue\s*#?\s*(\d{1,8})\b", re.IGNORECASE)
 
 # These files are useful for repository-wide orientation, but they are not
@@ -142,11 +151,23 @@ QUERY_STOPWORDS = {
     # Narrative words of bug reports and walkthrough requests. They match
     # prose everywhere and push the technical words of a long question out
     # of the bounded term list.
-    "bug", "report", "works", "but", "why", "who", "walk", "through", "fails", "same", "way", "inside",
+    "bug", "works", "but", "why", "who", "walk", "through", "fails", "same", "way", "inside",
     "every", "each", "exactly", "actually", "short", "small", "then", "there", "them", "they", "should",
     "could", "want", "need", "else", "has", "have", "had", "not", "was", "were", "did", "down", "over",
-    "find", "list", "trace", "place", "point",
+    "without",
 }
+# Words such as "trace", "list", "find", "report" and "point" name real things
+# in some repositories (httpx's ``trace`` extension), so they are not
+# stopwords. They are dropped only where they are clearly instructions: an
+# imperative that opens a sentence ("Trace the call path...", "List each
+# function..."), "can I find", "Bug report:", "every place", "the point where".
+_NARRATIVE_WORDING_PATTERN = re.compile(
+    r"(?:^|(?<=[.?!:;]\s)|(?<=\n))\s*(?:(?:please|now|also|then|and|first)\s*,?\s+)?(?:(?:can|could|would)\s+you\s+)?"
+    r"(?:trace|list|find|report|point\s+(?:me\s+)?(?:to|at))\b(?![(.])|"
+    r"\b(?:can|do|could|should|would|will)\s+(?:i|we|you|one)\s+(?:find|list|trace)\b|"
+    r"\bbug\s+report\b|\b(?:every|each|any|all|one)\s+places?\b|\b(?:to|at)\s+the\s+point\s+(?:where|at\s+which)\b",
+    re.IGNORECASE,
+)
 # Long questions keep this many of their own terms (code-shaped names first).
 MAX_QUESTION_TERMS = 12
 
@@ -472,6 +493,7 @@ def search_terms(query: str) -> list[str]:
     """Keep sparse matching resilient to punctuation and provider-unavailable embeddings."""
     # "(not tests or docs)" names what to leave out, not what to search for.
     text = NEGATED_SCOPE_PATTERN.sub(" ", strip_answer_instructions(query))
+    text = _NARRATIVE_WORDING_PATTERN.sub(" ", text)
     words = [
         word.lower()
         for word in WORD_PATTERN.findall(text)
@@ -789,7 +811,12 @@ def _focus_score_sql(focus: dict | None) -> tuple[str, list[object]]:
     counts 4 (exact case), a question word present counts 1."""
     names = [str(name) for name in (focus or {}).get("names") or [] if str(name)][:6]
     lowered = {name.lower() for name in names}
-    terms = [str(term) for term in (focus or {}).get("terms") or [] if str(term) and str(term) not in lowered][:6]
+    # The stem, as in ``_term_regex``: "imports" also finds ``import`` lines.
+    terms = [
+        term[:-1] if term.endswith("s") and len(term) > 3 else term
+        for term in (str(item) for item in (focus or {}).get("terms") or [])
+        if term and term not in lowered
+    ][:6]
     parts = [*("(CASE WHEN instr(content, ?) > 0 THEN 4 ELSE 0 END)" for _ in names),
              *("(CASE WHEN instr(lower(content), ?) > 0 THEN 1 ELSE 0 END)" for _ in terms)]
     return (" + ".join(parts) if parts else "0"), [*names, *terms]
@@ -846,6 +873,17 @@ SECTION_QUALIFIED_WEIGHT = 2.0
 SECTION_TERM_WEIGHT = 0.5
 # Sections of a named file shown before related evidence from other files.
 NAMED_FILE_LEADING_SECTIONS = 3
+# Words that say how to read a named file, or who is asking, not what to
+# look for in it: "explain httpx/_client.py", "the imports at the top of
+# app.py", "give me a tour of app.py for a new engineer". With nothing else
+# to rank by, the file is read from the top.
+FOCUS_INSTRUCTION_WORDS = {
+    "explain", "explained", "explaining", "explanation", "summarize", "summarise", "summary", "overview",
+    "describe", "description", "walkthrough", "top", "bottom", "beginning", "file", "files", "module", "modules",
+    "line", "lines", "section", "sections", "part", "parts", "purpose", "contents", "content", "entire", "whole",
+    "everything", "tell", "understand", "read", "look", "detail", "detailed", "details", "brief", "briefly",
+    "tour", "help", "break", "can", "you", "for", "new", "engineer", "engineers", "newcomer", "beginner",
+}
 
 
 def question_focus(query: str, requested_paths: list[str] | None = None) -> dict:
@@ -855,7 +893,8 @@ def question_focus(query: str, requested_paths: list[str] | None = None) -> dict
     ``get`` of ``Client.get``), matched with exact case; ``qualified`` keeps
     their owners; ``terms`` are the other question words. Words that only
     repeat a requested path ("flask", "client") are dropped because every
-    section of that file contains them.
+    section of that file contains them, and so are reading instructions
+    ("explain", "top").
     """
     qualified = extract_qualified_names(query)
     names = list(dict.fromkeys([*extract_question_identifiers(query), *(member for _, member in qualified)]))
@@ -863,9 +902,17 @@ def question_focus(query: str, requested_paths: list[str] | None = None) -> dict
     lowered_names = {name.lower() for name in names}
     terms = [
         term for term in search_terms(query)
-        if term not in lowered_names and term.strip("_") not in path_words
+        if term not in lowered_names and term.strip("_") not in path_words and term not in FOCUS_INSTRUCTION_WORDS
     ]
     return {"names": names[:8], "qualified": qualified, "terms": terms}
+
+
+def _term_regex(term: str) -> re.Pattern:
+    """A question word as a whole word, allowing a plural or verb ending:
+    "imports" matches ``import`` and ``imported``, "top" does not match
+    ``stop``. Inside identifiers, ``_`` counts as a word boundary."""
+    stem = term[:-1] if term.endswith("s") and len(term) > 3 else term
+    return re.compile(rf"(?<![a-z0-9]){re.escape(stem)}(?:s|es|ed|ing)?(?![a-z0-9])")
 
 
 def score_file_section(chunk: Dict, focus: dict) -> tuple[float, list[str], list[str]]:
@@ -885,7 +932,7 @@ def score_file_section(chunk: Dict, focus: dict) -> tuple[float, list[str], list
         if re.search(rf"(?<![\w$]){re.escape(owner)}\.(?:prototype\.)?{re.escape(member)}(?![\w$])", content):
             score += SECTION_QUALIFIED_WEIGHT
     lowered = content.lower()
-    score += SECTION_TERM_WEIGHT * sum(1 for term in focus.get("terms") or [] if term in lowered)
+    score += SECTION_TERM_WEIGHT * sum(1 for term in focus.get("terms") or [] if _term_regex(term).search(lowered))
     return score, declared, mentioned
 
 
@@ -975,7 +1022,15 @@ def select_named_sections(ranked: list[Dict], per_file_limit: int, leading_per_f
                 remainder = _without_overlap(chunk, chosen)
                 if remainder is not None:
                     chosen.append(remainder)
-        chosen_by_file[path] = chosen
+        # A later merge can grow a section over one chosen after it (1-150
+        # plus 111-260 reaches into 221-370); show each line once, keeping
+        # it in the better-ranked section.
+        distinct: list[Dict] = []
+        for chunk in chosen:
+            remainder = _without_overlap(chunk, distinct)
+            if remainder is not None:
+                distinct.append(remainder)
+        chosen_by_file[path] = distinct
     leading: list[Dict] = []
     for rank in range(max(0, leading_per_file)):
         for chosen in chosen_by_file.values():
@@ -1442,6 +1497,7 @@ async def paired_test_chunks(
     *,
     limit: int = 3,
     staging_prefix: str | None = None,
+    terms: list[str] | None = None,
 ) -> list[Dict]:
     """Test files that cover a source file or a named symbol, by convention.
 
@@ -1452,6 +1508,11 @@ async def paired_test_chunks(
     file (``response.js`` -> ``test/res.*.js``). Only the strongest tier
     present is used. Each file contributes its section that mentions the
     names most.
+
+    An abbreviation matches a whole family (21 ``test/res.*.js`` files for
+    ``lib/response.js``), so that tier returns a generated listing of the
+    family first, and only the members whose names share a question word
+    (``cookie`` -> ``test/res.cookie.js``) as sections.
     """
     stems = []
     for path in source_paths:
@@ -1509,9 +1570,21 @@ async def paired_test_chunks(
     if not tiers:
         return []
     best = max(tiers.values())
-    # An abbreviation ("res.*" for response.js) matches a whole family of
-    # tests; keep fewer of those than of exact name matches.
-    chosen = sorted(path for path, tier in tiers.items() if tier == best)[: max(1, limit if best > 1 else min(2, limit))]
+    listing: Dict | None = None
+    if best > 1:
+        chosen = sorted(path for path, tier in tiers.items() if tier == best)[: max(1, limit)]
+    else:
+        family = sorted(path for path, tier in tiers.items() if tier == best)
+        listing = _test_family_listing(family, source_paths)
+        wanted = _name_tokens(" ".join([*(terms or []), *names, *(member for _, member in members)]))
+        tokens = {path: _name_tokens(path.rsplit("/", 1)[-1].rsplit(".", 1)[0]) for path in family}
+        # A token every member shares ("res") picks none of them out.
+        shared = set.intersection(*tokens.values()) if len(family) > 1 else set()
+        overlap = {path: len((tokens[path] - shared) & wanted) for path in family}
+        chosen = sorted((path for path in family if overlap[path]), key=lambda path: (-overlap[path], path))
+        chosen = chosen[: max(0, min(2, limit - 1))]
+        if not chosen:
+            return [listing]
     placeholders = ",".join("?" for _ in chosen)
     rows = await store.fetch_all(
         "SELECT id, file_path, start_line, end_line, language, symbols, content FROM chunks "
@@ -1526,13 +1599,42 @@ async def paired_test_chunks(
         hits = sum(len(needle.findall(content)) for needle in needles)
         if path not in best_rows or hits > best_rows[path][0]:
             best_rows[path] = (hits, row)
-    result = []
+    result = [listing] if listing else []
     for path in chosen:
         if path in best_rows:
             row = dict(best_rows[path][1])
             row["_pairing_tier"] = tiers[path]
             result.append(row)
     return result
+
+
+def _test_family_listing(family: list[str], source_paths: list[str]) -> Dict:
+    """A generated evidence block naming every test file of an abbreviation
+    family (``test/res.*.js`` for ``lib/response.js``), so an answer can name
+    them all instead of presenting two arbitrary members as "the tests"."""
+    folders = {path.rsplit("/", 1)[0] if "/" in path else "" for path in family}
+    prefixes = {path.rsplit("/", 1)[-1].split(".", 1)[0] for path in family}
+    sources = ", ".join(source_paths[:2])
+    single = len(folders) == 1 and len(prefixes) == 1
+    pattern = (
+        f"{next(iter(folders)) + '/' if next(iter(folders)) else ''}{next(iter(prefixes))}.*"
+        if single else f"tests named like {sources}"
+    )
+    lines = [
+        f"{len(family)} test files are named like {sources}{f' ({pattern})' if single else ''}. "
+        "They are paired by file name only; their contents were not all read.",
+        "Files: " + ", ".join(family[:80]) + (f", and {len(family) - 80} more" if len(family) > 80 else ""),
+    ]
+    return {
+        "id": f"test-listing:{pattern}:{sources}",
+        "file_path": pattern,
+        "start_line": 1,
+        "end_line": len(lines),
+        "language": "text",
+        "symbols": [],
+        "content": "\n".join(lines),
+        "_synthetic": "test_file_listing",
+    }
 
 
 _LOCALE_PATH = re.compile(r"(?:^|/)(?:locales?|i18n|l10n|translations|lang)/")
@@ -1578,12 +1680,15 @@ def is_doc_path(file_path: str) -> bool:
 
 # "Library code (not tests or docs)" names tests and docs only to exclude
 # them. A negated mention must neither lift the test/doc demotion nor count
-# as a request for that evidence. "Not tested" and "has no tests" are about
-# test coverage, so they are deliberately not negations here.
+# as a request for that evidence. Only explicit exclusion wording counts.
+# "Not tested", "has no tests", "ships without tests", "without test
+# coverage", "pytest ignores tests in X" and "how do I skip tests" are about
+# tests, so "without", "ignore" and "skip" exclude only in phrases such as
+# "without looking at the tests".
 _SCOPE_WORD = r"(?:tests?|test\s+files?|test\s+code|specs?|docs?|documentation|examples?|fixtures?)"
 NEGATED_SCOPE_PATTERN = re.compile(
-    r"(?:\b(?:not|excluding|exclude|without|except|ignore|ignoring|skip|skipping|outside(?:\s+of)?|"
-    r"other\s+than|rather\s+than|instead\s+of)\s+|\bnon-?)"
+    r"(?:\b(?:not|excluding|exclude|except|outside(?:\s+of)?|other\s+than|rather\s+than|instead\s+of|"
+    r"without\s+(?:looking\s+(?:at|in(?:to)?)|reading|counting|including|considering|searching|opening))\s+|\bnon-?)"
     rf"(?:(?:the|any|in|from)\s+)?{_SCOPE_WORD}\b"
     rf"(?:\s*(?:,|/|\bor\b|\band\b|\bnor\b)\s*(?:the\s+)?{_SCOPE_WORD}\b)*",
     re.IGNORECASE,
@@ -1604,12 +1709,21 @@ def question_wants_docs(query: str) -> bool:
 
 
 def question_excludes_tests(query: str) -> bool:
-    """The question explicitly rules out tests ("not tests", "excluding specs")."""
-    return bool(re.search(r"\b(?:tests?|test\s+files?|test\s+code|specs?|fixtures?)\b", _negated_scopes(query), re.IGNORECASE))
+    """The question explicitly rules out tests ("not tests", "excluding specs").
+
+    A question that also asks about tests or coverage ("which code outside
+    the tests has no test coverage?") needs that evidence, so a request
+    always wins over an exclusion.
+    """
+    return bool(
+        re.search(r"\b(?:tests?|test\s+files?|test\s+code|specs?|fixtures?)\b", _negated_scopes(query), re.IGNORECASE)
+    ) and not question_wants_tests(query)
 
 
 def question_excludes_docs(query: str) -> bool:
-    return bool(re.search(r"\b(?:docs?|documentation)\b", _negated_scopes(query), re.IGNORECASE))
+    return bool(
+        re.search(r"\b(?:docs?|documentation)\b", _negated_scopes(query), re.IGNORECASE)
+    ) and not question_wants_docs(query)
 
 
 def _path_noise_penalties(query: str) -> list[tuple[re.Pattern, float]]:
@@ -1873,6 +1987,9 @@ async def symbol_definition_chunks(
             rf"\b(?:{_KIND_DECLARATIONS[kind]})\s+\"?{re.escape(name)}\b", re.IGNORECASE,
         ) if kind in _KIND_DECLARATIONS else None
         matches: list[tuple[tuple, Dict]] = []
+        # Members credited to the owner whose ``class Owner`` line is above
+        # their section: (index in ``matches``, path, owner line, section start).
+        unverified: list[tuple[int, str, int, int]] = []
         seen: set[str] = set()
         for row in exclude_staged(candidates, staging_prefix):
             chunk_id = str(row.get("id") or "")
@@ -1900,11 +2017,20 @@ async def symbol_definition_chunks(
                 offset = content[: (qualified_match or declaration_match).start()].count("\n")
             if qualified_match:
                 owner_rank = 0
-            elif owner and declaration_match:
-                line = int(row.get("start_line") or 0) + offset
-                preceding = [start for start in owner_lines.get(path, []) if start <= line]
+            elif owner and declaration_match and _can_be_member(declaration_match.group(0), content, offset):
+                # A member belongs to the nearest ``class Owner`` above it only
+                # when no other type is declared in between (``AsyncClient.send``
+                # is not ``Client.send``).
+                start = int(row.get("start_line") or 0)
+                line = start + offset
+                preceding = [entry for entry in owner_lines.get(path, []) if entry[0] <= line]
                 if preceding:
-                    owner_rank, owner_distance = 0, line - max(preceding)
+                    owner_line, owner_indent = max(preceding)
+                    shown_between = content.split("\n")[max(0, owner_line - start + 1): offset]
+                    if not _other_type_declared(shown_between, owner, owner_indent):
+                        owner_rank, owner_distance = 0, line - owner_line
+                        if owner_line < start:
+                            unverified.append((len(matches), path, owner_line, start))
             quality = (
                 1 if noisy else 0,
                 owner_rank,
@@ -1917,6 +2043,20 @@ async def symbol_definition_chunks(
                 offset,
             )
             matches.append((quality, row))
+        if unverified:
+            interrupted = await _types_declared_between(
+                store, repo_id, [(path, after, before) for _, path, after, before in unverified], owner,
+                staging_prefix=staging_prefix,
+            )
+            for index, path, after, before in unverified:
+                if (path, after, before) in interrupted:
+                    quality, row = matches[index]
+                    matches[index] = ((quality[0], 1, 0, *quality[3:]), row)
+        # Once the owner's own member is found, a same-named declaration
+        # elsewhere (``var redirect = express()`` in an example) is not shown
+        # as the definition the question asks for.
+        if any(quality[1] == 0 and not quality[0] for quality, _ in matches):
+            matches = [(quality, row) for quality, row in matches if quality[1] == 0]
         matches.sort(key=lambda item: (item[0], str(item[1].get("file_path")), int(item[1].get("start_line") or 0)))
         for quality, row in matches[: max(1, limit_per_symbol)]:
             enriched = dict(row)
@@ -1925,22 +2065,106 @@ async def symbol_definition_chunks(
     return list(found.values())
 
 
-def _owner_declaration_lines(rows: list[Dict], owner: str) -> dict[str, list[int]]:
-    """Line numbers of ``class Owner`` (or ``Owner = ...`` objects) per file."""
+def _owner_declaration_lines(rows: list[Dict], owner: str) -> dict[str, list[tuple[int, int]]]:
+    """``(line, indentation)`` of ``class Owner`` (or ``Owner = ...`` objects) per file."""
     pattern = re.compile(
-        rf"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(?:class|interface|struct|object|trait)\s+{re.escape(owner)}\b|"
-        rf"^\s*(?:export\s+)?(?:const|let|var)\s+{re.escape(owner)}\s*=",
+        rf"^([ \t]*)(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(?:class|interface|struct|object|trait)\s+{re.escape(owner)}\b|"
+        rf"^([ \t]*)(?:export\s+)?(?:const|let|var)\s+{re.escape(owner)}\s*=",
         re.MULTILINE,
     )
-    lines: dict[str, list[int]] = defaultdict(list)
+    lines: dict[str, list[tuple[int, int]]] = defaultdict(list)
     for row in rows:
         content = str(row.get("content") or "")
         for match in pattern.finditer(content):
-            line = int(row.get("start_line") or 0) + content[: match.start()].count("\n")
+            entry = (
+                int(row.get("start_line") or 0) + content[: match.start()].count("\n"),
+                len(match.group(1) if match.group(1) is not None else match.group(2) or ""),
+            )
             path = str(row.get("file_path") or "")
-            if line not in lines[path]:
-                lines[path].append(line)
+            if entry not in lines[path]:
+                lines[path].append(entry)
     return lines
+
+
+# A type declaration line: ``class AsyncClient(BaseClient):``,
+# ``export default class Router {``, ``pub struct Point``.
+_TYPE_DECLARATION_LINE = re.compile(
+    r"^(?P<indent>[ \t]*)(?:export\s+)?(?:default\s+)?"
+    r"(?:(?:public|private|internal|abstract|final|sealed|data|open|pub)\s+)*"
+    r"(?:class|interface|struct|object|trait|enum)\s+(?P<name>[A-Za-z_$][\w$]*)",
+    re.MULTILINE,
+)
+# Openings of a type declared at column 0, for a cheap SQL pre-filter
+# (``instr`` on the content with a newline prepended).
+_COLUMN0_TYPE_OPENINGS = (
+    "class ", "export class ", "export default class ", "abstract class ", "export abstract class ",
+    "interface ", "export interface ", "struct ", "pub struct ", "object ", "trait ", "enum ", "export enum ",
+    "public class ", "data class ",
+)
+
+
+def _can_be_member(declaration: str, content: str, offset: int) -> bool:
+    """Whether a declaration can be a member of a class or object: it is
+    indented, and it is not a local ``const``/``let``/``var`` variable."""
+    lines = content.split("\n")
+    line = lines[offset] if 0 <= offset < len(lines) else ""
+    indented = len(line) - len(line.lstrip(" \t")) > 0
+    return indented and not re.match(r"(?:const|let|var)\b", declaration.lstrip())
+
+
+def _other_type_declared(lines: list[str], owner: str, owner_indent: int) -> bool:
+    """Whether ``lines`` declare a type other than ``owner`` at the owner's
+    indentation or less, which ends the owner's body."""
+    for line in lines:
+        match = _TYPE_DECLARATION_LINE.match(line)
+        if match and match.group("name") != owner and len(match.group("indent")) <= owner_indent:
+            return True
+    return False
+
+
+async def _types_declared_between(
+    store,
+    repo_id: str,
+    spans: list[tuple[str, int, int]],
+    owner: str,
+    *,
+    staging_prefix: str | None = None,
+) -> set[tuple[str, int, int]]:
+    """The ``(path, after, before)`` spans in which a type other than
+    ``owner`` is declared at column 0 strictly between the two lines.
+
+    One bounded query over the sections of those files that open a type at
+    column 0 (``class AsyncClient`` between ``class Client`` and a ``send``
+    further down the file).
+    """
+    spans = list(dict.fromkeys(spans))[:8]
+    if not spans:
+        return set()
+    staging_filter, staging_args = ("", []) if not staging_prefix else (" AND id NOT LIKE ?", [f"{staging_prefix}%"])
+    try:
+        rows = await store.fetch_all(
+            "SELECT file_path, start_line, content FROM chunks WHERE repo_id = ? AND ("
+            + " OR ".join("(file_path = ? AND end_line > ? AND start_line < ?)" for _ in spans)
+            + ") AND (" + " OR ".join("instr(char(10) || content, ?) > 0" for _ in _COLUMN0_TYPE_OPENINGS)
+            + f"){staging_filter} LIMIT 30",
+            [repo_id, *(value for span in spans for value in span), *("\n" + opening for opening in _COLUMN0_TYPE_OPENINGS),
+             *staging_args],
+        )
+    except Exception as error:
+        logger.debug("Type declaration lookup unavailable (%s)", type(error).__name__)
+        return set()
+    declared: dict[str, list[int]] = defaultdict(list)
+    for row in exclude_staged(rows, staging_prefix):
+        content = str(row.get("content") or "")
+        for match in _TYPE_DECLARATION_LINE.finditer(content):
+            if not match.group("indent") and match.group("name") != owner:
+                declared[str(row.get("file_path") or "")].append(
+                    int(row.get("start_line") or 0) + content[: match.start()].count("\n")
+                )
+    return {
+        (path, after, before) for path, after, before in spans
+        if any(after < line < before for line in declared.get(path, []))
+    }
 
 
 async def symbol_call_sites(
@@ -1999,9 +2223,14 @@ async def symbol_call_sites(
     return ordered[:limit]
 
 
+# A bare "formatter" is ordinary code (click's HelpFormatter, a logging
+# formatter); only a code formatter, formatting the code, or running a
+# formatter or type checker is tooling.
 TOOLING_QUESTION_PATTERN = re.compile(
     r"\b(?:run|running|execute)\b[^.?!]{0,40}\b(?:tests?|specs?|suite|lint(?:er)?|linting|build|locally)\b|"
-    r"\b(?:lint|linter|linters|linting|eslint|prettier|ruff|flake8|pylint|formatter)\b|"
+    r"\b(?:run|running|execute)\s+(?:the\s+|a\s+)?(?:code\s+)?(?:formatters?|black|isort|mypy|pyright|tsc)\b|"
+    r"\b(?:lint|linter|linters|linting|eslint|prettier|ruff|flake8|pylint)\b|"
+    r"\b(?:code|source|auto)[\s-]?formatt(?:er|ers|ing)\b|\bformat(?:ting)?\s+(?:the\s+|my\s+|our\s+)?(?:code|sources?)\b|"
     r"\b(?:npm|yarn|pnpm|poetry|tox|nox)\b|"
     r"\b(?:install|set\s*up|setup)\b[^.?!]{0,30}\b(?:locally|dev(?:elopment)?|dependencies)\b",
     re.IGNORECASE,
@@ -2353,10 +2582,11 @@ async def _named_file_evidence(
     if wants_tests:
         jobs["tests"] = paired_test_chunks(
             store, repo_id, actual_paths, names, focus.get("qualified") or [], limit=3, staging_prefix=staging_prefix,
+            terms=focus.get("terms") or [],
         )
     if names and USAGE_QUESTION_PATTERN.search(query):
         jobs["callers"] = symbol_call_sites(store, repo_id, names[:2], limit=6, staging_prefix=staging_prefix)
-    if is_impact_question(query):
+    if is_impact_question(query) or IMPORTER_QUESTION_PATTERN.search(query):
         jobs["importers"] = importer_windows(
             store, repo_id, actual_paths, limit=4, include_tests=wants_tests, staging_prefix=staging_prefix,
         )
@@ -2370,8 +2600,17 @@ async def _named_file_evidence(
     companions: list[Dict] = []
     named = ", ".join(actual_paths[:2])
     for row in results.get("tests", []):
+        if row.get("_synthetic"):
+            listing = _companion(row, "paired_test", f"Generated list of the test files named like {named}", evidence_plan)
+            listing["_synthetic"] = row["_synthetic"]
+            companions.append(listing)
+            continue
         subject = ", ".join(f"`{owner}.{member}`" for owner, member in focus.get("qualified") or []) or named
-        companions.append(_companion(row, "paired_test", f"Test file paired by name with {subject}", evidence_plan))
+        reason = (
+            f"One of the test files named like {named} (see the list), chosen because its name matches the question"
+            if row.get("_pairing_tier") == 1 else f"Test file paired by name with {subject}"
+        )
+        companions.append(_companion(row, "paired_test", reason, evidence_plan))
     wants_docs = bool(evidence_plan.get("docs_requested")) and not evidence_plan.get("docs_excluded")
     for row in results.get("callers", []):
         path = str(row.get("file_path") or "")

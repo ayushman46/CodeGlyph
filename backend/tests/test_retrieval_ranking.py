@@ -82,6 +82,9 @@ def windowed_file(path, special, total, size=150, overlap=40):
 
 
 HTTPX_CLIENT = windowed_file("httpx/_client.py", {
+    2: "import typing",
+    # Words a reading instruction or a substring would wrongly match.
+    470: '        """Explain why the stream must stop here."""',
     188: "class BaseClient:",
     594: "class Client(BaseClient):",
     979: "            response = self._send_single_request(request)",
@@ -152,6 +155,65 @@ class QuestionAnalysisTests(unittest.TestCase):
             self.assertTrue(question_wants_tests(question), question)
             self.assertFalse(question_excludes_tests(question), question)
 
+    def test_coverage_wording_is_not_an_exclusion(self):
+        """Review finding: "without tests" and "ignore tests" removed every test from coverage questions."""
+        for question in (
+            "Is res.redirect covered by tests or does it ship without tests?",
+            "Which helpers are without test coverage?",
+            "Why does pytest ignore tests in the testing folder?",
+            "How do I skip tests that need the network?",
+            # A request wins over an exclusion in the same question.
+            "Which library code (not tests) has no test coverage?",
+        ):
+            plan = build_evidence_plan(question)
+            self.assertEqual((plan["tests_requested"], plan["tests_excluded"]), (True, False), question)
+        self.assertIn("tests", search_terms("Is res.redirect covered by tests or does it ship without tests?"))
+        # Explicit exclusion wording still excludes.
+        for question in ("Without looking at the tests, where is the timeout applied?",
+                         "Where is the timeout applied, excluding tests?",
+                         "Which code other than the tests reads the timeout?"):
+            self.assertTrue(question_excludes_tests(question), question)
+            self.assertFalse(question_wants_tests(question), question)
+
+    def test_a_bare_formatter_is_code_not_tooling(self):
+        """Review finding: "help formatter" made pyproject.toml the top source."""
+        tooling = retriever.TOOLING_QUESTION_PATTERN
+        for question in ("How does the help formatter wrap long option descriptions?",
+                         "Where is the default logging formatter configured?",
+                         "Which HelpFormatter method writes the usage line?",
+                         "When I run the CLI, how does the help formatter wrap text?"):
+            self.assertIsNone(tooling.search(question), question)
+        for question in ("Which code formatter does the project use?", "How do I format the code before committing?",
+                         "What lint or style rules does the project enforce?", "How do I run the tests locally?",
+                         "How do I run black?", "How do I run the formatter?"):
+            self.assertIsNotNone(tooling.search(question), question)
+
+    def test_instruction_words_are_dropped_only_where_they_instruct(self):
+        """Review finding: "trace" is an httpx extension; a global stopword hid it."""
+        self.assertIn("trace", search_terms("How does the trace extension work in httpx?"))
+        self.assertIn("report", search_terms("Where is the coverage report generated?"))
+        self.assertIn("find", search_terms("Where is db.find defined?"))
+        self.assertIn("find", search_terms("Where is the cache checked? find() is slow"))
+        terms = search_terms(
+            "Trace the call path from httpx.Client.get down to the point where the request bytes are actually sent. "
+            "List each function in order. Can you find the retry?"
+        )
+        for instruction in ("trace", "list", "point", "find"):
+            self.assertNotIn(instruction, terms)
+        self.assertNotIn("report", search_terms("Bug report: prepare() fails with files"))
+        self.assertNotIn("place", search_terms("Find every place that reads the timeout"))
+
+    def test_importer_questions_are_recognised(self):
+        """Review finding: "What imports X?" got no importers although the docs promised them."""
+        pattern = retriever.IMPORTER_QUESTION_PATTERN
+        for question in ("What imports httpx/_client.py?", "Which modules import httpx/_client.py?",
+                         "Who uses lib/router/index.js?", "Where is httpx/_client.py imported?",
+                         "Is src/flask/app.py imported by anything else?"):
+            self.assertIsNotNone(pattern.search(question), question)
+        for question in ("What does httpx/_client.py import?", "What are the imports at the top of httpx/_client.py?",
+                         "Which imports in src/flask/app.py are unused?"):
+            self.assertIsNone(pattern.search(question), question)
+
     def test_code_style_and_citation_wording_select_no_path_family(self):
         lint = "How do I run a single test file locally, and what lint or style rules does the project enforce?"
         self.assertEqual(extract_question_path_hints(lint), [])
@@ -173,8 +235,26 @@ class NamedFileSectionTests(unittest.TestCase):
         self.assertIn("Defines `_send_single_request`, named in the question", top[0]["_retrieval_reasons"])
 
     def test_a_question_without_focus_keeps_line_order(self):
-        ranked = rank_file_sections(HTTPX_CLIENT, question_focus("Explain httpx/_client.py", ["httpx/_client.py"]))
+        # The fixture says "Explain ... stop" at line 470: reading
+        # instructions are not focus words, so the file is read from the top.
+        focus = question_focus("Explain httpx/_client.py", ["httpx/_client.py"])
+        self.assertEqual((focus["names"], focus["terms"]), ([], []))
+        for question in ("Give me a tour of httpx/_client.py", "Summarize httpx/_client.py for a new engineer",
+                         "Can you help me understand httpx/_client.py?"):
+            self.assertEqual(question_focus(question, ["httpx/_client.py"])["terms"], [], question)
+        ranked = rank_file_sections(HTTPX_CLIENT, focus)
         self.assertEqual([item["start_line"] for item in ranked[:3]], [1, 111, 221])
+
+    def test_question_words_match_whole_words(self):
+        """Review finding: "top" matched ``stop`` and "explain" matched a docstring."""
+        focus = question_focus("What are the imports at the top of httpx/_client.py?", ["httpx/_client.py"])
+        self.assertEqual(focus["terms"], ["imports"])
+        ranked = rank_file_sections(HTTPX_CLIENT, focus)
+        self.assertEqual(ranked[0]["start_line"], 1)  # "import typing"; "imports" matches ``import``
+        stop = chunk("a.py", 1, "    stop_here = True")
+        top = chunk("a.py", 50, "    # the top of the stream")
+        ranked = rank_file_sections([stop, top], {"names": [], "qualified": [], "terms": ["top"]})
+        self.assertEqual([item["start_line"] for item in ranked], [50, 1])
 
     def test_relevant_overlaps_merge_and_filler_overlap_is_trimmed(self):
         def section(start, end, score, named):
@@ -186,6 +266,19 @@ class NamedFileSectionTests(unittest.TestCase):
         # The two relevant windows merge; the filler keeps only its new lines.
         self.assertEqual(spans, [(100, 359), (360, 469), (1, 99)])
         self.assertEqual(leading[1]["content"].split("\n")[0], "line 360")
+
+    def test_a_later_merge_never_shows_lines_twice(self):
+        """1-150 merges with 111-260 after 221-370 was chosen; 221-370 keeps only 261-330."""
+        def section(start, end, score):
+            item = chunk("a.js", start, "\n".join(f"line {n}" for n in range(start, end + 1)))
+            return {**item, "_section_score": score, "_section_named": True}
+        ranked = [section(1, 150, 10), section(441, 590, 8), section(221, 370, 7.5), section(331, 480, 7.25),
+                  section(111, 260, 4)]
+        leading, rest = select_named_sections(ranked, per_file_limit=8, leading_per_file=3)
+        spans = [(item["start_line"], item["end_line"]) for item in [*leading, *rest]]
+        self.assertEqual(spans, [(1, 260), (331, 590), (261, 330)])
+        shown = [line for item in [*leading, *rest] for line in item["content"].split("\n")]
+        self.assertEqual(len(shown), len(set(shown)))
 
     def test_each_named_file_leads_with_its_best_section(self):
         first = [{**chunk("a.py", n, f"a {n}"), "_section_score": 10 - n, "_section_named": False} for n in (1, 3, 5)]
@@ -228,6 +321,26 @@ class NamedFileSectionTests(unittest.TestCase):
         self.assertEqual(imports[0]["_retrieval_methods"], ["dependency"])
         # The best sections of the named file come first.
         self.assertTrue(covers(result[0], "httpx/_client.py", 1001))
+
+    def test_which_modules_import_a_named_file_adds_their_import_lines(self):
+        """Review finding: without "if I change" or "depends", importers were never looked up."""
+        api = chunk("httpx/_api.py", 1, "import typing\n\nfrom ._client import Client\nx = 1")
+        dependency_row = {**api, "source_file": "httpx/_api.py", "target_file": "httpx/_client.py", "line_number": 3}
+        for question in ("Which modules import httpx/_client.py?", "What imports httpx/_client.py?"):
+            store = FakeStore([
+                ("FROM repo_dependencies d JOIN chunks c", [dependency_row]),
+                ("AS focus_score FROM chunks", HTTPX_CLIENT),
+            ])
+            with patch.object(retriever, "embed_query", side_effect=EmbeddingUnavailableError("offline")):
+                result = run(retriever.retrieve_context(store, "r", question, top_k=8))
+            imports = [item for item in result if item["file_path"] == "httpx/_api.py"]
+            self.assertEqual([(item["start_line"], item["content"]) for item in imports], [(3, "from ._client import Client")])
+            self.assertTrue(covers(result[0], "httpx/_client.py", 2))  # "import" lines lead the named file
+        # The file's own imports are not a question about its importers.
+        store = FakeStore([("AS focus_score FROM chunks", HTTPX_CLIENT)])
+        with patch.object(retriever, "embed_query", side_effect=EmbeddingUnavailableError("offline")):
+            run(retriever.retrieve_context(store, "r", "What does httpx/_client.py import?", top_k=8))
+        self.assertFalse(any("repo_dependencies" in sql for sql, _ in store.executed))
 
     def test_usage_question_adds_callers_from_other_files(self):
         app = chunk("src/flask/app.py", 1260, "class Flask:\n    def make_response(self, rv):\n        return rv",
@@ -281,6 +394,39 @@ class NamedFileSectionTests(unittest.TestCase):
         paired = [item["file_path"] for item in result if item["_retrieval_methods"] == ["paired_test"]]
         self.assertEqual(sorted(paired), ["test/res.location.js", "test/res.redirect.js"])
 
+    def test_an_abbreviated_test_family_is_listed_not_sampled(self):
+        """Review finding: two alphabetical test/res.*.js files were presented as the tests of response.js."""
+        from api.query_router import build_citations, build_context_with_coverage
+
+        response = chunk("lib/response.js", 1, "var res = Object.create(http.ServerResponse.prototype);")
+        family = ["test/res.append.js", "test/res.attachment.js", "test/res.cookie.js", "test/res.send.js"]
+        store = FakeStore([
+            ("SELECT DISTINCT file_path FROM chunks", [{"file_path": path} for path in family]),
+            ("SELECT DISTINCT source_file", []),
+            ("AS focus_score FROM chunks", [response]),
+            ("AND file_path IN (", lambda sql, args: [chunk(path, 1, "describe('res')") for path in args if path in family]),
+        ])
+        with patch.object(retriever, "embed_query", side_effect=EmbeddingUnavailableError("offline")):
+            result = run(retriever.retrieve_context(store, "r", "Which tests cover lib/response.js?", top_k=8))
+        listing = [item for item in result if item.get("_synthetic")]
+        self.assertEqual(len(listing), 1)
+        self.assertEqual(listing[0]["file_path"], "test/res.*")
+        self.assertIn("4 test files are named like lib/response.js", listing[0]["content"])
+        self.assertIn(", ".join(family), listing[0]["content"])
+        # No member is passed off as "the" test file of response.js.
+        self.assertFalse(any(item["file_path"] in family for item in result))
+        text, shown = build_context_with_coverage(result)
+        self.assertIn("Generated test file listing for test/res.*", text)
+        self.assertNotIn("test/res.*", [item["file_path"] for item in build_citations(shown, {"repo_name": "express"})])
+
+        # A member whose name matches the question is shown, labelled as one of the family.
+        store.executed.clear()
+        with patch.object(retriever, "embed_query", side_effect=EmbeddingUnavailableError("offline")):
+            result = run(retriever.retrieve_context(store, "r", "Which tests cover the cookie code in lib/response.js?", top_k=8))
+        members = [item for item in result if item["file_path"] in family]
+        self.assertEqual([item["file_path"] for item in members], ["test/res.cookie.js"])
+        self.assertIn("One of the test files named like lib/response.js", members[0]["_retrieval_reasons"][0])
+
     def test_plain_named_file_request_is_still_one_round_trip(self):
         store = FakeStore([("AS focus_score FROM chunks", HTTPX_CLIENT[:2])])
         with patch.object(retriever, "embed_query", side_effect=EmbeddingUnavailableError("offline")):
@@ -313,8 +459,22 @@ class TestPairingTests(unittest.TestCase):
         ])
         rows = run(retriever.paired_test_chunks(store, "r", ["lib/response.js"], [], [("res", "redirect")]))
         self.assertEqual([row["file_path"] for row in rows], ["test/res.redirect.js"])
+        # The abbreviation tier used to return the first two files in
+        # alphabetical order as "the" tests; it now lists the whole family
+        # (test code only) and shows members only when their name matches.
         rows = run(retriever.paired_test_chunks(store, "r", ["lib/response.js"], [], []))
-        self.assertEqual([row["file_path"] for row in rows], ["test/res.append.js", "test/res.redirect.js"])
+        self.assertEqual([(row["file_path"], row.get("_synthetic")) for row in rows], [("test/res.*", "test_file_listing")])
+        self.assertIn("Files: test/res.append.js, test/res.redirect.js, test/res.send.js", rows[0]["content"])
+        rows = run(retriever.paired_test_chunks(store, "r", ["lib/response.js"], [], [], terms=["send", "body"]))
+        self.assertEqual([row["file_path"] for row in rows], ["test/res.*", "test/res.send.js"])
+        # "res" is in every member's name, so it picks none of them out.
+        rows = run(retriever.paired_test_chunks(store, "r", ["lib/response.js"], [], [], terms=["res", "methods"]))
+        self.assertEqual([row["file_path"] for row in rows], ["test/res.*"])
+
+    def test_a_family_in_several_folders_is_listed_by_its_source(self):
+        listing = retriever._test_family_listing(["test/res.send.js", "test/unit/resp.body.js"], ["lib/response.js"])
+        self.assertEqual(listing["file_path"], "tests named like lib/response.js")
+        self.assertTrue(listing["content"].startswith("2 test files are named like lib/response.js. They are paired"))
 
 
 class QualifiedDefinitionTests(unittest.TestCase):
@@ -341,6 +501,50 @@ class QualifiedDefinitionTests(unittest.TestCase):
         rows = run(retriever.symbol_definition_chunks(store, "r", ["redirect"], owners={"redirect": "res"}))
         self.assertEqual(rows[0]["file_path"], "lib/response.js")
         self.assertEqual(rows[0]["_defined_symbol"], "res.redirect")
+
+    def test_a_same_named_variable_is_not_the_owners_member(self):
+        """Review finding: ``var redirect = express()`` in an example was shown first as "Defines `redirect`"."""
+        example = chunk("examples/vhost/index.js", 1, "var express = require('../..');\nvar redirect = express();",
+                        symbols=["redirect"])
+        redirect = chunk("lib/response.js", 815, "res.redirect = function redirect(url) {\n  this.location(url);\n};")
+        store = FakeStore([("chunks_fts MATCH", [example, redirect]), ("symbols LIKE", [example])])
+        rows = run(retriever.symbol_definition_chunks(store, "r", ["redirect"], owners={"redirect": "res"}))
+        self.assertEqual([(row["file_path"], row["_defined_symbol"]) for row in rows], [("lib/response.js", "res.redirect")])
+        # Without the owner's member, the variable is still a definition of the plain name.
+        store = FakeStore([("chunks_fts MATCH", [example])])
+        rows = run(retriever.symbol_definition_chunks(store, "r", ["redirect"], owners={"redirect": "res"}))
+        self.assertEqual([row["_defined_symbol"] for row in rows], ["redirect"])
+
+    def test_a_class_declared_in_between_ends_the_owner(self):
+        """Review finding: AsyncClient.send was labelled ``Client.send``."""
+        client = chunk("httpx/_client.py", 594, "class Client(BaseClient):\n    pass", symbols=["Client"])
+        client_send = chunk("httpx/_client.py", 814, "\n" * 65 + "    def send(self, request):\n        pass",
+                            symbols=["send"])
+        async_send = chunk("httpx/_client.py", 1527, "\n" * 67 + "    async def send(self, request):\n        pass",
+                           symbols=["send"])
+        async_client = chunk("httpx/_client.py", 1307, "class AsyncClient(BaseClient):\n    pass", symbols=["AsyncClient"])
+        store = FakeStore([
+            ("LIMIT 20", [client]),
+            ("instr(char(10) || content", [client, async_client]),
+            ("AND file_path IN (SELECT file_path", [client_send, async_send]),
+            ("symbols LIKE", [async_send, client_send]),
+        ])
+        rows = run(retriever.symbol_definition_chunks(store, "r", ["send"], owners={"send": "Client"}))
+        self.assertEqual([(row["start_line"], row["_defined_symbol"]) for row in rows], [(814, "Client.send")])
+        # One query checks the lines between ``class Client`` and both sections.
+        sql, args = next(item for item in store.executed if "instr(char(10) || content" in item[0])
+        self.assertEqual({tuple(args[index:index + 3]) for index in (1, 4)},
+                         {("httpx/_client.py", 594, 814), ("httpx/_client.py", 594, 1527)})
+
+    def test_a_class_shown_above_the_member_decides_its_owner(self):
+        async_section = chunk("httpx/_client.py", 1307, "class AsyncClient(BaseClient):\n    async def send(self):\n        pass",
+                              symbols=["AsyncClient", "send"])
+        client = chunk("httpx/_client.py", 594, "class Client(BaseClient):\n    pass", symbols=["Client"])
+        store = FakeStore([("LIMIT 20", [client]), ("symbols LIKE", [async_section])])
+        rows = run(retriever.symbol_definition_chunks(store, "r", ["send"], owners={"send": "Client"}))
+        self.assertEqual([row["_defined_symbol"] for row in rows], ["send"])  # not "Client.send"
+        # The type check needed no extra query: the section shows the class.
+        self.assertFalse(any("instr(char(10) || content" in sql for sql, _ in store.executed))
 
     def test_symbol_evidence_is_not_capped_per_file(self):
         def item(start, method):
