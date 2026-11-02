@@ -91,6 +91,7 @@ const InvitePage = () => {
   }
 
   const hasAccess = invite.status === 'owner' || invite.status === 'member';
+  const shownRole = invite.status === 'member' && invite.access_role ? invite.access_role : invite.role;
   return (
     <Shell>
       <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-accent-soft text-accent-strong"><Users className="h-5 w-5" aria-hidden="true" /></span>
@@ -103,9 +104,14 @@ const InvitePage = () => {
           <div className="flex gap-2"><dt className="w-24 shrink-0 text-ink-3">Repository</dt><dd className="min-w-0 truncate font-mono text-ink">{invite.full_name}</dd></div>
         )}
         <div className="flex gap-2"><dt className="w-24 shrink-0 text-ink-3">Shared by</dt><dd className="min-w-0 truncate text-ink">{invite.owner_label || 'A teammate'}</dd></div>
+        {/* Someone who already has access sees their role, not the link's (they differed after a role change). */}
         <div className="flex items-center gap-2">
-          <dt className="w-24 shrink-0 text-ink-3">Access</dt>
-          <dd><Badge tone={invite.role === 'editor' ? 'accent' : 'neutral'}>{ROLE_LABELS[invite.role]}</Badge></dd>
+          <dt className="w-24 shrink-0 text-ink-3">{hasAccess ? 'Your access' : 'Access'}</dt>
+          <dd>
+            {invite.status === 'owner'
+              ? <Badge tone="accent">Owner</Badge>
+              : <Badge tone={shownRole === 'editor' ? 'accent' : 'neutral'}>{ROLE_LABELS[shownRole]}</Badge>}
+          </dd>
         </div>
       </dl>
       {hasAccess ? (
