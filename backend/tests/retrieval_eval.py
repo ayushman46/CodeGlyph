@@ -27,7 +27,9 @@ BACKEND = Path(__file__).resolve().parent.parent
 
 # (target path, line) means a shown source of that file covers the line;
 # (target path, None) means any section of that file is shown. ``avoid`` is a
-# path regex with the most matching sources that are acceptable.
+# path regex with the most matching sources that are acceptable. ``first`` is
+# a target the first shown source must cover (a named file read from the top);
+# ``absent`` lists targets no shown source may cover (a wrong definition).
 CASES = [
     {
         "id": "BUG-04 httpx signature change",
@@ -135,6 +137,81 @@ CASES = [
         "question": "How does ky decide whether to retry a failed request?",
         "expect": [("source/core/Ky.ts", 708)],
     },
+    # Review regressions: wording that must not exclude tests, pull root
+    # manifests, skip importers, mislabel definitions, or reorder a file.
+    {
+        "id": "review: coverage wording keeps tests (express)",
+        "user": "sim-onboard", "repo": "express", "workflow": "general",
+        "question": "Is res.redirect covered by tests or does it ship without tests?",
+        "expect": [("test/res.redirect.js", None), ("lib/response.js", 815)],
+    },
+    {
+        "id": "review: coverage wording keeps tests (requests)",
+        "user": "sim-maint", "repo": "requests", "workflow": "general",
+        "question": "Which helpers in requests utils are without test coverage?",
+        "expect": [("tests/test_utils.py", None)],
+    },
+    {
+        "id": "review: pytest ignore wording keeps tests",
+        "user": "sim-first", "repo": "click", "workflow": "general",
+        "question": "Why does pytest ignore tests in the testing folder?",
+        "expect": [("tests/conftest.py", None)],
+    },
+    {
+        "id": "review: help formatter is code, not tooling",
+        "user": "sim-first", "repo": "click", "workflow": "general",
+        "question": "How does the help formatter wrap long option descriptions?",
+        "expect": [("src/click/formatting.py", 31)],
+        "avoid": (r"(?:^|/)pyproject\.toml$", 0),
+    },
+    {
+        "id": "review: logging formatter is code, not tooling",
+        "user": "sim-lead", "repo": "flask", "workflow": "general",
+        "question": "Where is the default logging formatter configured?",
+        "expect": [("src/flask/logging.py", 54)],
+        "avoid": (r"(?:^|/)pyproject\.toml$", 0),
+    },
+    {
+        "id": "review: which modules import a named file",
+        "user": "sim-dev", "repo": "httpx", "workflow": "general",
+        "question": "Which modules import httpx/_client.py?",
+        "expect": [("httpx/__init__.py", 4), ("httpx/_api.py", 6), ("httpx/_main.py", 17)],
+    },
+    {
+        "id": "review: res.redirect definition, not var redirect",
+        "user": "sim-onboard", "repo": "express", "workflow": "general",
+        "question": "Where is res.redirect defined?",
+        "expect": [("lib/response.js", 815)],
+        "avoid": (r"^examples/", 0),
+    },
+    {
+        "id": "review: Client.send, not AsyncClient.send",
+        "user": "sim-dev", "repo": "httpx", "workflow": "general",
+        "question": "Where is Client.send defined?",
+        "expect": [("httpx/_client.py", 879)],
+        "first": ("httpx/_client.py", 879),
+        "absent": [("httpx/_client.py", 1594)],
+    },
+    {
+        "id": "review: explain a named file starts at the top",
+        "user": "sim-lead", "repo": "flask", "workflow": "general",
+        "question": "Explain src/flask/app.py",
+        "expect": [("src/flask/app.py", 1)],
+        "first": ("src/flask/app.py", 1),
+    },
+    {
+        "id": "review: imports at the top of a named file",
+        "user": "sim-dev", "repo": "httpx", "workflow": "general",
+        "question": "What are the imports at the top of httpx/_client.py?",
+        "expect": [("httpx/_client.py", 1)],
+        "first": ("httpx/_client.py", 1),
+    },
+    {
+        "id": "review: trace is a term, not a stopword",
+        "user": "sim-dev", "repo": "httpx", "workflow": "general",
+        "question": "How does the trace extension work in httpx?",
+        "expect": [("httpx/_main.py", 492)],
+    },
 ]
 
 
@@ -186,9 +263,16 @@ async def evaluate(database: str, only: str | None = None) -> dict:
                 pattern, allowed = case["avoid"]
                 avoid_count = sum(1 for source in sources if re.search(pattern, str(source["file_path"])))
                 avoid_ok = avoid_count <= allowed
+            first_ok = True
+            if case.get("first"):
+                first_ok = bool(sources) and _covers(sources[0], *case["first"])
+            first_ok = first_ok and not any(
+                _covers(source, path, line) for path, line in case.get("absent", []) for source in sources
+            )
             results.append({
                 "id": case["id"], "found": sum(hit["found"] for hit in hits), "total": len(hits),
-                "targets": hits, "avoid_ok": avoid_ok, "avoid_count": avoid_count, "sources": sources,
+                "targets": hits, "avoid_ok": avoid_ok and first_ok, "avoid_count": avoid_count, "first_ok": first_ok,
+                "sources": sources,
             })
     found = sum(result["found"] for result in results)
     total = sum(result["total"] for result in results)
@@ -221,7 +305,9 @@ def main() -> int:
     for result in report["results"]:
         status = "PASS" if result.get("found") == result.get("total") and result.get("avoid_ok", True) else "MISS"
         missing = [hit["target"] for hit in result.get("targets", []) if not hit["found"]]
-        extra = "" if result.get("avoid_ok", True) else f"  avoid-pattern sources: {result['avoid_count']}"
+        extra = "" if result.get("avoid_ok", True) else (
+            f"  avoid-pattern sources: {result['avoid_count']}" if result.get("first_ok", True) else "  wrong first or unwanted source"
+        )
         print(f"{status} {result['found']}/{result['total']}  {result['id']}"
               + (f"  missing: {', '.join(missing)}" if missing else "") + extra)
         if args.verbose:
