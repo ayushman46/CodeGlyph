@@ -725,6 +725,51 @@ class StreamingEndpointTests(EndpointTestCase):
         self.assertEqual((CountingLimiter.acquired, CountingLimiter.released), (1, 1))
         self.assertNotIn(USER, limiter._active)
 
+    def test_a_question_left_mid_answer_is_saved_with_what_was_written(self):
+        """A reload or closed tab mid-answer used to lose the question entirely."""
+        async def blocking_stream(*_args, **_kwargs):
+            yield "Sessions are "
+            await asyncio.Event().wait()
+
+        async def scenario():
+            response = await query_router.query_repo_stream(
+                QueryRequest(repo_name=REPO_NAME, question=QUESTION), SimpleNamespace(id=USER),
+            )
+            frames = []
+            iterator = response.body_iterator
+            while not any(frame.startswith("event: token") for frame in frames):
+                frames.append(await asyncio.wait_for(iterator.__anext__(), 5))
+            await iterator.aclose()
+            await response.background()
+
+        with patch("api.query_router.query_request_limiter", self.limiter), \
+             patch("api.query_router.retrieve_context", AsyncMock(return_value=[AUTH_CHUNK])), \
+             patch("api.query_router.stream_agent_answer", blocking_stream):
+            run(scenario())
+        rows = self.chat_rows()
+        self.assertEqual([(row["role"], row["mode"]) for row in rows], [("user", None), ("assistant", "partial")])
+        self.assertEqual(rows[0]["content"], QUESTION)
+        self.assertTrue(rows[1]["content"].startswith("Sessions are"))
+        self.assertIn("The answer was stopped here", rows[1]["content"])
+        self.assertEqual(rows[1]["citations"][0]["file_path"], AUTH_CHUNK["file_path"])
+        # Reloading shows the partial answer with its reason (the chat offers Try again).
+        history = self.client.get(f"/api/conversations/{REPO_NAME}").json()
+        answer = history["messages"][-1]
+        self.assertEqual(answer["mode"], "partial")
+        self.assertEqual(answer["answer_failure"]["reason"], "interrupted")
+        self.assertEqual(answer["answer_failure"]["cause"], "client")
+
+    def test_a_finished_or_failed_stream_is_not_saved_twice_and_edit_runs_are_not_saved_partially(self):
+        progress = query_router.StreamProgress()
+        progress.see("token", {"text": "x"})
+        progress.see("done", {})
+        request = QueryRequest(repo_name=REPO_NAME, question=QUESTION)
+        repo = {"id": REPO_ID}
+        run(query_router.save_interrupted_exchange(self.store, repo, request, USER, {}, progress))
+        editing = QueryRequest(repo_name=REPO_NAME, question="Rename the session helper", workflow="editing")
+        run(query_router.save_interrupted_exchange(self.store, repo, editing, USER, {}, query_router.StreamProgress()))
+        self.assertEqual(self.chat_rows(), [])
+
     def test_disconnect_during_a_blocked_send_stops_generation_before_freeing_the_slot(self):
         """Drive the real Starlette response the way uvicorn does (ASGI 2.3).
 
@@ -774,8 +819,12 @@ class StreamingEndpointTests(EndpointTestCase):
             _response, (at_return, active_at_return) = run(scenario())
         self.assertEqual(at_return, {"cancelled": True, "finished": False})
         self.assertEqual(active_at_return, {})
-        # The abandoned answer was not generated to completion and saved.
-        self.assertEqual(self.chat_rows(), [])
+        # The abandoned answer was not generated to completion: only the
+        # question and the text written before the reader left are saved,
+        # marked partial (the chat offers Try again).
+        rows = self.chat_rows()
+        self.assertEqual([(row["role"], row["mode"]) for row in rows], [("user", None), ("assistant", "partial")])
+        self.assertNotIn("validated.", rows[1]["content"])
 
     def test_invalid_question_fails_as_plain_http_before_streaming(self):
         retrieve = AsyncMock()

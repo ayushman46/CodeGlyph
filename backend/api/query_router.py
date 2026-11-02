@@ -952,6 +952,65 @@ async def save_exchange(store, *, repo_id: str, user_id: str, conversation: dict
     return _conversation_payload({**conversation, "updated_at": now}), message_id
 
 
+class StreamProgress:
+    """What a streamed answer has sent so far: its sources and text, and whether it finished."""
+
+    def __init__(self) -> None:
+        self.citations: list = []
+        self.parts: list[str] = []
+        self.finished = False
+
+    def see(self, event: str, data: dict) -> None:
+        if event == "citations":
+            self.citations = list(data.get("citations") or [])
+        elif event == "token":
+            self.parts.append(str(data.get("text") or ""))
+        elif event in {"continue", "done", "error"}:
+            # Continue updates a stored message; done and error end the
+            # exchange themselves (done after it was saved).
+            self.finished = True
+
+
+INTERRUPTED_BY_READER = {
+    "reason": "interrupted",
+    "cause": "client",
+    "message": "The answer was stopped before it finished (Stop, a reload or a closed tab).",
+}
+
+
+async def save_interrupted_exchange(store, repo: dict, req, user_id: str, conversation: dict | None,
+                                    progress: StreamProgress, timeout: float = 10.0) -> None:
+    """Save a question whose streamed answer the reader left before it was saved.
+
+    Without this the question vanished: a reload mid-answer cancels the
+    request, and the exchange was only written once the answer was complete.
+    It is stored as a partial answer with the reason, so the chat shows the
+    text that was written and offers Try again. Edit & PR runs are not
+    stored this way (a proposal is all or nothing).
+    """
+    question = str(getattr(req, "question", "") or "").strip()
+    if (progress.finished or not question or getattr(req, "continue_from", None)
+            or (getattr(req, "workflow", "general") or "general") == "editing"):
+        return
+    written = "".join(progress.parts).strip()
+    answer = written + "\n\n> The answer was stopped here. Ask again to regenerate it." if written else (
+        "> The answer was stopped before any text was written. Ask again to regenerate it."
+    )
+    check = answer_check_entry(answer_failure=INTERRUPTED_BY_READER)
+
+    async def save() -> None:
+        await save_exchange(
+            store, repo_id=repo["id"], user_id=user_id, conversation=conversation or {}, question=question,
+            answer=answer, citations=progress.citations, tool_calls=[check] if check else [], mode="partial", latency_ms=0,
+        )
+
+    try:
+        # Shielded: the request is being cancelled, the save must still finish.
+        await asyncio.wait_for(asyncio.shield(save()), timeout=timeout)
+    except BaseException:
+        logger.warning("Could not save an interrupted answer for repository %s", repo.get("id"), exc_info=True)
+
+
 def _compact_proposal(proposal: dict, max_bytes: int = 3_000_000) -> str:
     payload = json.dumps(proposal, separators=(",", ":"), ensure_ascii=False)
     if len(payload.encode("utf-8")) <= max_bytes:
@@ -1613,10 +1672,15 @@ async def query_repo_stream(req: QueryRequest, current_user=Depends(get_current_
         queue: asyncio.Queue = asyncio.Queue()
 
         async def produce():
+            progress = StreamProgress()
             try:
                 async for event, data in answer_events(store, repo, req, current_user.id, stream=True, conversation=conversation):
+                    progress.see(event, data)
                     await queue.put((event, data))
             except asyncio.CancelledError:
+                # The reader went away (reload, closed tab, Stop) before the
+                # answer was saved: keep the question and what was written.
+                await save_interrupted_exchange(store, repo, req, current_user.id, conversation, progress)
                 raise
             except Exception as error:
                 mapped = _map_errors(error)
