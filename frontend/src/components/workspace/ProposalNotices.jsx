@@ -140,7 +140,8 @@ export const RevisionNote = ({ proposal, className = '' }) => {
         <p className="m-0"><span className="font-semibold text-ink">Revises the previous proposal</span> “{revision.title}”.</p>
         <p className="m-0">
           {revision.kept.length
-            ? <>Keeps its changes to {list(revision.kept)} and adds this request&apos;s changes.</>
+            // A request that only drops an earlier change adds nothing.
+            ? <>Keeps its changes to {list(revision.kept)}{revision.dropped.length ? '.' : <> and adds this request&apos;s changes.</>}</>
             : 'This request’s changes replace its changes.'}
         </p>
         {revision.dropped.length > 0 && <p className="m-0">Dropped, as asked: {list(revision.dropped)}.</p>}
