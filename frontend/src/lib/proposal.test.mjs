@@ -302,6 +302,24 @@ test('qualitySummary: unverified review suggestions are kept apart and never war
   assert.equal(CHECK_LABELS.tests, 'Tests touched');
 });
 
+test('qualitySummary: removed PR text and a missing changelog entry are warnings', async () => {
+  const { qualitySummary, qualityNote, findingText, CHECK_LABELS } = await import('./proposal.js');
+  const summary = qualitySummary(withQuality({
+    status: 'warn',
+    checks: [
+      { id: 'claims', status: 'warn', detail: 'Removed 1 statement',
+        files: [{ file_path: '', line: null, message: 'Removed from the PR text: "Cannot implement the fix"' }] },
+      check('conventions', 'warn', { files: [{ file_path: 'CHANGES.rst', line: null, message: 'changelog entry not added' }] }),
+      check('review', 'pass'),
+    ],
+  }));
+  assert.equal(CHECK_LABELS.claims, 'PR text');
+  assert.deepEqual(summary.warnings.map((item) => item.label), ['PR text', 'Conventions']);
+  assert.equal(findingText(summary.warnings[0].files[0]), 'Removed from the PR text: "Cannot implement the fix"');
+  assert.equal(findingText(summary.warnings[1].files[0]), 'CHANGES.rst changelog entry not added');
+  assert.equal(qualityNote(summary), 'tests not run · 2 warnings');
+});
+
 test('qualitySummary: a legacy proposal without quality has no status', async () => {
   const { qualitySummary, qualityNote, fileQuality } = await import('./proposal.js');
   for (const legacy of [{ id: 'p', files: [{ file_path: 'a.ts' }] }, { quality: null }, { quality: [] }, null, undefined]) {

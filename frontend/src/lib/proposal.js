@@ -162,6 +162,8 @@ export const CHECK_LABELS = Object.freeze({
   review: 'Self-review',
   conventions: 'Conventions',
   scope: 'Scope',
+  // Statements removed from the model's PR text ("... was not provided", a function that does not exist).
+  claims: 'PR text',
 });
 
 const isRecord = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);

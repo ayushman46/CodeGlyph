@@ -36,6 +36,7 @@ change too large for one reviewable proposal gets a split plan instead.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import difflib
 import json
 import logging
@@ -176,9 +177,23 @@ _REVISION_CUE = re.compile(
     r"|\b(?:the|this|that)\s+(?:proposal|patch|diff)(?=\s*(?:$|[,.;:!?)])|\s+(?:to|so|and|but|too|also|as|above|again|instead)\b)"
     r"|\b(?:drop|undo|remove|revert|keep)\s+(?:the|that|this|those|these|your)\s+(?:[\w./-]+\s+){0,3}?"
     r"(?:change|changes|edit|edits|hunk|hunks)(?=\s*(?:$|[,.;:!?)])|\s+(?:to|in|for|but|and|so|that|you)\b)"
-    r"(?!\s+(?:in|to)\s+(?:commit|pr\b|pull request|#|[0-9a-f]{7,40}\b))",
+    r"(?!\s+(?:in|to)\s+(?:commit|pr\b|pull request|#|[0-9a-f]{7,40}\b))"
+    # - a request that opens with the verb and a colon ("Revise: fix the
+    #   bytes-key regression"), or revises/amends "the proposal" / "the
+    #   patch" by name ("Revise the proposal \"Fix ...\"", "Rework the
+    #   patch so ..."), but not "update the patch version" or "revise the
+    #   diff algorithm".
+    r"|^\s*(?:(?:ok(?:ay)?|great|thanks|thank you|good|nice|perfect|cool)[,.!]?\s+)?(?:please\s+)?"
+    r"(?:revise|amend|rework|redo)\s*(?::|\s[-\u2013\u2014]\s)"
+    r"|\b(?:revise|amend|rework|redo|update)\s+(?:the|this|that)\s+(?:previous\s+|last\s+|earlier\s+)?(?:proposal|patch|diff)"
+    r"(?=\s*(?:$|[,.;:!?)\"'\u201c\u2018])|\s+(?:to|so|and|but|named|titled|called|that|which|too|also|again|instead)\b)",
     re.IGNORECASE,
 )
+# A quoted span of a request ("..." / '...' / curly quotes): a title named on purpose.
+_QUOTED_TITLE = re.compile(r"[\"\u201c\u201d]([^\"\u201c\u201d\n]{4,240})[\"\u201c\u201d]|(?<![\w])[\u2018']([^'\u2018\u2019\n]{4,240})[\u2019'](?![\w])")
+_CONVENTIONAL_PREFIX = re.compile(r"^\s*[a-z]+(?:\([^)]*\))?!?:\s*", re.IGNORECASE)
+# How close a named title must be to a proposal's title (difflib ratio).
+_TITLE_MATCH_RATIO = 0.84
 # A proposal older than this is never revised, even when the conversation
 # still holds it: an explicit "also ..." days later is most likely a new request.
 _REVISION_WINDOW_SECONDS = 6 * 3600
@@ -579,26 +594,26 @@ def _within_revision_window(created_at: Any, now: datetime | None = None) -> boo
     return (now or datetime.now(UTC)) - moment <= timedelta(seconds=_REVISION_WINDOW_SECONDS)
 
 
-async def recent_proposal_for(store: Any, repo_id: str, user_id: str, history: list[dict]) -> dict | None:
-    """The newest proposal of this conversation, if it was made recently; else None.
+async def _conversation_proposals(store: Any, repo_id: str, user_id: str, history: list[dict], *, limit: int = 20):
+    """Yield ``(created_at, proposal)`` for the proposals of this conversation, newest first.
 
-    Only a proposal of this conversation counts: the newest assistant reply
-    that produced one (its ``code_edit`` call) and whose text is among the
+    Only a proposal of this conversation counts: an assistant reply that
+    produced one (its ``code_edit`` call) and whose text is among the
     assistant messages of ``history``, which the caller already scoped to the
-    conversation. That reply must be at most ``_REVISION_WINDOW_SECONDS``
-    old. The proposal is read for this user and repository only. Returns
-    ``{id, title, summary, question, files, issue_reference,
-    issue_confirmed, issue_repository}``.
+    conversation. The proposal is read for this user and repository only.
+    ``proposal`` is ``{id, title, summary, question, files, issue_reference,
+    issue_confirmed, issue_repository}``, or None when the stored proposal
+    cannot be read (the caller decides whether to look further).
     """
     replies = [str(entry.get("content") or "").strip() for entry in history or []
                if isinstance(entry, dict) and entry.get("role") == "assistant"]
     replies = [text for text in replies if text]
     if not replies:
-        return None
+        return
     rows = await store.fetch_all(
         "SELECT content, tool_calls, created_at FROM chat_messages WHERE repo_id = ? AND user_id = ? AND role = 'assistant' "
-        "AND tool_calls LIKE '%code_edit%' ORDER BY created_at DESC, id DESC LIMIT 20",
-        [repo_id, user_id],
+        "AND tool_calls LIKE '%code_edit%' ORDER BY created_at DESC, id DESC LIMIT ?",
+        [repo_id, user_id, limit],
     )
     for row in rows:
         content = str(row.get("content") or "").strip()
@@ -613,56 +628,176 @@ async def recent_proposal_for(store: Any, repo_id: str, user_id: str, history: l
                             if isinstance(call, dict) and call.get("tool") == "code_edit"), "")
         if not proposal_id:
             continue
-        if not _within_revision_window(row.get("created_at")):
+        yield row.get("created_at"), await _stored_proposal(store, repo_id, user_id, proposal_id, row.get("created_at"))
+
+
+async def _stored_proposal(store: Any, repo_id: str, user_id: str, proposal_id: str, created_at: Any) -> dict | None:
+    stored = await store.fetch_one(
+        "SELECT payload_json FROM edit_proposals WHERE id = ? AND user_id = ? AND repo_id = ?",
+        [proposal_id, user_id, repo_id],
+    )
+    if not stored:
+        return None
+    try:
+        proposal = json.loads(stored["payload_json"])
+    except (TypeError, ValueError):
+        return None
+    asked = await store.fetch_one(
+        "SELECT content FROM chat_messages WHERE repo_id = ? AND user_id = ? AND role = 'user' AND created_at <= ? "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        [repo_id, user_id, created_at],
+    )
+    files = [item for item in proposal.get("files") or [] if isinstance(item, dict) and item.get("file_path")]
+    if not files:
+        return None
+    return {
+        "id": str(proposal.get("id") or proposal_id), "title": str(proposal.get("title") or ""),
+        "summary": str(proposal.get("summary") or ""), "question": str((asked or {}).get("content") or ""),
+        "files": files, "issue_reference": str(proposal.get("issue_reference") or "") or None,
+        "issue_confirmed": bool(proposal.get("issue_confirmed")),
+        "issue_repository": str(proposal.get("issue_repository") or ""),
+    }
+
+
+async def recent_proposal_for(store: Any, repo_id: str, user_id: str, history: list[dict]) -> dict | None:
+    """The newest proposal of this conversation, if it was made recently; else None.
+
+    See ``_conversation_proposals`` for what counts as this conversation's
+    proposal. The reply that produced it must be at most
+    ``_REVISION_WINDOW_SECONDS`` old.
+    """
+    async for created_at, proposal in _conversation_proposals(store, repo_id, user_id, history):
+        if not _within_revision_window(created_at):
             return None  # the newest proposal is old; older ones are older still
-        stored = await store.fetch_one(
-            "SELECT payload_json FROM edit_proposals WHERE id = ? AND user_id = ? AND repo_id = ?",
-            [proposal_id, user_id, repo_id],
-        )
-        if not stored:
-            return None
-        try:
-            proposal = json.loads(stored["payload_json"])
-        except (TypeError, ValueError):
-            return None
-        asked = await store.fetch_one(
-            "SELECT content FROM chat_messages WHERE repo_id = ? AND user_id = ? AND role = 'user' AND created_at <= ? "
-            "ORDER BY created_at DESC, id DESC LIMIT 1",
-            [repo_id, user_id, row.get("created_at")],
-        )
-        files = [item for item in proposal.get("files") or [] if isinstance(item, dict) and item.get("file_path")]
-        if not files:
-            return None
-        return {
-            "id": str(proposal.get("id") or proposal_id), "title": str(proposal.get("title") or ""),
-            "summary": str(proposal.get("summary") or ""), "question": str((asked or {}).get("content") or ""),
-            "files": files, "issue_reference": str(proposal.get("issue_reference") or "") or None,
-            "issue_confirmed": bool(proposal.get("issue_confirmed")),
-            "issue_repository": str(proposal.get("issue_repository") or ""),
-        }
+        return proposal
     return None
 
 
-def revises(proposal: dict | None, question: str) -> bool:
-    """Whether ``question`` amends ``proposal`` (``recent_proposal_for``'s).
+def _title_words(text: str) -> list[str]:
+    """Lower-case words of a title or request, typographic quotes and punctuation removed."""
+    return re.findall(r"[a-z0-9_]+", str(text or "").lower())
+
+
+# Words of a request that are compared with titles (a pasted issue can be long).
+_TITLE_SEARCH_WORDS = 400
+
+
+def title_match(question: str, title: str) -> tuple[float, bool, str]:
+    """How closely ``question`` names ``title``: (score in 0..1, quoted, the request without the title).
+
+    A quoted span ("..." or curly quotes) is compared with the whole title;
+    otherwise the title's words must appear as a run of the request's words,
+    allowing small differences (a word added, dropped or misspelt), and only
+    for titles of four words or more (three when they match exactly). Case
+    and punctuation never matter, and a Conventional Commits prefix
+    ("fix: ") is optional on either side. The third value is the request's
+    words with the matched title removed, so the caller can tell "revise
+    <title>" from a new request whose wording equals the title.
+    """
+    variants = {" ".join(_title_words(title)), " ".join(_title_words(_CONVENTIONAL_PREFIX.sub("", str(title or ""))))}
+    variants.discard("")
+    if not variants:
+        return 0.0, False, str(question or "")
+    best, quoted, rest = 0.0, False, str(question or "")
+    text = str(question or "")
+    for match in _QUOTED_TITLE.finditer(text):
+        span = " ".join(_title_words(_CONVENTIONAL_PREFIX.sub("", match.group(1) or match.group(2) or "")))
+        for variant in variants:
+            if span and min(len(span), len(variant)) >= 6:
+                ratio = difflib.SequenceMatcher(None, span, variant, autojunk=False).ratio()
+                if ratio > best:
+                    best, quoted, rest = ratio, True, text[:match.start()] + " " + text[match.end():]
+    if quoted and best >= _TITLE_MATCH_RATIO:
+        return best, quoted, rest
+    words = _title_words(text)[:_TITLE_SEARCH_WORDS]
+    for variant in variants:
+        target = variant.split()
+        size = len(target)
+        if size < 3:
+            continue
+        for width in ((size,) if size < 4 else range(size - 1, size + 2)):
+            for begin in range(0, max(0, len(words) - width) + 1):
+                window = " ".join(words[begin:begin + width])
+                matcher = difflib.SequenceMatcher(None, window, variant, autojunk=False)
+                if size < 4:
+                    ratio = 1.0 if window == variant else 0.0
+                elif matcher.real_quick_ratio() <= best or matcher.quick_ratio() <= best:
+                    continue
+                else:
+                    ratio = matcher.ratio()
+                if ratio > best:
+                    best, quoted, rest = ratio, False, " ".join(words[:begin] + words[begin + width:])
+    return best, quoted, rest
+
+
+# Next to an unquoted title, what makes the request a change to that
+# proposal rather than a new request worded like it.
+_NAMED_REVISION_CUE = re.compile(r"\b(?:revise|revising|amend|amending|rework|reworking|redo)\b|\b(?:proposal|patch)\b",
+                                 re.IGNORECASE)
+
+
+async def named_proposal_for(store: Any, repo_id: str, user_id: str, question: str, history: list[dict]) -> dict | None:
+    """The earlier proposal of this conversation that ``question`` names by its title, or None.
+
+    A quoted title is enough. An unquoted one also needs, outside the title's
+    own words, a revision cue (``wants_revision``), "revise" / "amend" /
+    "rework" / "redo", or the word "proposal" / "patch": "Update
+    src/app.py to add retries" never revises an earlier proposal titled
+    "Update src/app.py". The best match wins (the newest on a tie). Only
+    proposals of this conversation and user count
+    (``_conversation_proposals``); naming one is explicit, so the revision
+    window does not apply.
+    """
+    text = str(question or "")
+    if _FRESH_START.search(text):
+        return None
+    best: tuple[float, dict] | None = None
+    async for _created_at, proposal in _conversation_proposals(store, repo_id, user_id, history):
+        if not proposal or not proposal.get("title"):
+            continue
+        score, quoted, rest = title_match(text, proposal["title"])
+        if score < _TITLE_MATCH_RATIO:
+            continue
+        if not (quoted or wants_revision(rest) or _NAMED_REVISION_CUE.search(rest)):
+            continue
+        if best is None or score > best[0]:
+            best = (score, proposal)
+    return best[1] if best else None
+
+
+def revises(proposal: dict | None, question: str, *, named: bool = False) -> bool:
+    """Whether ``question`` amends ``proposal`` (``recent_proposal_for``'s or ``named_proposal_for``'s).
 
     The request must read as an amendment (``wants_revision``: an explicit
-    reference such as a leading "also" or "the previous proposal") and must
-    not name a different issue, which is a separate change.
+    reference such as a leading "also", "Revise:" or "the previous
+    proposal"; or, with ``named``, the proposal's title) and must not name a
+    different issue, which is a separate change.
     """
-    if not proposal or not wants_revision(question):
+    if not proposal or not (named or wants_revision(question)):
         return False
-    named = _issue_mentions(question)
-    return not named or named == {str(proposal.get("issue_reference") or "")}
+    issues = _issue_mentions(question)
+    return not issues or issues == {str(proposal.get("issue_reference") or "")}
+
+
+async def proposal_to_revise(store: Any, repo_id: str, user_id: str, question: str,
+                             history: list[dict]) -> tuple[dict | None, dict | None]:
+    """(the proposal ``question`` revises or None, the newest recent proposal of this conversation or None).
+
+    An earlier proposal named by its title is revised even when a newer one
+    exists; otherwise a revision request amends the newest one.
+    """
+    recent = await recent_proposal_for(store, repo_id, user_id, history)
+    named = await named_proposal_for(store, repo_id, user_id, question, history)
+    if named and revises(named, question, named=True):
+        return named, recent
+    return (recent if revises(recent, question) else None), recent
 
 
 async def previous_proposal_for(store: Any, repo_id: str, user_id: str, question: str,
                                 history: list[dict]) -> dict | None:
-    """The proposal ``question`` revises (``recent_proposal_for`` when ``revises``), or None."""
-    if not wants_revision(question):
-        return None
-    proposal = await recent_proposal_for(store, repo_id, user_id, history)
-    return proposal if revises(proposal, question) else None
+    """The proposal ``question`` revises (named by its title, else the newest one), or None."""
+    target, _recent = await proposal_to_revise(store, repo_id, user_id, question, history)
+    return target
 
 
 def _already_applied(content: str, change: dict) -> bool:
@@ -675,6 +810,87 @@ def _already_applied(content: str, change: dict) -> bool:
 
 def _references(text: str, name: str) -> bool:
     return bool(re.search(rf"(?<![\w$]){re.escape(name)}(?![\w$])", text or ""))
+
+
+# The model saying it lacked a file or could not make the change: "Cannot
+# implement the fix because src/requests/models.py ... was not provided in
+# the FILE sections." The files it was given are known, so such a sentence is
+# never presented as part of a fix.
+_INPUT_GAP_CLAIM = re.compile(
+    r"\bFILE\s+sections?\b"
+    r"|\b(?:not|never)\s+(?:been\s+)?(?:provided|included|shown|given|supplied|visible|available)\s+"
+    r"(?:in|to|with|among)\s+(?:the\s+|my\s+|this\s+)?(?:FILE|files?|context|input|prompt|request|sections?)\b"
+    r"|\b(?:cannot|can't|could\s+not|couldn't|unable\s+to|was\s+unable\s+to|is\s+not\s+possible\s+to)\s+"
+    r"(?:implement|apply|make|write|complete|include|add)\s+(?:the\s+)?(?:actual\s+|real\s+|underlying\s+|source\s+|code\s+)?"
+    r"(?:fix|change|implementation|code\s+change|source\s+change)\b",
+    re.IGNORECASE,
+)
+_UNAVAILABLE = re.compile(
+    r"\b(?:not|never|wasn't|weren't|isn't)\s+(?:been\s+)?(?:provided|included|shown|given|supplied|available|visible|loaded)\b"
+    r"|\b(?:was|is)\s+missing\b",
+    re.IGNORECASE,
+)
+# A code name in PR prose: snake_case anywhere, or a backticked / called
+# camelCase name. Dotted names (`os.path.join`) are left alone.
+_PROSE_NAME = re.compile(r"(?<![\w$./\\-])([A-Za-z_][A-Za-z0-9_]*)(\(\))?(?![\w$/\\-]|\.[A-Za-z_])")
+_SNAKE_NAME = re.compile(r"[A-Za-z0-9]_[A-Za-z0-9]")
+_CAMEL_NAME = re.compile(r"[a-z][A-Z]")
+_KNOWN_GLOBALS = frozenset(dir(builtins)) | frozenset("""
+JSON Promise Object Array Number String Boolean Symbol BigInt Error TypeError RangeError SyntaxError ReferenceError Map Set
+WeakMap WeakSet Date RegExp Math Intl Reflect Proxy globalThis setTimeout clearTimeout setInterval clearInterval
+parseInt parseFloat encodeURIComponent decodeURIComponent encodeURI decodeURI AbortController AbortSignal fetch
+Request Response Headers FormData URLSearchParams URL Blob File ReadableStream TextEncoder TextDecoder structuredClone
+queueMicrotask requestAnimationFrame localStorage sessionStorage console process require module exports
+useState useEffect useMemo useCallback useRef useContext useReducer useLayoutEffect
+__init__ __name__ __main__ __all__ __file__ __repr__ __str__ __eq__ __hash__ __call__ __enter__ __exit__
+""".split())
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z`*(\[\"'])")
+_CLAIM_LIST_PREFIX = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?)")
+
+
+def _prose_names(sentence: str) -> list[str]:
+    """Code names a sentence of PR prose mentions (see ``_PROSE_NAME``), outside URLs and paths."""
+    names: list[str] = []
+    ticked = {match.group(1).strip().rstrip("()") for match in re.finditer(r"`([^`\n]+)`", sentence)}
+    for match in _PROSE_NAME.finditer(re.sub(r"https?://\S+", " ", sentence)):
+        name = match.group(1)
+        if name in _KNOWN_GLOBALS or name.strip("_") == "" or name in names:
+            continue
+        called = bool(match.group(2)) or name in ticked
+        if _SNAKE_NAME.search(name.strip("_")) or (called and _CAMEL_NAME.search(name)):
+            names.append(name)
+    return names
+
+
+def drop_sentences(text: str, drop: Callable[[str], bool]) -> tuple[str, list[str]]:
+    """``text`` without the sentences ``drop`` selects, and those sentences.
+
+    Headings stay. A list item or paragraph line loses only the selected
+    sentences, and disappears when none is left; fenced code is never touched.
+    """
+    removed: list[str] = []
+    kept: list[str] = []
+    fenced = False
+    for line in str(text or "").replace("\r\n", "\n").split("\n"):
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+            kept.append(line)
+            continue
+        if fenced or not line.strip() or line.lstrip().startswith("#"):
+            kept.append(line)
+            continue
+        prefix_match = _CLAIM_LIST_PREFIX.match(line)
+        prefix = prefix_match.group(1) if prefix_match else line[: len(line) - len(line.lstrip())]
+        sentences = _SENTENCE_SPLIT.split(line[len(prefix):])
+        keep = [sentence for sentence in sentences if not drop(sentence)]
+        if len(keep) == len(sentences):
+            kept.append(line)
+            continue
+        removed.extend(sentence.strip() for sentence in sentences if sentence not in keep)
+        if keep:
+            kept.append(prefix + " ".join(sentence.strip() for sentence in keep))
+    result = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    return result, removed
 
 
 class CodeEditor:
@@ -746,6 +962,9 @@ class CodeEditor:
         self.revision_dropped: list[str] = []
         # For a new request made right after a proposal: how to revise that one instead.
         self.revision_hint = ""
+        # Statements removed from the model's PR text because the change and
+        # the files it was given do not support them ({text, reason, file_path}).
+        self.unsupported_claims: list[dict] = []
 
     def _issue_link(self, number: str) -> str:
         """GitHub's closing reference; a bare #N always means this repository."""
@@ -2737,14 +2956,15 @@ Rules:
         request = self.request
         self.started = time.monotonic()
         try:
-            recent = await recent_proposal_for(
-                request.store, str(request.repo.get("id") or ""), request.user_id, request.conversation_history,
+            target, recent = await proposal_to_revise(
+                request.store, str(request.repo.get("id") or ""), request.user_id, request.question,
+                request.conversation_history,
             )
         except Exception:
             logger.warning("Could not look up the proposal to revise", exc_info=True)
-            recent = None
-        if revises(recent, request.question):
-            self.previous = recent
+            target, recent = None, None
+        if target:
+            self.previous = target
         elif recent and not _FRESH_START.search(request.question) and not _issue_mentions(request.question):
             # A new request right after a proposal: say how to revise it instead.
             self.revision_hint = (
@@ -3149,6 +3369,10 @@ Rules:
         approximate = sorted(item["file_path"] for item in files
                              if item.get("action") == "modify" and item["file_path"] in loaded and not loaded[item["file_path"]].exact)
 
+        # The model's PR text never states what the change and its inputs do
+        # not support ("... was not provided", a function that does not exist).
+        await self._drop_unsupported_claims(payload, files, loaded)
+
         # G6b: title, body and commit message per the repository's conventions.
         kind = repo_conventions.change_type(files, renames=renames, question=request.question, closes_issue=closes_issue)
         fallback_title = (f"Fix {issue_link}" if closes_issue else
@@ -3248,6 +3472,80 @@ Rules:
 
         await asyncio.gather(*(load(path) for path in paths))
         return {path: results.get(path) for path in paths}
+
+    async def _drop_unsupported_claims(self, payload: dict, files: list[dict], loaded: dict[str, LoadedFile]) -> None:
+        """Remove statements the change does not support from the model's PR text; record each.
+
+        Two kinds, in the summary, the PR body and the file summaries:
+
+        * the model says a file was not provided or that it could not make
+          the fix ("... was not provided in the FILE sections"): the files
+          it was given are known (a revision starts from the revised
+          proposal's files), so this is never presented as part of a fix;
+        * a code name (``encode_multipart_data``) that occurs in none of the
+          files it was given, the final files, the request or the issue,
+          and nowhere in the index.
+
+        Each removal becomes ``self.unsupported_claims`` (the "PR text"
+        check).
+        """
+        texts = [str(self.request.question or ""), self.issue_body]
+        texts.extend(item.content for item in loaded.values())
+        texts.extend(item.content for item in self.mechanical.values() if isinstance(getattr(item, "content", None), str))
+        for item in files:
+            texts.extend(value for value in (item.get("before"), item.get("after")) if isinstance(value, str))
+        texts.extend(self.revision_starts.values())
+        paths = sorted({*loaded, *(item["file_path"] for item in files)})
+        texts.append("\n".join(paths))
+        corpus = "\n".join(texts)
+        fields = [("summary", str(payload.get("summary") or "")), ("pr_body", str(payload.get("pr_body") or ""))]
+        fields += [(f"file:{index}", str(item.get("summary") or "")) for index, item in enumerate(files)]
+        candidates: list[str] = []
+        for _key, value in fields:
+            for name in _prose_names(value):
+                if name not in candidates and not _references(corpus, name):
+                    candidates.append(name)
+        unknown: set[str] = set()
+        if candidates:
+            try:
+                found = await scope.symbol_reference_files(self.request.store, self.request.repo["id"], candidates[:8], max_pages=1)
+            except Exception:
+                logger.debug("Name lookup for the PR text failed", exc_info=True)
+                found = {name: {"?": "code"} for name in candidates}
+            unknown = {name for name in candidates[:8] if not found.get(name)}
+
+        reasons: dict[str, tuple[str, str]] = {}
+
+        def unsupported(sentence: str) -> bool:
+            named_path = next((path for path in paths if path in sentence or posixpath.basename(path) in sentence), "")
+            if _INPUT_GAP_CLAIM.search(sentence) or (named_path and _UNAVAILABLE.search(sentence)):
+                reasons[sentence.strip()] = (
+                    "says a file was missing or the fix could not be made, but "
+                    + (f"{named_path} was given to the model" if named_path else "the files it needed were given to the model")
+                    + "; check that the change does what you asked", named_path)
+                return True
+            names = [name for name in _prose_names(sentence) if name in unknown]
+            if names:
+                reasons[sentence.strip()] = (
+                    "names " + ", ".join(f"`{name}`" for name in names)
+                    + ", which is not in the files given to the model or anywhere in the index", "")
+                return True
+            return False
+
+        for key, value in fields:
+            if not value:
+                continue
+            cleaned, removed = drop_sentences(value, unsupported)
+            if not removed:
+                continue
+            if key.startswith("file:"):
+                files[int(key[5:])]["summary"] = cleaned
+            else:
+                payload[key] = cleaned
+            for sentence in removed:
+                reason, path = reasons.get(sentence, ("is not supported by the change", ""))
+                if not any(entry["text"] == sentence[:300] for entry in self.unsupported_claims):
+                    self.unsupported_claims.append({"text": sentence[:300], "reason": reason, "file_path": path})
 
     # ------------------------------------------------------- quality report
 
@@ -3367,6 +3665,17 @@ Rules:
             review_check,
             conventions_check,
         ]
+        if self.unsupported_claims:
+            count = len(self.unsupported_claims)
+            first = self.unsupported_claims[0]
+            checks_list.append({
+                "id": "claims", "label": "PR text", "status": "warn",
+                "detail": (f"Removed {count} statement{'s' if count != 1 else ''} from the PR text that the change does not "
+                           f"support: \"{first['text'][:160]}\" {first['reason']}")[:600],
+                "files": [{"file_path": entry["file_path"], "line": None, "column": None,
+                           "message": f"Removed from the PR text: \"{entry['text'][:200]}\" ({entry['reason']})"}
+                          for entry in self.unsupported_claims[:20]],
+            })
         statuses = [check["status"] for check in checks_list if check["status"] != "skipped"]
         if review_status == "skipped" and not review.get("trivial"):
             # A review that was meant to run but did not leaves the proposal
@@ -3454,7 +3763,7 @@ Rules:
 
 _FAILING_LABELS = {"syntax": "syntax errors", "imports": "unresolved imports", "style": "style problems",
                    "completeness": "stale references", "tests": "tests", "review": "review issues",
-                   "conventions": "conventions", "scope": "scope"}
+                   "conventions": "conventions", "scope": "scope", "claims": "PR text"}
 
 
 def format_proposal_markdown(proposal: dict) -> str:
@@ -3511,8 +3820,8 @@ def format_proposal_markdown(proposal: dict) -> str:
             lines.append(f"- **{check.get('label')}** ({mark}): {check.get('detail') or ''}")
             if check.get("status") in {"warn", "fail"}:
                 for entry in (check.get("files") or [])[:4]:
-                    where = f"{entry['file_path']}:{entry['line']}" if entry.get("line") else entry["file_path"]
-                    lines.append(f"  - `{where}` {entry['message']}")
+                    where = f"{entry['file_path']}:{entry['line']}" if entry.get("line") else entry.get("file_path") or ""
+                    lines.append(f"  - `{where}` {entry['message']}" if where else f"  - {entry['message']}")
     verification = proposal.get("verification") if isinstance(proposal.get("verification"), dict) else None
     if verification and not verification.get("tests_run"):
         command = verification.get("command") or ""
