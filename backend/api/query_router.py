@@ -32,7 +32,7 @@ from api.answer_trust import (
     restore_answer_check,
 )
 from api.auth import get_current_user
-from api.repository_state import fetch_owned_repository
+from api.repository_state import fetch_accessible_repository, repository_access_by_id, role_allows
 from config import ModelConfigurationError, get_editing_ticket_secret, query_request_limiter, settings
 from database import DatabaseConfigurationError, assert_turso_schema, explain_database_error, get_turso_store
 from ingest.cloner import RepositoryValidationError, parse_github_repository
@@ -103,8 +103,8 @@ def timestamp() -> str:
     return datetime.now(UTC).isoformat()
 
 
-async def get_owned_repo(store, repo_name: str, user_id: str):
-    return await fetch_owned_repository(store, user_id, repo_name)
+async def get_owned_repo(store, repo_name: str, user_id: str, permission: str = "view"):
+    return await fetch_accessible_repository(store, user_id, repo_name, permission=permission)
 
 
 async def get_conversation_history(store, repo_id: str, user_id: str, limit: int | None = None):
@@ -1337,7 +1337,7 @@ async def query_repo(req: QueryRequest, current_user=Depends(get_current_user)):
         limiter_acquired = True
         await assert_turso_schema()
         store = get_turso_store()
-        repo = await get_owned_repo(store, req.repo_name, current_user.id)
+        repo = await get_owned_repo(store, req.repo_name, current_user.id, "edit" if getattr(req, "workflow", "") == "editing" else "view")
         result: dict | None = None
         async for event, data in answer_events(store, repo, req, current_user.id, stream=False):
             if event == "done":
@@ -1400,7 +1400,7 @@ async def query_repo_stream(req: QueryRequest, current_user=Depends(get_current_
     try:
         await assert_turso_schema()
         store = get_turso_store()
-        repo = await get_owned_repo(store, req.repo_name, current_user.id)
+        repo = await get_owned_repo(store, req.repo_name, current_user.id, "edit" if getattr(req, "workflow", "") == "editing" else "view")
         _check_answerable(repo, req)
     except BaseException as error:
         # BaseException: a cancelled request (shutdown, timeout) must not keep
@@ -1558,15 +1558,15 @@ async def get_edit_proposal(proposal_id: str, current_user=Depends(get_current_u
         await assert_turso_schema()
         store = get_turso_store()
         row = await store.fetch_one(
-            "SELECT p.payload_json, p.repo_name, r.repo_name AS current_name FROM edit_proposals p "
-            "JOIN repos r ON r.id = p.repo_id WHERE p.id = ? AND p.user_id = ? AND r.user_id = ?",
-            [proposal_id, current_user.id, current_user.id],
+            "SELECT payload_json, repo_id FROM edit_proposals WHERE id = ? AND user_id = ?", [proposal_id, current_user.id],
         )
-        if not row:
+        access = await repository_access_by_id(store, current_user.id, str(row["repo_id"])) if row else None
+        if not row or not access:
             raise HTTPException(status_code=404, detail="Proposal not found.")
         proposal = json.loads(row["payload_json"])
-        repo_name = str(row.get("current_name") or row.get("repo_name"))
-        return {"proposal": proposal, "edit_ticket": issue_edit_ticket(current_user.id, repo_name, proposal), "repo_name": repo_name}
+        repo_name = str(access["repo_name"])
+        ticket = issue_edit_ticket(current_user.id, repo_name, proposal) if role_allows(access["role"], "edit") else None
+        return {"proposal": proposal, "edit_ticket": ticket, "repo_name": repo_name}
     except HTTPException:
         raise
     except DatabaseConfigurationError as error:

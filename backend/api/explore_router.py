@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from agent.code_edit import CodeEditValidationError, normalise_repository_path
 from agent.editor import language_for, reconstruct_indexed_file
 from api.auth import get_current_user
-from api.repository_state import fetch_owned_repository, public_view, raise_storage_error
+from api.repository_state import fetch_accessible_repository, public_view, raise_storage_error
 from api.start_here import gather_start_here
 from config import settings
 from database import assert_turso_schema, get_turso_store
@@ -848,7 +848,7 @@ async def repository_overview(repo_name: str, current_user=Depends(get_current_u
     try:
         await assert_turso_schema()
         store = get_turso_store()
-        repo = await fetch_owned_repository(store, current_user.id, repo_name)
+        repo = await fetch_accessible_repository(store, current_user.id, repo_name)
         repo_map = await current_repo_map(store, repo)
         try:
             repo_map = without_files(repo_map, await _unsearchable_files(store, repo))
@@ -904,7 +904,7 @@ async def repository_search(
     try:
         await assert_turso_schema()
         store = get_turso_store()
-        repo = await fetch_owned_repository(store, current_user.id, repo_name)
+        repo = await fetch_accessible_repository(store, current_user.id, repo_name)
         if not repo["queryable"]:
             return {
                 "results": [], "query": q, "searchable": False, "mode": "exact", "more_files": False, "line_count": 0,
@@ -944,7 +944,7 @@ async def repository_files(
     try:
         await assert_turso_schema()
         store = get_turso_store()
-        repo = await fetch_owned_repository(store, current_user.id, repo_name)
+        repo = await fetch_accessible_repository(store, current_user.id, repo_name)
         paths = await repository_paths(
             store, repo["id"], version=_paths_version(repo), staging_prefix=repo.get("staging_prefix"),
         )
@@ -967,7 +967,7 @@ async def repository_symbols(
     try:
         await assert_turso_schema()
         store = get_turso_store()
-        repo = await fetch_owned_repository(store, current_user.id, repo_name)
+        repo = await fetch_accessible_repository(store, current_user.id, repo_name)
         if not repo["queryable"]:
             return {"query": q, "symbols": [], "searchable": False}
         symbols = await find_symbols(store, repo["id"], q, limit=limit, staging_prefix=repo.get("staging_prefix"))
@@ -1023,7 +1023,7 @@ async def repository_file(
     try:
         await assert_turso_schema()
         store = get_turso_store()
-        repo = await fetch_owned_repository(store, current_user.id, repo_name)
+        repo = await fetch_accessible_repository(store, current_user.id, repo_name)
         staging = repo.get("staging_prefix")
         # A refresh's replacement rows stay hidden until the swap, so a file
         # that only exists in the unpublished version is not served.

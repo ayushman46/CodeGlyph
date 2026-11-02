@@ -566,6 +566,244 @@ async def fetch_owned_repository(store, user_id: str, repo_name: str) -> dict[st
     return presented
 
 
+# ---------------------------------------------------------------------------
+# Shared repositories
+# ---------------------------------------------------------------------------
+
+# What each role may do. The owner is the user who indexed the repository;
+# members join through an invite link (``api.sharing_router``). Members ask
+# questions against the owner's index; their conversations, proposals and
+# GitHub connection stay their own.
+ROLE_PERMISSIONS = {
+    "owner": frozenset({"view", "edit", "manage"}),
+    "editor": frozenset({"view", "edit"}),
+    "viewer": frozenset({"view"}),
+}
+NO_LONGER_SHARED = "This repository is no longer shared with you."
+_MEMBER_SELECT = REPOSITORY_SELECT.replace(
+    "SELECT ", "SELECT m.role AS member_role, m.alias AS member_alias, m.owner_label AS member_owner_label, ", 1,
+) + "JOIN repo_members m ON m.repo_id = r.id "
+
+
+def role_allows(role: str, permission: str) -> bool:
+    return permission in ROLE_PERMISSIONS.get(role, frozenset())
+
+
+async def _sharing_rows(store, sql: str, args: list[Any]) -> list[dict[str, Any]]:
+    """Rows from the sharing tables; none until ``08_sharing.sql`` has run.
+
+    Owners' lookups never touch these tables, so a deploy that precedes the
+    migration keeps every repository working (and unknown names still 404).
+    """
+    try:
+        return await store.fetch_all(sql, args)
+    except Exception as error:
+        if "no such table" in str(error).lower():
+            return []
+        raise
+
+
+def _require_permission(access: dict[str, Any], permission: str) -> None:
+    """Raise 403 when a member's role does not allow ``permission``."""
+    if role_allows(access["role"], permission):
+        return
+    owner = access.get("owner_label") or "its owner"
+    if permission == "edit":
+        detail = (
+            f"You have view access to {access['repo_name']}, so Edit & PR is off. "
+            f"Ask {owner} for editor access to propose changes."
+        )
+    else:
+        detail = (
+            f"Only the owner of {access['repo_name']} ({owner}) can rename, re-index, stop indexing, "
+            "delete or share it."
+        )
+    raise HTTPException(status_code=403, detail=detail, headers={"X-Error-Code": "insufficient_role"})
+
+
+async def _raise_unavailable(store, user_id: str, repo_name: str) -> NoReturn:
+    """404 for a name the user cannot open, saying so when the owner removed them."""
+    removed = await _sharing_rows(
+        store,
+        "SELECT 1 AS removed FROM repo_members WHERE user_id = ? AND alias = ? AND removed_at IS NOT NULL "
+        "AND left_at IS NULL LIMIT 1",
+        [user_id, repo_name],
+    )
+    if removed:
+        raise HTTPException(status_code=404, detail=NO_LONGER_SHARED, headers={"X-Error-Code": "share_removed"})
+    raise HTTPException(status_code=404, detail="Repository not found.")
+
+
+def _access(role: str, repo_name: str, row: dict[str, Any], owner_label: str | None = None) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "owner_id": row.get("user_id"),
+        "github_url": row.get("github_url"),
+        "role": role,
+        # The name the requesting user knows the repository by.
+        "repo_name": repo_name,
+        "owner_label": owner_label or None,
+    }
+
+
+async def resolve_repository_access(store, user_id: str, repo_name: str, *, permission: str = "view") -> dict[str, Any]:
+    """The caller's access to ``repo_name`` in their namespace, or raise.
+
+    A light lookup (``repos`` only for an owner) for routes that need the
+    repository's id and URL but not its indexing state. Non-members get 404;
+    a member whose role lacks ``permission`` gets 403.
+    """
+    row = await store.fetch_one(
+        "SELECT id, user_id, repo_name, github_url FROM repos WHERE user_id = ? AND repo_name = ?", [user_id, repo_name],
+    )
+    if row:
+        access = _access("owner", repo_name, row)
+    else:
+        rows = await _sharing_rows(
+            store,
+            "SELECT r.id, r.user_id, r.repo_name, r.github_url, m.role, m.owner_label FROM repo_members m "
+            "JOIN repos r ON r.id = m.repo_id WHERE m.user_id = ? AND m.alias = ? AND m.removed_at IS NULL",
+            [user_id, repo_name],
+        )
+        if not rows:
+            await _raise_unavailable(store, user_id, repo_name)
+        row = rows[0]
+        access = _access(str(row["role"]), repo_name, row, row.get("owner_label"))
+    _require_permission(access, permission)
+    return access
+
+
+async def repository_access_by_id(store, user_id: str, repo_id: str) -> dict[str, Any] | None:
+    """The caller's access to the repository with ``repo_id``, or None."""
+    row = await store.fetch_one("SELECT id, user_id, repo_name, github_url FROM repos WHERE id = ?", [repo_id])
+    if not row:
+        return None
+    if row.get("user_id") == user_id:
+        return _access("owner", str(row["repo_name"]), row)
+    members = await _sharing_rows(
+        store,
+        "SELECT role, alias, owner_label FROM repo_members WHERE repo_id = ? AND user_id = ? AND removed_at IS NULL",
+        [repo_id, user_id],
+    )
+    if not members:
+        return None
+    return _access(str(members[0]["role"]), str(members[0]["alias"]), row, members[0].get("owner_label"))
+
+
+def _apply_access(presented: dict[str, Any], access: dict[str, Any], member_count: int | None = None) -> dict[str, Any]:
+    """Name the repository as the caller knows it and say what they may do."""
+    shared = access["role"] != "owner"
+    if shared:
+        presented["owner_repo_name"] = presented.get("repo_name")
+        presented["repo_name"] = access["repo_name"]
+    presented["access_role"] = access["role"]
+    presented["shared"] = shared
+    presented["owner_label"] = access.get("owner_label") if shared else None
+    if not shared and member_count is not None:
+        # Listed for the owner only: how many people the repository is shared with.
+        presented["member_count"] = member_count
+    capabilities = presented.get("capabilities")
+    if isinstance(capabilities, dict):
+        capabilities["propose_changes"] = bool(capabilities.get("propose_changes")) and role_allows(access["role"], "edit")
+    return presented
+
+
+def _with_staging(presented: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    run_prefix = row.get("run_prefix")
+    presented["staging_prefix"] = None if not run_prefix or is_initial_run(run_prefix) else run_prefix
+    return presented
+
+
+async def fetch_accessible_repository(store, user_id: str, repo_name: str, *, permission: str = "view") -> dict[str, Any]:
+    """Like ``fetch_owned_repository``, for the owner or a member it is shared with.
+
+    The owner's lookup is the same single query as before. A member's
+    repository is found by their alias and reported under that name, with
+    ``access_role`` and ``owner_label``. Non-members get 404 (never data) and
+    a member whose role lacks ``permission`` ("view", "edit" or "manage")
+    gets 403.
+    """
+    row = await store.fetch_one(REPOSITORY_SELECT + "WHERE r.user_id = ? AND r.repo_name = ?", [user_id, repo_name])
+    if row:
+        access = _access("owner", repo_name, row)
+    else:
+        rows = await _sharing_rows(
+            store, _MEMBER_SELECT + "WHERE m.user_id = ? AND m.alias = ? AND m.removed_at IS NULL", [user_id, repo_name],
+        )
+        if not rows:
+            await _raise_unavailable(store, user_id, repo_name)
+        row = rows[0]
+        access = _access(str(row["member_role"]), repo_name, row, row.get("member_owner_label"))
+    _require_permission(access, permission)
+    return _with_staging(_apply_access(present_repository(row), access), row)
+
+
+def unique_alias(name: str, taken: set[str]) -> str:
+    """``name``, or ``name-shared`` (then ``-shared-2``...) when it is taken."""
+    if name not in taken:
+        return name
+    base = f"{name[:180]}-shared"
+    candidate, number = base, 2
+    while candidate in taken:
+        candidate, number = f"{base}-{number}", number + 1
+    return candidate
+
+
+async def taken_repository_names(store, user_id: str) -> set[str]:
+    """Every name in a user's namespace: their repositories and active shares."""
+    rows = await store.fetch_all(
+        "SELECT repo_name AS name FROM repos WHERE user_id = ? "
+        "UNION SELECT alias AS name FROM repo_members WHERE user_id = ? AND removed_at IS NULL",
+        [user_id, user_id],
+    )
+    return {str(row["name"]) for row in rows}
+
+
+async def list_accessible_repositories(store, user_id: str) -> list[dict[str, Any]]:
+    """The user's repositories (newest first), then the ones shared with them."""
+    owned = await list_repositories(store, user_id)
+    counts = {
+        str(row["repo_id"]): _int(row.get("members"))
+        for row in await _sharing_rows(
+            store,
+            "SELECT m.repo_id, COUNT(*) AS members FROM repo_members m JOIN repos r ON r.id = m.repo_id "
+            "WHERE r.user_id = ? AND m.removed_at IS NULL GROUP BY m.repo_id",
+            [user_id],
+        )
+    }
+    for repo in owned:
+        _apply_access(repo, {"role": "owner", "repo_name": repo["repo_name"]}, counts.get(str(repo["id"]), 0))
+    rows = await _sharing_rows(
+        store, _MEMBER_SELECT + "WHERE m.user_id = ? AND m.removed_at IS NULL ORDER BY m.joined_at DESC", [user_id],
+    )
+    taken = {str(repo["repo_name"]) for repo in owned}
+    shared = []
+    for row in rows:
+        alias = str(row["member_alias"])
+        if alias in taken:
+            # The member later indexed or renamed a repository of their own to
+            # this name; their own one keeps it and the share moves aside.
+            alias = unique_alias(alias, taken | {str(item["member_alias"]) for item in rows})
+            await store.execute(
+                "UPDATE repo_members SET alias = ?, updated_at = ? WHERE repo_id = ? AND user_id = ? AND removed_at IS NULL",
+                [alias, datetime.now(UTC).isoformat(), row["id"], user_id],
+            )
+        taken.add(alias)
+        access = _access(str(row["member_role"]), alias, row, row.get("member_owner_label"))
+        shared.append(_apply_access(present_repository(row), access))
+    return owned + shared
+
+
+async def remove_repository_access(store, repo_id: str) -> None:
+    """Delete a repository's memberships, invite links and shared answers (with the repository)."""
+    for table in ("repo_members", "repo_invites", "answer_shares"):
+        try:
+            await store.execute(f"DELETE FROM {table} WHERE repo_id = ?", [repo_id])
+        except Exception as error:
+            if "no such table" not in str(error).lower():
+                raise
+
+
 def public_view(repo: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in repo.items() if key != "staging_prefix"}
 

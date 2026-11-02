@@ -160,6 +160,7 @@ const DeleteDialog = ({ repo: snapshot, onClose }) => {
     repo.queryable && `${formatCount(repo.indexed_files)} indexed files`,
     repo.selection?.selected_bytes > 0 && `${formatBytes(repo.selection.selected_bytes)} of indexed source`,
     'the conversation and saved change proposals',
+    repo.member_count > 0 && `access for the ${formatCount(repo.member_count)} ${repo.member_count === 1 ? 'person' : 'people'} you shared it with, and its invite links`,
   ].filter(Boolean);
   return (
     <Modal open onClose={onClose} busy={busy} size="sm" title={`Delete ${repo.repo_name}?`} description="Removes it from your workspace. Your GitHub repository is not affected."

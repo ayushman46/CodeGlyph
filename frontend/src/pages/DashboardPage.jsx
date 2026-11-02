@@ -8,6 +8,7 @@ import RepoDialogs from '../components/workspace/RepoDialogs';
 import RepoInput from '../components/workspace/RepoInput';
 import RepoWorkspace from '../components/workspace/RepoWorkspace';
 import Sidebar from '../components/workspace/Sidebar';
+import MissingRepository from '../components/sharing/MissingRepository';
 import Badge from '../components/ui/Badge';
 import Button from '../components/ui/Button';
 import Kbd from '../components/ui/Kbd';
@@ -243,7 +244,7 @@ const DashboardPage = () => {
   let main;
   if (reposError && !repo && !repos.length) main = <ReposError message={reposError} onRetry={retryRepos} retrying={retrying} />;
   else if (!reposLoaded) main = <LoadingWorkspace withRepo={Boolean(repoName)} />;
-  else if (missing) main = <NotFound name={repoName} />;
+  else if (missing) main = <MissingRepository name={repoName}><NotFound name={repoName} /></MissingRepository>;
   else if (repo) main = <RepoWorkspace repo={repo} onRequestDialog={requestDialog} />;
   else main = <WorkspaceHome repos={repos} />;
 

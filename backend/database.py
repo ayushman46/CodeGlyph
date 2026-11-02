@@ -672,6 +672,7 @@ MIGRATIONS: tuple[tuple[str, frozenset[str]], ...] = (
     ("03_github.sql", frozenset({"user_github_tokens", "github_oauth_states", "github_change_operations"})),
     ("05_performance.sql", frozenset({"repo_index_state", "ingestion_job_meta", "embedding_cache", "ingestion_metrics"})),
     ("06_scale_and_editing.sql", frozenset({"repo_snapshots", "file_vectors", "repo_index_runs", "edit_proposals"})),
+    ("08_sharing.sql", frozenset({"repo_members", "repo_invites", "answer_shares"})),
 )
 
 

@@ -12,11 +12,12 @@ from pydantic import BaseModel, Field
 from api import impact
 from api.auth import get_current_user
 from api.repository_state import (
-    fetch_owned_repository,
+    fetch_accessible_repository,
     friendly_conflict,
-    list_repositories,
+    list_accessible_repositories,
     public_view,
     raise_storage_error,
+    remove_repository_access,
 )
 from database import assert_turso_schema, get_turso_store
 from ingest.pipeline import (
@@ -60,9 +61,13 @@ def _normalise_impact_path(file_path: str) -> str:
     return normalised
 
 
-async def owned_repo(store, user_id: str, repo_name: str):
-    """Compatibility wrapper used by other routers and tests."""
-    return await fetch_owned_repository(store, user_id, repo_name)
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def owned_repo(store, user_id: str, repo_name: str, permission: str = "view"):
+    """Compatibility wrapper used by other routers and tests (owner or member, see ``fetch_accessible_repository``)."""
+    return await fetch_accessible_repository(store, user_id, repo_name, permission=permission)
 
 
 def _database_errors(action: str):
@@ -90,7 +95,7 @@ async def get_status(repo_name: str, current_user=Depends(get_current_user)):
 async def list_repos(current_user=Depends(get_current_user)):
     try:
         await assert_turso_schema()
-        return await list_repositories(get_turso_store(), current_user.id)
+        return await list_accessible_repositories(get_turso_store(), current_user.id)
     except Exception as error:
         _database_errors("load your repositories")(error)
 
@@ -104,7 +109,7 @@ async def list_repo_statuses(current_user=Depends(get_current_user)):
     """
     try:
         await assert_turso_schema()
-        return await list_repositories(get_turso_store(), current_user.id)
+        return await list_accessible_repositories(get_turso_store(), current_user.id)
     except Exception as error:
         _database_errors("refresh indexing progress")(error)
 
@@ -260,8 +265,9 @@ async def delete_repo(repo_name: str, current_user=Depends(get_current_user)):
     try:
         await assert_turso_schema()
         store = get_turso_store()
-        repo = await owned_repo(store, current_user.id, repo_name)
+        repo = await owned_repo(store, current_user.id, repo_name, "manage")
         await delete_repository(store, repo["id"], current_user.id)
+        await remove_repository_access(store, repo["id"])
     except Exception as error:
         _database_errors("delete the repository")(error)
     return {"message": f"Deleted {repo_name} and its index."}
@@ -285,7 +291,7 @@ async def rename_repo(repo_name: str, payload: RenameRepositoryRequest, current_
     try:
         await assert_turso_schema()
         store = get_turso_store()
-        repo = await owned_repo(store, current_user.id, repo_name)
+        repo = await owned_repo(store, current_user.id, repo_name, "manage")
         duplicate = await store.fetch_one(
             "SELECT id FROM repos WHERE user_id = ? AND repo_name = ?", [current_user.id, new_name]
         )
@@ -307,7 +313,7 @@ async def reindex_repository(repo_name: str, current_user=Depends(get_current_us
     try:
         await assert_turso_schema()
         store = get_turso_store()
-        existing = await owned_repo(store, current_user.id, repo_name)
+        existing = await owned_repo(store, current_user.id, repo_name, "manage")
         if existing["is_indexing"]:
             raise IngestionConflictError(
                 "This repository is already being indexed. Wait for it to finish, or stop it first."
@@ -331,7 +337,7 @@ async def cancel_indexing(repo_name: str, current_user=Depends(get_current_user)
     try:
         await assert_turso_schema()
         store = get_turso_store()
-        repo = await owned_repo(store, current_user.id, repo_name)
+        repo = await owned_repo(store, current_user.id, repo_name, "manage")
         outcome = await cancel_repository_indexing(store, repo["id"], current_user.id)
     except Exception as error:
         _database_errors("stop indexing")(error)

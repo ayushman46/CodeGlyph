@@ -19,6 +19,7 @@ import CodeBlock from '../CodeBlock';
 import { LoadingState } from '../ai/LoadingState';
 import { StreamingFollowUps, StreamingText, useSmoothStream } from '../ai/StreamingText';
 import EditProposalCard, { ProposalToolChips, isEditRun } from './EditProposalCard';
+import ShareAnswerButton from '../sharing/ShareAnswerButton';
 
 const STAGE_LABELS = {
   retrieving: 'Searching the indexed code',
@@ -991,6 +992,7 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
         {showCheck && searchTerm && repoName && (
           <CodeSearchCheck repoName={repoName} term={searchTerm} onOpen={(file) => openFile(file, message.id)} onClose={() => setSearchTerm(null)} />
         )}
+        {settled && !isError && !editRun && <ShareAnswerButton message={message} repo={repo} />}
 
         {showArtifact && <EditProposalCard message={message} />}
 

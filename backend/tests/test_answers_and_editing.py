@@ -229,7 +229,7 @@ class DatabaseTestCase(unittest.TestCase):
 
 class SchemaBootstrapTests(DatabaseTestCase):
     def test_migrations_create_every_required_table_and_are_idempotent(self):
-        self.assertEqual(self.applied, ["00_init.sql", "05_performance.sql", "06_scale_and_editing.sql"])
+        self.assertEqual(self.applied, ["00_init.sql", "05_performance.sql", "06_scale_and_editing.sql", "08_sharing.sql"])
         tables = {row["name"] for row in run(self.store.fetch_all("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"))}
         self.assertEqual([table for table in REQUIRED_TABLES if table not in tables], [])
         self.assertIn("chunks_fts", tables)

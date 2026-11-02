@@ -1,6 +1,6 @@
 import {
   ArrowLeft, ArrowRight, BookOpen, Check, Compass, Copy, GitPullRequest, Keyboard, Layers, Lightbulb, Link2,
-  MessageSquareText, Rocket, Search, ShieldCheck,
+  MessageSquareText, Rocket, Search, ShieldCheck, Users,
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
@@ -171,6 +171,34 @@ const SECTIONS = [
     ],
   },
   {
+    id: 'team',
+    label: 'Team access',
+    icon: Users,
+    eyebrow: 'Team access',
+    title: 'Index once, share with your team.',
+    summary: 'Share a repository through an invite link so teammates ask questions against your index instead of indexing it again.',
+    blocks: [
+      {
+        type: 'steps',
+        items: [
+          ['Create a link', 'Open the repository, choose Share, pick a role and how long the link works (1, 7 or 30 days), then copy the link. It is shown only once.'],
+          ['Your teammate joins', 'Signed in, they open the link, see the repository, who shared it and the role, and choose Join. It appears in their sidebar under Shared with you.'],
+          ['Manage access', 'Share shows active links (revoke any of them) and everyone with access: change a role or remove someone. Changes apply on their next request. Team access on your account page lists all of this in one place.'],
+        ],
+      },
+      {
+        type: 'list',
+        items: [
+          ['Viewer', 'Asks questions, searches the code and browses files. Edit & PR is off.'],
+          ['Editor', 'Can also use Edit & PR and open pull requests with their own GitHub connection.'],
+          ['Owner', 'The person who indexed it. Only the owner renames, re-indexes, deletes or shares it, and it counts only toward the owner’s storage.'],
+        ],
+      },
+      { type: 'callout', title: 'Conversations stay private', text: 'Each person’s questions, answers and saved changes are visible only to them. A member who no longer needs a repository can leave it from its header. An invite link that still works brings them back, and a role the owner changed for them stays as set.' },
+      { type: 'callout', title: 'Share one answer', text: 'Share answer under an answer makes a read-only link to a copy of the question, the answer and its sources (pinned to the indexed commit) for anyone signed in. Stop sharing it from the same dialog or from your account page.' },
+    ],
+  },
+  {
     id: 'security',
     label: 'Security & privacy',
     icon: ShieldCheck,
@@ -181,7 +209,7 @@ const SECTIONS = [
       {
         type: 'list',
         items: [
-          ['Account-scoped workspaces', 'Repositories, conversations and usage belong to your account and are visible only to you.'],
+          ['Account-scoped workspaces', 'Repositories, conversations and usage belong to your account. Others see a repository only if you share it with them, and conversations stay private either way.'],
           ['Encrypted GitHub tokens', 'If you connect GitHub, the token is encrypted at rest and never sent to your browser. You can disconnect at any time from your account page.'],
           ['File-scoped PR tickets', 'Reading files for a review and opening a pull request require a short-lived ticket scoped to the files in that change.'],
           ['Untrusted repository content', 'Code, comments, documentation and issues are treated as untrusted input, and the agent is instructed never to act on instructions found inside them.'],

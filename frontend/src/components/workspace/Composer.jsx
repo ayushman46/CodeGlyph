@@ -1,5 +1,5 @@
 import {
-  ChevronDown, ClipboardCheck, Clock, FileCode2, FileText, GitPullRequest, GraduationCap, Layers,
+  ChevronDown, ClipboardCheck, Clock, FileCode2, FileText, GitPullRequest, GraduationCap, Layers, Lock,
   MessageCircleQuestion, MessageSquareText, ShieldCheck, Sparkles, Users, Zap,
 } from 'lucide-react';
 import { forwardRef, useCallback, useEffect, useId, useImperativeHandle, useMemo, useRef, useState } from 'react';
@@ -265,7 +265,7 @@ const PROMPT_BAR_LAYOUT = [
   '[&_[data-slot=prompt-bar-suggestions]_[role=option]>span:last-child]:[overflow-wrap:anywhere]',
 ].join(' ');
 
-const Composer = forwardRef(({ onSubmit, onStop, busy, disabled, disabledReason }, ref) => {
+const Composer = forwardRef(({ onSubmit, onStop, busy, disabled, disabledReason, editDisabledReason = '' }, ref) => {
   const [text, setText] = useState('');
   const [preferences, setPreferences] = useState(readPreferences);
   // The `@word` / `/word` at the caret, tracked like the Prompt Bar does.
@@ -284,7 +284,9 @@ const Composer = forwardRef(({ onSubmit, onStop, busy, disabled, disabledReason 
   const touchKeyboard = useMediaQuery('(hover: none) and (pointer: coarse)');
   const { items: mentions, searching } = useFileMentions(repoName, suggestion);
 
-  const editing = preferences.mode === 'edit';
+  // A viewer of a shared repository cannot use Edit & PR (the server refuses
+  // it too); their saved preference is kept for repositories where they can.
+  const editing = preferences.mode === 'edit' && !editDisabledReason;
   const length = text.trim().length;
   const tooLong = length > MAX_QUESTION_LENGTH;
   const stop = onStop || stopQuery;
@@ -444,6 +446,12 @@ const Composer = forwardRef(({ onSubmit, onStop, busy, disabled, disabledReason 
 
   return (
     <div ref={rootRef} className="@container mx-auto w-full max-w-3xl">
+      {editDisabledReason && !waitingReason && (
+        <p className="mb-2 flex items-start gap-2 px-1 text-[12.5px] leading-snug text-ink-3" data-slot="edit-disabled-reason">
+          <Lock className="mt-px h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          <span>{editDisabledReason}</span>
+        </p>
+      )}
       {waitingReason && (
         <p className="mb-2 flex items-start gap-2 px-1 text-[12.5px] leading-snug text-ink-2" role="status">
           {historyLoading
@@ -453,7 +461,7 @@ const Composer = forwardRef(({ onSubmit, onStop, busy, disabled, disabledReason 
         </p>
       )}
       <PromptBar
-        data-mode={preferences.mode}
+        data-mode={editing ? 'edit' : 'ask'}
         className={PROMPT_BAR_LAYOUT}
         value={text}
         onValueChange={changeText}
@@ -486,7 +494,7 @@ const Composer = forwardRef(({ onSubmit, onStop, busy, disabled, disabledReason 
               size="sm"
               label="Mode"
               className="shrink-0 @max-sm:[&_svg]:hidden"
-              value={preferences.mode}
+              value={editing ? 'edit' : 'ask'}
               onChange={(mode) => {
                 setPreferences((current) => ({ ...current, mode }));
                 getInput()?.focus();
@@ -494,7 +502,7 @@ const Composer = forwardRef(({ onSubmit, onStop, busy, disabled, disabledReason 
               // Inert with the rest of the dimmed field while the bar is disabled.
               options={[
                 { value: 'ask', label: 'Ask', icon: MessageSquareText, title: 'Ask questions; answers cite exact files and lines', disabled },
-                { value: 'edit', label: 'Edit & PR', icon: GitPullRequest, title: 'Describe a change; review a validated diff, then open a pull request', disabled },
+                { value: 'edit', label: 'Edit & PR', icon: GitPullRequest, title: editDisabledReason || 'Describe a change; review a validated diff, then open a pull request', disabled: disabled || Boolean(editDisabledReason) },
               ]}
             />
           </>

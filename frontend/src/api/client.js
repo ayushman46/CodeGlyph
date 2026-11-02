@@ -212,6 +212,25 @@ export const searchRepositorySymbols = (repo_name, q, config = {}) => api.get(
  */
 export const continueAnswerRequest = (payload, config = {}) => api.post('/query', payload, { timeout: 300000, ...config });
 
+// Sharing a repository with teammates (owner: invite links, members, roles;
+// member: leave). Invite links are opened with previewInvite/acceptInvite.
+const sharedRepoPath = (repoName) => `/repos/${encodeURIComponent(repoName)}`;
+export const getSharing = (repoName) => api.get(`${sharedRepoPath(repoName)}/sharing`);
+export const createInvite = (repoName, role, expiresInDays) => api.post(
+  `${sharedRepoPath(repoName)}/invites`, { role, expires_in_days: expiresInDays },
+);
+export const revokeInvite = (repoName, inviteId) => api.delete(`${sharedRepoPath(repoName)}/invites/${encodeURIComponent(inviteId)}`);
+export const changeMemberRole = (repoName, userId, role) => api.patch(`${sharedRepoPath(repoName)}/members/${encodeURIComponent(userId)}`, { role });
+export const removeMember = (repoName, userId) => api.delete(`${sharedRepoPath(repoName)}/members/${encodeURIComponent(userId)}`);
+export const leaveRepository = (repoName) => api.delete(`${sharedRepoPath(repoName)}/membership`);
+export const previewInvite = (token) => api.get(`/invites/${encodeURIComponent(token)}`);
+export const acceptInvite = (token) => api.post(`/invites/${encodeURIComponent(token)}/accept`);
+// Read-only links to one answer (the server copies it from your conversation).
+export const shareAnswer = (repoName, messageId, answer) => api.post('/answers/share', { repo_name: repoName, message_id: messageId || '', answer: answer || '' });
+export const getSharedAnswer = (token) => api.get(`/shared-answers/${encodeURIComponent(token)}`);
+export const listAnswerShares = () => api.get('/answers/shares');
+export const revokeAnswerShare = (shareId) => api.delete(`/answers/shares/${encodeURIComponent(shareId)}`);
+
 export default api;
 
 /**
