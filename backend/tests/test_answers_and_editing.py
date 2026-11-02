@@ -1088,7 +1088,8 @@ def edit_response(files, *, title="Return False from logout", **extra):
 
 
 # The "How to verify" section every PR body keeps, built from edit_response's validation.
-VERIFY_SECTION = "\n\n## How to verify\n\n- pytest -q"
+# Nothing is run here, so the testing section says so above the steps (round 2, R2-13).
+VERIFY_SECTION = "\n\n## How to verify\n\nThese commands were not run by Codebase Intel; run them (or let CI run them) before merging.\n\n- pytest -q"
 
 LOGOUT_FIX = {
     "file_path": "src/auth.py", "action": "modify", "summary": "Return False on logout",

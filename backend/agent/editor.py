@@ -3401,6 +3401,10 @@ Rules:
         )
         # GitHub closes the issue only for "Fixes #N" itself ("Fixes issue #N"
         # closes nothing), and the reference must be exact: "#42" is not #4.
+        if not verification.get("tests_run"):
+            # Whatever the template, its testing section says plainly that
+            # the commands it lists were not run here.
+            pr_body = repo_conventions.note_tests_not_run(pr_body)
         pr_body = repo_conventions.ensure_issue_reference(pr_body, issue_link, closes=closes_issue)
         pr_body = pr_body[:repo_conventions.PR_BODY_LIMIT]
         commit_message = repo_conventions.commit_message(title, files)
@@ -3645,7 +3649,7 @@ Rules:
                 f"{tests_check['detail']}; the self-review was skipped ({review['skipped']}), so "
                 f"{'this test was' if len(touched_tests) == 1 else 'these tests were'} neither run nor reviewed"
             )[:600]
-        conventions_check = self._conventions_check(title, conventional)
+        conventions_check = self._conventions_check(title, conventional, [item["file_path"] for item in files])
         review_check = {"id": "review", "label": "Self-review", "status": review_status, "detail": review_detail[:600],
                         "files": review_files[:20]}
         if review.get("trivial"):
@@ -3692,13 +3696,24 @@ Rules:
             "style": style_profiles,
         }
 
-    def _conventions_check(self, title: str, conventional: bool) -> dict:
+    def _conventions_check(self, title: str, conventional: bool, paths: list[str] | None = None) -> dict:
         conventions = self.conventions
         if not (self.owner and self.name):
             return {"id": "conventions", "label": "Conventions", "status": "skipped",
                     "detail": "No GitHub repository to read conventions from", "files": []}
         details = []
+        gaps: list[dict] = []
         status = "pass"
+        missing = repo_conventions.changelog_gap(conventions, list(paths or []))
+        if missing:
+            # The template or CONTRIBUTING asks for it and the change does
+            # not touch it: conventions are not fully met.
+            status = "warn"
+            source = str((conventions.get("changelog") or {}).get("source") or "the repository")
+            message = f"changelog entry not added ({source} asks for one{' in ' + missing if missing != 'a changelog entry' else ''})"
+            details.append(message)
+            gaps.append({"file_path": missing if missing != "a changelog entry" else source, "line": None, "column": None,
+                         "message": "changelog entry not added"})
         if conventions.get("pr_template_path"):
             details.append(f"PR body follows {conventions['pr_template_path']} (checkboxes left for you)")
         if conventional:
@@ -3714,7 +3729,8 @@ Rules:
         if not details:
             details.append("No PR template or commit convention found; the PR uses Summary, Changes and How to verify")
         text = "; ".join(details)
-        return {"id": "conventions", "label": "Conventions", "status": status, "detail": (text[:1].upper() + text[1:])[:600], "files": []}
+        return {"id": "conventions", "label": "Conventions", "status": status, "detail": (text[:1].upper() + text[1:])[:600],
+                "files": gaps}
 
     def _append_check_calls(self, files: list[dict], checks: dict, completeness: dict, review: dict, quality: dict) -> None:
         paths = [item["file_path"] for item in files]

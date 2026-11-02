@@ -65,6 +65,8 @@ Report a problem ONLY when one of these holds:
 (b) you can copy into "evidence", character for character, the exact code shown below that is wrong, and you can name a
     concrete input or case whose result is wrong. Before claiming that a value is mishandled, evaluate the existing code
     with that value step by step. Never add a check for a case the existing code already rejects or handles.
+(c) an added test asserts a message or string that no line shown produces on the path the test exercises: copy the
+    assertion line into "evidence" and say which line produces the text instead (or that none does).
 Do not report preferences, optional extra tests or docs, or improvements the request did not ask for, unless a numbered
 finding names them.
 
@@ -76,6 +78,13 @@ What to check:
    fail), unresolved imports, syntax errors.
 3. Imports and exports of the changed lines: every imported name exists and paths follow the repository's convention.
 4. Repository coding rules (such as AGENTS.md), for the lines the change adds.
+5. Every added test assertion that checks a message or string (an exception message, `match=...`, `"..." in str(e.value)`,
+   `toThrow('...')`, an equality with a string): find the exact line of the PROPOSED or CURRENT content that produces
+   that text on the path the test exercises, and write a verification line that names it as path:line, for example
+   "test asserts 'invalid key' (tests/test_x.py:40): produced by src/app.py:120 raise TypeError(f'invalid key {k!r}'),
+   the branch the test calls: OK". A message produced only by a different branch (one the test does not reach, or one
+   the patch did not change while the test expects the patch's behaviour) does not count. When you cannot point to
+   such a line, report a problem under rule (c); never approve the test.
 
 Return EXACTLY one JSON object wrapped in <code_review></code_review> tags:
 {
@@ -137,6 +146,47 @@ def _case_line(case: dict) -> str:
     return f"- this script{reported}:\n" + "\n".join(f"    {line}" for line in code.split("\n"))
 
 
+# A test line that asserts something about a string (Python and JavaScript runners).
+_ASSERTION_LINE = re.compile(
+    r"\bassert\b|\bassert[A-Z]\w*\(|\bmatch\s*=|\bexpect\s*\(|\.to(?:Throw|ThrowError|Match|Contain|Be|Equal|StrictEqual)\w*\("
+    r"|\bt\.(?:is|deepEqual|regex|throws|throwsAsync|true|false|like)\(|\b(?:pytest\.raises|raises|throws)\b"
+)
+_STRING_LITERAL = re.compile(r"""(?<![\w])(?:[rbfu]{0,2})(['"`])((?:\\.|(?!\1)[^\\\n]){3,200})\1""", re.IGNORECASE)
+MESSAGE_ASSERTION_LIMIT = 12
+
+
+def message_assertions(files: list[dict]) -> list[dict]:
+    """Added test lines that assert a message or string: ``{file_path, line, code, texts}``, at most 12.
+
+    Only lines the change adds to test files count; a string that is a
+    path, a URL or a single identifier-like word of one character class is
+    still listed (the review decides), but a line without any string
+    literal is not.
+    """
+    from agent.quality import added_line_indices, is_test_path
+
+    found: list[dict] = []
+    for item in files:
+        after = item.get("after")
+        if not isinstance(after, str) or not is_test_path(str(item.get("file_path") or "")):
+            continue
+        before = "" if item.get("action") == "create" else str(item.get("before") or "")
+        lines = after.replace("\r\n", "\n").split("\n")
+        for index in sorted(added_line_indices(before, after)):
+            if index >= len(lines):
+                continue
+            code = lines[index].strip()
+            if not code or code.startswith(("#", "//")) or not _ASSERTION_LINE.search(code):
+                continue
+            texts = [match.group(2) for match in _STRING_LITERAL.finditer(code)]
+            if not texts:
+                continue
+            found.append({"file_path": item["file_path"], "line": index + 1, "code": code[:240], "texts": texts[:4]})
+            if len(found) >= MESSAGE_ASSERTION_LIMIT:
+                return found
+    return found
+
+
 def build_review_messages(*, request_text: str, conventions_text: str, findings: list[str], files: list[dict],
                           related: list[dict], title: str = "", template: str = "", conventional: bool = False,
                           cases: list[dict] | None = None) -> list[dict]:
@@ -187,6 +237,14 @@ def build_review_messages(*, request_text: str, conventions_text: str, findings:
                  "step by step (every argument it passes, including fallbacks such as default names) and add one "
                  "verification line per case saying what it does after the change:\n"
                  + "\n".join(_case_line(case) for case in cases[:12]) + "\n\n")
+    assertions = message_assertions(files)
+    if assertions:
+        # Static only: the review must point at the line that produces each
+        # asserted text, or report that no line shown does.
+        head += ("Strings the added tests assert. Nothing was run: for EACH, name the line of the PROPOSED or CURRENT "
+                 "content that produces it on the path the test exercises (path:line) in a verification line, or report a "
+                 "problem under rule (c) when no line shown does:\n"
+                 + "\n".join(f"- {entry['file_path']}:{entry['line']} {entry['code']}" for entry in assertions) + "\n\n")
     # Changed files get the budget first; related source is shown before
     # them (read the source, then judge the change) when it still fits.
     used = len(REVIEW_SYSTEM) + len(head)

@@ -80,7 +80,7 @@ def empty_conventions(note: str = "") -> dict:
         "contributing_path": None, "contributing_excerpt": "", "agent_instructions_path": None,
         "agent_instructions": "", "dco_required": False, "notes": [note] if note else [],
         "repo_style": build_repo_style(), "sources": [], "test_command": "", "test_command_source": "", "test_runner": "",
-        "package_manager": "", "complete": False,
+        "package_manager": "", "complete": False, "changelog": None,
     }
 
 
@@ -371,6 +371,14 @@ async def detect_conventions(*, owner: str, name: str, repo_id: str, commit_sha:
         notes.append("Commits need a DCO sign-off (Signed-off-by: Name <email>); GitHub's DCO check fails without it.")
         if ".github/dco.yml" in texts:
             sources.append(".github/dco.yml")
+    # A template's instructions are often HTML comments (Flask's "Add an
+    # entry in CHANGES.rst ..."), so the raw texts are read here.
+    for path in (template_path, contributing_path):
+        found = changelog_requirement(texts.get(path or "", ""))
+        if path and found is not None:
+            conventions["changelog"] = {"path": found, "source": path}
+            notes.append(f"{path} asks for a changelog entry" + (f" in {found}." if found else "."))
+            break
 
     prettier_name = next((path for path in (".prettierrc", ".prettierrc.json", ".prettierrc.yaml", ".prettierrc.yml") if path in texts), None)
     conventions["repo_style"] = build_repo_style(
@@ -533,6 +541,83 @@ async def _has_manifest(store: Any, repo_id: str) -> bool:
     except Exception:
         return False
     return bool(row)
+
+
+# A changelog file a PR template or CONTRIBUTING asks contributors to update.
+_CHANGELOG_FILE = re.compile(
+    r"(?<![\w-])((?:[\w.-]+/)*(?:(?i:changes|changelog|change_log|history|news|release[-_]notes|whatsnew)"
+    r"\.(?i:rst|md|txt|markdown|adoc)|(?:CHANGES|CHANGELOG|HISTORY|NEWS)(?![\w.])))"
+)
+_CHANGELOG_WORD = re.compile(r"\bchange\s?log\b|\brelease\s+notes?\b", re.IGNORECASE)
+_CHANGELOG_ASK = re.compile(
+    r"\b(?:add|update|include|write|document|record|mention)(?:s|d|ed|ing)?\b|\b(?:entry|entries|note)\b", re.IGNORECASE)
+_CHANGELOG_NEGATION = re.compile(
+    r"\b(?:do\s+not|don't|never|no\s+need|not\s+(?:required|needed|necessary)|maintainers?\s+(?:will|do|handle)|"
+    r"(?:is|are)\s+(?:generated|automated|automatic))\b",
+    re.IGNORECASE,
+)
+
+
+def changelog_requirement(text: str) -> str | None:
+    """The changelog file ``text`` asks contributors to update ("CHANGES.rst"), "" for any changelog, or None.
+
+    A line (HTML comments included) must name the file or the word
+    "changelog" next to a verb such as "add" / "update" / "entry", and must
+    not say it is not needed or generated.
+    """
+    for raw in str(text or "").replace("\r\n", "\n").split("\n"):
+        line = raw.strip()
+        if not line or not _CHANGELOG_ASK.search(line) or _CHANGELOG_NEGATION.search(line):
+            continue
+        match = _CHANGELOG_FILE.search(line)
+        if match:
+            return match.group(1).strip("`'\".,;:")
+        if _CHANGELOG_WORD.search(line):
+            return ""
+    return None
+
+
+def changelog_gap(conventions: dict | None, paths: list[str]) -> str:
+    """"" when the changelog the repository asks for is changed by ``paths`` (or none is asked for), else the expected file.
+
+    A named file matches by its file name (CHANGES.rst at the root or in
+    docs/); "any changelog" matches a file named like one.
+    """
+    changelog = (conventions or {}).get("changelog")
+    if not isinstance(changelog, dict):
+        return ""
+    wanted = str(changelog.get("path") or "")
+    names = [posixpath.basename(path).lower() for path in paths]
+    if wanted:
+        if posixpath.basename(wanted).lower() in names:
+            return ""
+        return wanted
+    if any(re.match(r"^(?:changes|changelog|change_log|history|news|release[-_]notes)(?:\.|$)", name) for name in names):
+        return ""
+    return "a changelog entry"
+
+
+# The one sentence every PR body's testing section carries while nothing was run.
+TESTS_NOT_RUN_NOTE = "These commands were not run by Codebase Intel; run them (or let CI run them) before merging."
+
+
+def note_tests_not_run(body: str) -> str:
+    """The body with ``TESTS_NOT_RUN_NOTE`` at the top of its first testing / verification section.
+
+    Any template: the first heading that reads as testing ("Testing", "How
+    has this been tested?", "How to verify", "Test plan") gets it; a body
+    without one gains "## How to verify" with the note. Never added twice.
+    """
+    text = str(body or "").replace("\r\n", "\n")
+    if TESTS_NOT_RUN_NOTE in text:
+        return text
+    for match in _HEADING.finditer(text):
+        if _VERIFY_HEADING.match(match.group(0)) or _section_kind(match.group(2)) == "testing":
+            end = text.find("\n", match.start())
+            end = len(text) if end < 0 else end
+            rest = text[end:].lstrip("\n")
+            return f"{text[:end].rstrip()}\n\n{TESTS_NOT_RUN_NOTE}" + (f"\n\n{rest}" if rest.strip() else "")
+    return f"{text.strip()}\n\n## How to verify\n\n{TESTS_NOT_RUN_NOTE}".strip()
 
 
 def conventions_summary(conventions: dict) -> str:
