@@ -281,6 +281,22 @@ class TestSetupTests(unittest.TestCase):
         go = {"test_command": "go test ./...", "test_runner": "go"}
         self.assertEqual(repo_conventions.targeted_test_command(go, ["pkg/api/handler_test.go"]), "go test ./pkg/api")
 
+    def test_only_files_with_tests_narrow_the_command_and_a_cd_recipe_is_kept_whole(self):
+        conventions = {"test_command": "python -m pytest tests", "test_runner": "pytest"}
+        # pytest collects nothing from helpers or conftest.py ("no tests ran").
+        self.assertEqual(repo_conventions.targeted_test_command(conventions, ["tests/conftest.py", "tests/utils.py",
+                                                                              "tests/__init__.py"]), "python -m pytest tests")
+        self.assertEqual(repo_conventions.targeted_test_command(conventions, ["tests/conftest.py", "tests/test_x.py",
+                                                                              "tests/x_test.py"]),
+                         "python -m pytest tests/test_x.py tests/x_test.py")
+        # Repository paths are wrong after "cd backend", so the recipe stays as it is.
+        command, _source, runner = repo_conventions.test_setup({"Makefile": "test:\n\tcd backend && pytest\n"})
+        self.assertEqual((command, runner), ("cd backend && pytest", "pytest"))
+        self.assertEqual(repo_conventions.targeted_test_command({"test_command": command, "test_runner": runner},
+                                                                ["backend/tests/test_x.py"]), "cd backend && pytest")
+        self.assertEqual(repo_conventions.targeted_test_command({"test_command": "pytest; flake8", "test_runner": "pytest"},
+                                                                ["tests/test_x.py"]), "pytest; flake8")
+
 
 class PullRequestBodyTests(unittest.TestCase):
     FILES = [{"file_path": "src/flask/app.py", "action": "modify", "summary": "Name the endpoint in the error"}]

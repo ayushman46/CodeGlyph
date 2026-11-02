@@ -494,15 +494,27 @@ def test_setup(texts: dict[str, str], *, package: dict | None = None, manager: s
     return "", "", ""
 
 
+# Files pytest collects tests from by default (python_files = test_*.py *_test.py).
+_PYTEST_FILE = re.compile(r"(?:^|/)(?:test_[^/]*|[^/]*_test)\.py$")
+
+
 def targeted_test_command(conventions: dict | None, test_paths: list[str]) -> str:
-    """The repository's test command narrowed to the changed test files when its runner takes paths, else the whole command."""
+    """The repository's test command narrowed to the changed test files when its runner takes paths, else the whole command.
+
+    Only files the runner collects count: pytest finds no tests in
+    conftest.py, helpers or fixtures (and exits with "no tests ran"). A
+    command that changes directory or chains commands ("cd backend &&
+    pytest") is never narrowed, since repository paths would be wrong there.
+    """
     data = conventions or {}
     command = str(data.get("test_command") or "").strip()
     runner = str(data.get("test_runner") or "")
     if not command:
         return ""
+    if re.search(r"(?:^|[\s;&|(])(?:cd|pushd)\s|&&|\|\||;", command):
+        return command
     if runner == "pytest":
-        python_tests = [path for path in test_paths if path.endswith(".py")][:6]
+        python_tests = [path for path in test_paths if _PYTEST_FILE.search(path)][:6]
         prefix = re.match(r"^(.*?\b(?:pytest|py\.test))\b", command)
         if python_tests and prefix:
             return f"{prefix.group(1)} {' '.join(python_tests)}"
