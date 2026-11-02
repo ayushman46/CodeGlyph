@@ -8,7 +8,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { errorMessage, searchRepository } from '../../api/client';
 import { citationsToSources, shouldPaceReply } from '../../lib/ai/streamingText';
-import { absenceTerms, markdownSection, splitSearchMatches, withoutInterruptionNote } from '../../lib/answerText';
+import { absenceTerms, markdownSection, searchName, splitSearchMatches, withoutInterruptionNote } from '../../lib/answerText';
 import {
   answerLinkTarget, basename, citationExcerpt, compactPath, formatLines, groupByDirectory, markdownWithPermalinks,
   matchCitation, normaliseCitationMarkdown, referenceReasonLabel, resolveReference, summariseReferences,
@@ -490,7 +490,7 @@ const CodeSearchCheck = ({ repoName, term, onOpen, onClose }) => {
   useEffect(() => {
     const controller = new AbortController();
     setState({ loading: true, results: [], error: '' });
-    searchRepository(repoName, term, { signal: controller.signal })
+    searchRepository(repoName, searchName(term) || term, { signal: controller.signal })
       .then((response) => setState({ loading: false, results: response.data?.results || [], error: '' }))
       .catch((error) => {
         if (error?.code === 'ERR_CANCELED' || error?.name === 'CanceledError') return;

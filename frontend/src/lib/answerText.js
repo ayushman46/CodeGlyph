@@ -95,8 +95,18 @@ const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
  *   `exact` and `partial` hold `{file_path, line, text}` per matching line;
  *   `longerNames` are up to three identifiers that contain the name.
  */
+/**
+ * What to search the index for to check a code name: its last part
+ * (`HTTPTransport.handle_request` -> `handle_request`). Code is written
+ * `self.handle_request(` or `def handle_request(`, so searching the dotted
+ * name found almost nothing and reported real methods as missing.
+ *
+ * @param {string} term
+ */
+export const searchName = (term) => String(term || '').trim().replace(/\(\)$/, '').split(/\.|::/).pop() || '';
+
 export const splitSearchMatches = (results, term) => {
-  const name = String(term || '').trim().replace(/\(\)$/, '').split(/\.|::/).pop() || '';
+  const name = searchName(term);
   const whole = name ? new RegExp(`(?<![\\w$])${escapeRegExp(name)}(?![\\w$])`) : null;
   const lowered = name.toLowerCase();
   const exact = [];

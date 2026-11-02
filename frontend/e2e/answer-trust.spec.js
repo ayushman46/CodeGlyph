@@ -159,6 +159,28 @@ test('an answer that says it did not retrieve a name offers a one-click code sea
   await expect(page.getByRole('complementary', { name: `File ${CITED_PATH}` }).first()).toBeVisible();
 });
 
+test('a dotted method name is searched by its own name, so a real method is found (R2-04)', async ({ page }) => {
+  await mockApi(page);
+  await routeStream(page, () => [['done', done({
+    answer: `## Evidence limits\nI did not retrieve \`HTTPTransport.handle_request\`, so the transport step is not shown (\`${CITED_PATH}:L42-L118\`).`,
+  })]]);
+  const asked = [];
+  await page.route('**/api/repos/cal.com/search**', (route) => {
+    asked.push(new URL(route.request().url()).searchParams.get('q'));
+    return route.fulfill({
+      status: 200, contentType: 'application/json', body: JSON.stringify({ query: 'handle_request', results: [
+        { file_path: 'httpx/_transports/default.py', start_line: 220, end_line: 260, matches: [{ line: 230, text: '    def handle_request(self, request):' }] },
+      ] }),
+    });
+  });
+  await page.goto('/app/r/cal.com');
+  await ask(page, 'Trace Client.get to the transport.');
+  await page.getByRole('button', { name: 'Search code for HTTPTransport.handle_request' }).click();
+  const result = page.locator('[data-slot="code-search-check"]');
+  await expect(result).toContainText('Found handle_request (the last part of HTTPTransport.handle_request) in 1 place in the indexed code');
+  expect(asked).toEqual(['handle_request']);
+});
+
 test('a failed Detailed answer names the failure and offers Retry with Fast', async ({ page }) => {
   await mockApi(page);
   const payloads = await routeStream(page, (payload) => (payload.model_profile === 'detailed' ? [['done', done({

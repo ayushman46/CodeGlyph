@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { absenceTerms, markdownSection, splitSearchMatches, withoutInterruptionNote } from './answerText.js';
+import { absenceTerms, markdownSection, searchName, splitSearchMatches, withoutInterruptionNote } from './answerText.js';
 
 const ANSWER = [
   '## Direct answer',
@@ -93,4 +93,14 @@ test('withoutInterruptionNote removes only the server note that ends a stopped a
   const quoted = `> The answer was interrupted. Quoted earlier.\n\n${answer}`;
   assert.equal(withoutInterruptionNote(quoted), quoted);
   assert.equal(withoutInterruptionNote(undefined), '');
+});
+
+test('searchName checks a dotted or qualified code name by its last part', () => {
+  // A method is written `def handle_request(` or `self.handle_request(`, so
+  // searching `HTTPTransport.handle_request` reported real methods as missing.
+  assert.equal(searchName('HTTPTransport.handle_request'), 'handle_request');
+  assert.equal(searchName('Client.get()'), 'get');
+  assert.equal(searchName('std::vector'), 'vector');
+  assert.equal(searchName('  _set_timeout '), '_set_timeout');
+  assert.equal(searchName(''), '');
 });
