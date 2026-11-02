@@ -39,12 +39,12 @@ Deferred (need owner input or infrastructure): FEAT-07 sandboxed test runs (cost
 T1 answer trust (BUG-02/05/07/09 + absence wording) · T2 retrieval (BUG-04/06) · T3 navigation (BUG-03/11/12, FEAT-01/03/10/02) · T4 conversations (BUG-01, FEAT-04/09) · T5 impact (BUG-10/15, FEAT-05) · T6 team access (FEAT-06/15) · T7 onboarding + indexing UX (FEAT-14/08, BUG-13/14, UX-07/04) · T8 Edit & PR honesty (BUG-08/16, FEAT-13).
 
 ## Changes
+- Batch 1 merged into `ux-polish-and-pr-flow` (each track implemented → adversarially reviewed → fixed): T7 onboarding/indexing, T5 impact, T3 navigation, T1 answer trust, T6 team access. Integration fixes: new `/files`, `/symbols` endpoints use the shared-access lookup and are in the team-access route-coverage test (with `/impact/suggestions`); sidebar file count uses searchable files inside the new shared/owned list.
 - Dev tooling: `scripts/dev_server.py` accepts `local:<id>` bearer tokens; the e2e/test build reads `ci-e2e-user` (frontend/src/api/supabase.js, test builds only).
 
 ## Verification log
-_(pending)_
+- After merging T7, T5, T3, T1, T6: backend 1077 tests OK (2 skipped); frontend unit 352 pass; `vite build` OK. Playwright e2e not yet run on the merged branch (held until the remaining fix agents stop using ports 4173/4174).
 
 ## Next step
-Batch 1 is running as workflow run `wf_f9352695-2a0` (8 tracks → review → fix; branches `track/t1-answer-trust` … `track/t8-edit-honesty`, one git worktree each, live checks on ports 8101–8108 / 5301–5308 against copies of `sim/sim-snapshot-r1.db`).
-When it finishes: merge each `track/*` branch into `ux-polish-and-pr-flow` (hot spots: query_router.py, useStore.js, RepoWorkspace.jsx, api/client.js, database.py MIGRATIONS, Sidebar.jsx, explore_router.py, repository_state.py), run all suites, restart `sim/backend.sh` + `sim/frontend.sh`, then run customer round 2 on the acceptance scenarios.
-If this session ends first: re-run the workflow with `resumeFromRunId` (see the Workflow tool output) or inspect `git branch --list 'track/*'` and `git worktree list` to merge whatever finished.
+Fix step for T2 retrieval, T4 conversations and T8 Edit & PR is running as workflow run `wf_175f4b69-751` (script `scratchpad/merge/finish-fixes.js`; worktrees `.claude/worktrees/wf_f9352695-2a0-{2,4,8}`). The first attempt stopped at a usage limit; do NOT resume `wf_f9352695-2a0` (resume re-runs every fix agent after the first changed one).
+When it finishes: merge `track/t2-retrieval`, `track/t4-conversations`, `track/t8-edit-honesty` (T4 then T8: T8's tests call `get_conversation_history`, which T4 gives a required `conversation_id`; T4 conversation routes must use the shared-access lookup and be added to `repo_routes()` in backend/tests/test_team_access.py; MIGRATIONS order 07 then 08 and the migration-list test). Then run all suites including `cd frontend && CI=1 npx playwright test`, restart `sim/backend.sh` + `sim/frontend.sh`, and run customer round 2.
