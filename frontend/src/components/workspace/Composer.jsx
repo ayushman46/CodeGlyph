@@ -235,7 +235,7 @@ const WorkflowMenu = ({ value, onChange, disabled }) => {
           {WORKFLOWS.map((item) => {
             const ItemIcon = item.icon;
             return (
-              <MenuRadioItem key={item.value} value={item.value}>
+              <MenuRadioItem key={item.value} value={item.value} closeOnClick>
                 <span className="flex min-w-0 items-center justify-between gap-3">
                   <span className="flex min-w-0 items-center gap-1">
                     <ItemIcon aria-hidden="true" />

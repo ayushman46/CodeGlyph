@@ -388,14 +388,19 @@ export const markdownWithPermalinks = (markdown, { githubUrl, commit, citations 
   }).join('');
 };
 
-/** Find the citation that best matches a reference in the answer text. */
-export const matchCitation = (citations = [], reference) => {
+/**
+ * Find the citation that best matches a reference in the answer text.
+ * `exact`: the reference's path is already a full repository path (the
+ * server resolved it), so a same-named file elsewhere is not a match:
+ * a root `index.js` must not open `examples/mvc/index.js`.
+ */
+export const matchCitation = (citations = [], reference, { exact = false } = {}) => {
   if (!reference) return -1;
   let best = -1;
   let bestScore = -1;
   citations.forEach((citation, index) => {
     const path = citation.file_path || '';
-    if (!(path === reference.path || path.endsWith(`/${reference.path}`))) return;
+    if (!(path === reference.path || (!exact && path.endsWith(`/${reference.path}`)))) return;
     let score = 1;
     if (reference.start && citation.start_line <= reference.start && citation.end_line >= reference.start) score += 2;
     if (path === reference.path) score += 1;

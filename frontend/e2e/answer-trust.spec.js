@@ -186,6 +186,29 @@ test('a dotted method name is searched by its own name, so a real method is foun
   expect(asked).toEqual(['handle_request']);
 });
 
+test('a bare file name the server resolved opens that file, not a same-named source (round 3)', async ({ page }) => {
+  await mockApi(page);
+  const opened = [];
+  page.on('request', (request) => { if (request.url().includes('/repos/cal.com/file?')) opened.push(new URL(request.url()).searchParams.get('path')); });
+  await routeStream(page, () => [['done', done({
+    answer: 'The entry file is `index.js`, which loads `lib/express.js`.',
+    citations: [{
+      file_path: 'examples/mvc/index.js', start_line: 1, end_line: 95, language: 'js', cited_in_answer: false,
+      github_url: `https://github.com/calcom/cal.com/blob/${SHA}/examples/mvc/index.js#L1-L95`,
+    }],
+    answer_references: [
+      { text: 'index.js', file_path: 'index.js', start_line: null, end_line: null, valid: true, reason: null },
+      { text: 'lib/express.js', file_path: 'lib/express.js', start_line: null, end_line: null, valid: true, reason: null },
+    ],
+  })]]);
+  await page.goto('/app/r/cal.com');
+  await ask(page, 'What does index.js load?');
+  await page.locator('.prose-answer').last().getByRole('button', { name: /^index\.js/ }).click();
+  await expect(page.getByRole('complementary', { name: 'File index.js' }).first()).toBeVisible();
+  expect(opened).toContain('index.js');
+  expect(opened).not.toContain('examples/mvc/index.js');
+});
+
 test('a suggested question uses the workflow and model chosen in the composer (R2-09)', async ({ page }) => {
   await page.addInitScript(() => window.localStorage.setItem('ci-composer', JSON.stringify({ mode: 'ask', workflow: 'onboarding', model: 'detailed' })));
   await mockApi(page);
@@ -194,6 +217,18 @@ test('a suggested question uses the workflow and model chosen in the composer (R
   await page.getByRole('button', { name: /Where are the API routes defined/ }).first().click();
   await expect.poll(() => payloads.length).toBe(1);
   expect(payloads[0]).toMatchObject({ workflow: 'onboarding', model_profile: 'detailed' });
+});
+
+test('picking a workflow closes its menu, so the next click asks the suggestion (round 3)', async ({ page }) => {
+  await mockApi(page);
+  const payloads = await routeStream(page, () => [['done', done({ answer: `Routes are defined in \`${CITED_PATH}:L42-L118\`.` })]]);
+  await page.goto('/app/r/cal.com');
+  await page.getByRole('button', { name: /^Workflow:/ }).click();
+  await page.getByRole('menuitemradio', { name: /New engineer onboarding/ }).click();
+  await expect(page.getByRole('menuitemradio', { name: /New engineer onboarding/ })).toHaveCount(0);
+  await page.getByRole('button', { name: /Where are the API routes defined/ }).first().click();
+  await expect.poll(() => payloads.length).toBe(1);
+  expect(payloads[0]).toMatchObject({ workflow: 'onboarding' });
 });
 
 test('a failed Detailed answer names the failure and offers Retry with Fast', async ({ page }) => {

@@ -447,7 +447,7 @@ export function PromptBar({
               <MenuPopup align="start" className="min-w-48">
                 <MenuRadioGroup value={model} onValueChange={(next) => setModel(String(next))}>
                   {models.map((item) => (
-                    <MenuRadioItem key={item.id} value={item.id}>
+                    <MenuRadioItem key={item.id} value={item.id} closeOnClick>
                       <span className="flex min-w-0 items-center justify-between gap-3">
                         <span className="flex min-w-0 items-center gap-1">
                           {item.icon}

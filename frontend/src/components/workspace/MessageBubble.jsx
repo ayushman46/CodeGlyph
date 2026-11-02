@@ -695,15 +695,17 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
       .map((item) => [String(item.text).trim(), item.names || []]),
   ), [message.unverified_identifiers]);
 
+  // References the server resolved carry full repository paths.
+  const serverResolved = Array.isArray(message.answer_references);
   const openReference = useCallback((reference) => {
-    const index = matchCitation(citations, reference);
+    const index = matchCitation(citations, reference, { exact: serverResolved });
     const citation = index >= 0 ? citations[index] : null;
     openFile({
       path: citation?.file_path || reference.path,
       start: reference.start || citation?.start_line || null,
       end: reference.end || citation?.end_line || null,
     }, message.id);
-  }, [citations, openFile, message.id]);
+  }, [citations, openFile, message.id, serverResolved]);
 
   const openCitation = useCallback((citation) => openFile({
     path: citation.file_path, start: citation.start_line || null, end: citation.end_line || null,
@@ -728,7 +730,7 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
       }
       if (resolved) {
         const { reference } = resolved;
-        const index = matchCitation(citations, reference);
+        const index = matchCitation(citations, reference, { exact: serverResolved });
         return (
           <CitationChip
             reference={reference}

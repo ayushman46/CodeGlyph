@@ -208,3 +208,10 @@ test('the link target is the commit the answer was written against', () => {
   assert.deepEqual(answerLinkTarget({}, repo), { githubUrl: repo.github_url, commit: 'beef999' });
   assert.equal(answerLinkTarget({}, { github_url: 'not github' }), null);
 });
+
+test('a server-resolved path matches only its own citation (round 3: index.js opened examples/mvc/index.js)', () => {
+  const citations = [{ file_path: 'examples/mvc/index.js', start_line: 1, end_line: 95 }, { file_path: 'lib/express.js', start_line: 1, end_line: 40 }];
+  assert.equal(matchCitation(citations, { path: 'index.js', start: null }), 0);
+  assert.equal(matchCitation(citations, { path: 'index.js', start: null }, { exact: true }), -1);
+  assert.equal(matchCitation(citations, { path: 'lib/express.js', start: 3 }, { exact: true }), 1);
+});
