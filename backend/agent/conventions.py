@@ -612,7 +612,11 @@ def note_tests_not_run(body: str) -> str:
     if TESTS_NOT_RUN_NOTE in text:
         return text
     for match in _HEADING.finditer(text):
-        if _VERIFY_HEADING.match(match.group(0)) or _section_kind(match.group(2)) == "testing":
+        title = match.group(2)
+        # A file heading ("### tests/test_app.py") is not a testing section.
+        if re.search(r"[/\\]|\.[A-Za-z]{1,5}\b|`", title):
+            continue
+        if _VERIFY_HEADING.match(match.group(0)) or _section_kind(title) == "testing":
             end = text.find("\n", match.start())
             end = len(text) if end < 0 else end
             rest = text[end:].lstrip("\n")

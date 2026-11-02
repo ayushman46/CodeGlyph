@@ -86,6 +86,9 @@ class TestsNotRunNoteTests(unittest.TestCase):
             self.assertIn(f"{heading}\n\n{NOTE}\n\n", noted)
             self.assertEqual(noted.count(NOTE), 1)
             self.assertEqual(repo_conventions.note_tests_not_run(noted), noted)
+        # A per-file heading for a test file is not the testing section (live round 2 run).
+        per_file = "## Changes\n\n### src/requests/models.py\n\n- Decode keys.\n\n### tests/test_requests.py\n\n- Add tests."
+        self.assertEqual(repo_conventions.note_tests_not_run(per_file), f"{per_file}\n\n## How to verify\n\n{NOTE}")
         # A body without a testing section gains one that says so.
         self.assertEqual(repo_conventions.note_tests_not_run("Just a summary."), f"Just a summary.\n\n## How to verify\n\n{NOTE}")
 
