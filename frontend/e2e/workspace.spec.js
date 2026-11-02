@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 import {
-  CITED_PATH, FAILING_PROPOSAL_ID, ISSUE_CASE, REVISED_PROPOSAL_ID, SHA, failingProposal, failingToolCalls, mockApi, prStatusPassed,
-  proposal as fixtureProposal, revisedProposal,
+  CITED_PATH, FAILING_PROPOSAL_ID, ISSUE_CASE, ISSUE_LOOP, REVISED_PROPOSAL_ID, SHA, failingProposal, failingToolCalls, mockApi,
+  prStatusPassed, proposal as fixtureProposal, revisedProposal,
 } from './fixtures.js';
 
 test.use({ baseURL: process.env.E2E_WORKSPACE_URL || 'http://127.0.0.1:4174' });
@@ -528,6 +528,8 @@ test('(e) a revision whose tests were not run says so on the card and in the rev
   await expect(notRun.locator('[data-slot="test-command"]')).toHaveText('python -m pytest tests/test_requests.py');
   await expect(notRun).toContainText('(from the test target in the Makefile)');
   await expect(notRun.locator('[data-slot="how-to-verify"]')).toContainText(ISSUE_CASE);
+  // A loop from the issue keeps its lines and indentation.
+  expect(await notRun.locator('[data-slot="case-block"]').textContent()).toBe(ISSUE_LOOP);
   await expect(card.locator('[data-slot="quality-passed"]')).toHaveText('Static checks passed: syntax, style, tests touched.');
   await expect(card.locator('[data-slot="quality-review"]')).toContainText('Self-review: No problems found by reading the diff (nothing was run)');
 

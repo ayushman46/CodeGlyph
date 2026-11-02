@@ -99,11 +99,16 @@ export const buildPrBody = (proposal) => {
   const validation = (Array.isArray(proposal?.validation) ? proposal.validation : [])
     .filter((step) => typeof step === 'string' && step.trim())
     .map((step) => step.trim());
-  // A step the body already lists as a bullet or checkbox is not repeated.
+  // A step the body already lists as a bullet or checkbox is not repeated
+  // (a step with a code block is matched by its first line).
   const listed = new Set(body.split(/\r?\n/).map((line) => line.replace(/^\s*[-*+]\s+(?:\[[ xX]\]\s+)?/, '').trim()));
-  const missing = validation.filter((step) => !listed.has(step) && !listed.has(`\`${step}\``));
+  const missing = validation.filter((step) => {
+    const first = step.split('\n')[0].trim();
+    return !listed.has(first) && !listed.has(`\`${first}\``);
+  });
+  // A step's further lines (a code block) are indented to stay in its item.
   const checklist = missing.length && !hasTestingSection(body)
-    ? `\n\n## Testing\n${missing.map((step) => `- [ ] ${step}`).join('\n')}`
+    ? `\n\n## Testing\n${missing.map((step) => `- [ ] ${step.replace(/\n/g, '\n  ')}`).join('\n')}`
     : '';
   return `${body}${checklist}`.slice(0, PR_BODY_LIMIT - PR_FOOTER.length) + PR_FOOTER;
 };
@@ -264,15 +269,38 @@ export const qualitySummary = (proposal) => {
   };
 };
 
-// A step that runs a test suite ("pytest tests/x.py -v", "npm test", "go test ./...").
-const TEST_COMMAND = /\b(?:python3?\s+-m\s+pytest|pytest|py\.test|(?:npm|yarn|pnpm|bun)\s+(?:run\s+)?test|go\s+test|cargo\s+test|make\s+test|tox|nox|jest|vitest|mocha|rspec|phpunit)\b[^`]*/i;
+// A test runner ("pytest tests/x.py -v", "npm test", "go test ./...").
+const TEST_RUNNER = String.raw`(?:python3?\s+-m\s+pytest|pytest|py\.test|(?:npm|yarn|pnpm|bun)\s+(?:run\s+)?test|go\s+test|cargo\s+test|make\s+test|tox|nox|jest|vitest|mocha|rspec|phpunit)\b`;
+const TEST_COMMAND = new RegExp(String.raw`\b${TEST_RUNNER}`, 'i');
+const STARTS_WITH_TEST_COMMAND = new RegExp(String.raw`^${TEST_RUNNER}`, 'i');
+// Words of a sentence, never arguments of a test command ("pytest and confirm that ...").
+const PROSE_WORD = /^(?:and|or|to|the|that|then|make|sure|confirm|check|verify|ensure|see|it|is|are|should|pass(?:es)?|fail(?:s)?|nothing|breaks?|with|for|a|an|all|this|if|when|in|on|of|still|works?|before|after|again)$/i;
+
+/**
+ * The test command a "How to verify" step runs, or '' when the step does not
+ * name one exactly: a backtick span that is a test command ("Run `npm test`
+ * and ..."), or a step that is only the command ("python -m pytest tests -x",
+ * "Run pytest tests/test_x.py"). Prose around a command ("Run pytest and
+ * confirm that test_x passes") is never shown as the command.
+ */
+export const stepCommand = (step) => {
+  const value = text(step);
+  const spans = [...value.matchAll(/`([^`]+)`/g)].map((match) => match[1].trim());
+  if (spans.length) return spans.find((span) => TEST_COMMAND.test(span)) || '';
+  const rest = value.replace(/^run\b:?\s*/i, '').replace(/(?<!\.)[.;]\s*$/, '').trim();
+  const runner = STARTS_WITH_TEST_COMMAND.exec(rest);
+  if (!runner) return '';
+  const words = rest.slice(runner[0].length).replace(/"[^"]*"|'[^']*'/g, ' ').split(/\s+/).filter(Boolean);
+  return words.some((word) => PROSE_WORD.test(word)) ? '' : rest;
+};
 
 /**
  * What a proposal says about running it: `{ testsRun, command, suiteCommand,
  * source, testFiles, cases, steps }`, or null for a legacy proposal that has
  * neither `verification` nor `quality` (it renders exactly as before).
  * - command: the repository's test command (narrowed to the changed tests);
- *   for an older proposal, the first "How to verify" step that runs tests.
+ *   for an older proposal, the first "How to verify" step that names one
+ *   exactly (stepCommand), else '' ("no test command was found").
  * - cases: the issue's reproduction cases `{ code, note, covered }`.
  * - steps: the "How to verify" steps (they include the cases).
  */
@@ -281,11 +309,7 @@ export const verificationOf = (proposal) => {
   if (!stored && !qualityOf(proposal)) return null;
   const steps = (Array.isArray(proposal?.validation) ? proposal.validation : []).map(text).filter(Boolean);
   let command = text(stored?.command);
-  if (!stored) {
-    const step = steps.find((item) => TEST_COMMAND.test(item));
-    const quoted = step && /`([^`]+)`/.exec(step);
-    command = quoted && TEST_COMMAND.test(quoted[1]) ? quoted[1].trim() : (step ? step.match(TEST_COMMAND)[0].trim() : '');
-  }
+  if (!stored) command = steps.map(stepCommand).find(Boolean) || '';
   return {
     testsRun: stored?.tests_run === true,
     command,

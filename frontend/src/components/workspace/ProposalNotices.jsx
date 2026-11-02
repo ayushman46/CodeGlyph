@@ -53,8 +53,24 @@ const CheckList = ({ checks }) => (
   </ul>
 );
 
-/** Text with `code spans` (as the server writes verification steps) rendered as code. */
+/**
+ * Text with `code spans` (as the server writes verification steps) rendered
+ * as code, and a fenced block (a multi-line case from the issue, such as a
+ * loop) as a preformatted block that keeps its indentation.
+ */
 const WithCode = ({ text }) => {
+  const fenced = /^(`{3,}|~{3,})[^\n]*\n([\s\S]*?)\n\1[ \t]*$/m.exec(text);
+  if (fenced) {
+    const before = text.slice(0, fenced.index).trim();
+    const after = text.slice(fenced.index + fenced[0].length).trim();
+    return (
+      <>
+        {before && <WithCode text={before} />}
+        <pre data-slot="case-block" className="scroll-thin my-1 overflow-x-auto rounded bg-surface px-2 py-1.5 font-mono text-[11.5px] leading-snug text-ink">{fenced[2]}</pre>
+        {after && <WithCode text={after} />}
+      </>
+    );
+  }
   const parts = [];
   const pattern = /(`+)([\s\S]*?[^`])\1(?!`)/g;
   let last = 0;

@@ -136,6 +136,8 @@ export const failingToolCalls = [
 
 export const REVISED_PROPOSAL_ID = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
 export const ISSUE_CASE = 'requests.Request("POST", "http://x", files={1: b"x"}).prepare()';
+// A case of several lines stays a block with its indentation (not one joined line).
+export const ISSUE_LOOP = 'for key in [1, 2]:\n    requests.Request("POST", "http://x", files={key: b"x"}).prepare()';
 const modelsBefore = 'def _encode_files(files, data):\n    for k, v in files:\n        fn = guess_filename(v) or k\n        rf = RequestField(name=k, data=v, filename=fn)\n';
 const modelsAfter = modelsBefore.replace('or k\n', 'or str(k)\n').replace('name=k,', 'name=str(k),');
 
@@ -152,6 +154,7 @@ export const revisedProposal = {
   validation: [
     'Run `python -m pytest tests/test_requests.py`, then the whole suite with `python -m pytest tests`',
     `Check the case from #7634: \`${ISSUE_CASE}\` (the issue reports: AttributeError: 'int' object has no attribute 'translate')`,
+    `Check the case from #7634 (the issue reports: AttributeError):\n\`\`\`\n${ISSUE_LOOP}\n\`\`\``,
   ],
   issue_reference: '7634',
   issue_confirmed: true,
@@ -181,7 +184,10 @@ export const revisedProposal = {
   verification: {
     tests_run: false, command: 'python -m pytest tests/test_requests.py', suite_command: 'python -m pytest tests',
     command_source: 'the test target in the Makefile', test_files: [], issue: '#7634',
-    cases: [{ code: ISSUE_CASE, note: "AttributeError: 'int' object has no attribute 'translate'", covered: false }],
+    cases: [
+      { code: ISSUE_CASE, note: "AttributeError: 'int' object has no attribute 'translate'", covered: false },
+      { code: ISSUE_LOOP, note: 'AttributeError', covered: false },
+    ],
   },
   revision_of: {
     id: '11111111-2222-3333-4444-555555555555', title: 'Fix non-string form field names',

@@ -206,6 +206,14 @@ test('verificationOf: the command to run and every reproduction case; older prop
   const fromSteps = verificationOf({ ...withQuality({ status: 'pass', checks: [] }), validation: ['Review the diff', 'python -m pytest tests/ -x -k "multipart or form"'] });
   assert.equal(fromSteps.command, 'python -m pytest tests/ -x -k "multipart or form"');
   assert.equal(verificationOf({ ...withQuality({ status: 'pass', checks: [] }), validation: ['Run `npm test` and check the output'] }).command, 'npm test');
+  // Prose around a command is never shown as the command to run.
+  for (const step of ['Run pytest and confirm that test_multipart passes', 'Run the test suite with npm test to make sure nothing breaks',
+    'npm test to make sure nothing breaks', 'Check the case: `requests.get(1)`']) {
+    assert.equal(verificationOf({ ...withQuality({ status: 'pass', checks: [] }), validation: [step] }).command, '', step);
+  }
+  assert.equal(verificationOf({ ...withQuality({ status: 'pass', checks: [] }), validation: ['Run pytest tests/test_x.py.'] }).command, 'pytest tests/test_x.py');
+  assert.equal(verificationOf({ ...withQuality({ status: 'pass', checks: [] }), validation: ['make test', 'go test ./...'] }).command, 'make test');
+  assert.equal(verificationOf({ ...withQuality({ status: 'pass', checks: [] }), validation: ['Review the diff', 'go test ./...'] }).command, 'go test ./...');
   // A legacy proposal without quality renders as before.
   assert.equal(verificationOf({ id: 'p', files: [] }), null);
 });
@@ -237,6 +245,28 @@ test('buildPrBody: a body of only template comments is replaced, and "Fixes issu
   // An unconfirmed issue is only referenced; the body is left alone.
   assert.equal(withClosingReference('See issue #12.', { issue_reference: 12, issue_confirmed: false }), 'See issue #12.');
   assert.match(buildPrBody({ ...confirmed, pr_body: '## Summary\nFixes issue #7634.' }), /^## Summary\nFixes #7634\./);
+});
+
+test('buildPrBody keeps a step\'s code block inside its checklist item', async () => {
+  const { buildPrBody } = await import('./proposal.js');
+  const step = 'Check the case from #7634:\n```\nfor key in [1, 2]:\n    prepare(key)\n```';
+  const body = buildPrBody({ pr_body: '## Summary\n\nNames.', validation: ['pytest', step] });
+  assert.match(body, /## Testing\n- \[ \] pytest\n- \[ \] Check the case from #7634:\n {2}```\n {2}for key in \[1, 2\]:\n {6}prepare\(key\)\n {2}```/);
+  // Already in the body (matched by its first line): not repeated.
+  const listed = buildPrBody({ pr_body: `## Summary\n\nNames.\n\n- ${step.replace(/\n/g, '\n  ')}`, validation: [step] });
+  assert.doesNotMatch(listed, /## Testing/);
+});
+
+test('an older stored self-review chip never says a bare "No problems found"', async () => {
+  const { toolCallsToCalls } = await import('./ai/toolChips.js');
+  const [older, withNote, fixed] = toolCallsToCalls([
+    { tool: 'review_patch', input: { files: ['a.py'], issues: 0, fixed: 0 }, result_summary: 'No problems found', status: 'ok' },
+    { tool: 'review_patch', input: { files: ['a.py'] }, result_summary: 'No problems found; 1 unverified suggestion not applied' },
+    { tool: 'review_patch', input: { files: ['a.py'], issues: 1, fixed: 1 }, result_summary: 'Fixed 1 of 1 issue' },
+  ]);
+  assert.deepEqual(older.output.map((line) => line.text), ['No problems found by reading the diff (nothing was run)']);
+  assert.deepEqual(withNote.output.map((line) => line.text), ['No problems found by reading the diff (nothing was run)', '1 unverified suggestion not applied']);
+  assert.deepEqual(fixed.output.map((line) => line.text), ['Fixed 1 of 1 issue']);
 });
 
 test('revisionOf names the revised proposal and what happened to its files', async () => {
