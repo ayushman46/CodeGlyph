@@ -68,6 +68,28 @@ test('⌘K jumps to a declaration at its exact line and to a file by name (FEAT-
   await expect(viewer(page, 'packages/features/bookings/lib/getBooking.ts')).toBeVisible();
 });
 
+test.describe('on a phone', () => {
+  test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+
+  test('a header button opens the palette, which has no keyboard shortcut there (R2-02)', async ({ page }) => {
+    await mockApi(page);
+    await page.goto('/app/r/cal.com');
+    await expect(page.getByRole('textbox', { name: 'Ask about this codebase' })).toBeVisible();
+    const open = page.getByRole('button', { name: 'Open command palette' });
+    await expect(open).toBeVisible();
+    const size = await open.boundingBox();
+    expect(size.width).toBeGreaterThanOrEqual(44);
+    expect(size.height).toBeGreaterThanOrEqual(44);
+    await open.tap();
+    const box = page.getByRole('combobox', { name: 'Search commands' });
+    await box.fill('handleConfirmation');
+    const options = page.getByRole('listbox', { name: 'Commands' }).getByRole('option');
+    await expect(options.first()).toContainText(`${CITED_PATH}:42`);
+    await options.first().tap();
+    await expect(viewer(page).getByText('Line 42', { exact: true })).toBeVisible();
+  });
+});
+
 test('@ suggests a file by its own name and by a partial path (BUG-11)', async ({ page }) => {
   await mockApi(page);
   const asked = [];

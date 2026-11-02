@@ -131,6 +131,18 @@ const SiteHeader = ({ variant = 'marketing', onToggleSidebar, onOpenPalette }) =
                 <span className="ml-3 flex gap-0.5"><Kbd>⌘</Kbd><Kbd>K</Kbd></span>
               </button>
             )}
+            {/* Phones have no ⌘K: the same palette (files, symbols, repositories) from a tap. */}
+            {isApp && onOpenPalette && (
+              <button
+                type="button"
+                onClick={onOpenPalette}
+                className="flex h-11 w-11 items-center justify-center rounded-lg text-ink-2 transition-colors hover:bg-surface-2 hover:text-ink sm:hidden"
+                aria-label="Open command palette"
+                title="Jump to a file, symbol or repository"
+              >
+                <Search className="h-[18px] w-[18px]" aria-hidden="true" />
+              </button>
+            )}
             {isApp && <ThemeToggle />}
             {user ? (
               <>
