@@ -443,6 +443,21 @@ class ViewerTests(TeamAccessCase):
                          [(VIEWER, f"{VIEWER}@example.test", "viewer")])
         self.assertEqual(sharing["invites"][0]["accepted_count"], 1)
 
+    def test_each_link_lists_who_joined_with_it_while_they_are_members(self):
+        """Round 2 (admin): anyone signed in can use a link, and the owner saw only a count."""
+        token = self.invite()["token"]
+        for user in (EDITOR, STRANGER):
+            self.assertEqual(self.call(user, "POST", f"/invites/{token}/accept").status_code, 200)
+        links = {item["accepted_count"]: item for item in self.call(OWNER, "GET", f"/repos/{REPO}/sharing").json()["invites"]}
+        self.assertEqual([person["user_id"] for person in links[2]["joined_by"]], [EDITOR, STRANGER])
+        self.assertEqual(links[2]["joined_by"][0]["label"], f"{EDITOR}@example.test")
+        # The setUp link still lists the viewer who joined with it.
+        self.assertEqual([person["user_id"] for person in links[1]["joined_by"]], [VIEWER])
+        # A removed member is no longer listed under the link.
+        self.call(OWNER, "DELETE", f"/repos/{REPO}/members/{STRANGER}")
+        links = {item["accepted_count"]: item for item in self.call(OWNER, "GET", f"/repos/{REPO}/sharing").json()["invites"]}
+        self.assertEqual([person["user_id"] for person in links[2]["joined_by"]], [EDITOR])
+
 
 class EditorTests(TeamAccessCase):
     def setUp(self):

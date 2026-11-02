@@ -177,7 +177,7 @@ async def get_sharing(repo_name: str, current_user=Depends(get_current_user)):
         store = await _store()
         access = await resolve_repository_access(store, current_user.id, repo_name, permission="manage")
         members = await store.fetch_all(
-            "SELECT user_id, role, member_label, joined_at, updated_at FROM repo_members "
+            "SELECT user_id, role, member_label, joined_at, updated_at, invite_id FROM repo_members "
             "WHERE repo_id = ? AND removed_at IS NULL ORDER BY joined_at",
             [access["id"]],
         )
@@ -187,11 +187,18 @@ async def get_sharing(repo_name: str, current_user=Depends(get_current_user)):
             "WHERE repo_id = ? AND revoked_at IS NULL AND expires_at > ? ORDER BY created_at DESC",
             [access["id"], _iso(now)],
         )
+        # Who joined through each link (and is still a member): a link can be
+        # used by anyone signed in, so the owner sees who actually used it.
+        joined_by: dict[str, list[dict[str, Any]]] = {}
+        for member in members:
+            if member.get("invite_id"):
+                joined_by.setdefault(member["invite_id"], []).append(
+                    {"user_id": member["user_id"], "label": member.get("member_label") or member["user_id"]})
         return {
             "repository": repo_name,
             "full_name": _full_name(access["github_url"]),
             "members": [_public_member(member) for member in members],
-            "invites": [_public_invite(invite, now) for invite in invites],
+            "invites": [{**_public_invite(invite, now), "joined_by": joined_by.get(invite["id"], [])} for invite in invites],
         }
     except Exception as error:
         _storage_errors("load who this repository is shared with")(error)

@@ -71,6 +71,7 @@ const ShareDialog = ({ repo, open, onClose }) => {
   const [created, setCreated] = useState(null);
   const [pending, setPending] = useState('');
   const [confirmRemove, setConfirmRemove] = useState('');
+  const [confirmRevoke, setConfirmRevoke] = useState('');
   const repoName = repo?.repo_name;
 
   const load = useCallback(async () => {
@@ -127,6 +128,7 @@ const ShareDialog = ({ repo, open, onClose }) => {
     await revokeInvite(repoName, invite.id);
     setData((current) => ({ ...current, invites: current.invites.filter((item) => item.id !== invite.id) }));
     if (created?.invite.id === invite.id) setCreated(null);
+    setConfirmRevoke('');
     toast('Invite link revoked', { description: 'It no longer works. People who already joined keep their access.' });
   }, 'The link could not be revoked.');
 
@@ -218,12 +220,24 @@ const ShareDialog = ({ repo, open, onClose }) => {
                     size="xs"
                     variant="danger-ghost"
                     className="ml-auto"
-                    loading={pending === `invite:${invite.id}`}
-                    onClick={() => revoke(invite)}
+                    onClick={() => setConfirmRevoke(invite.id)}
                     aria-label={`Revoke the ${ROLE_LABELS[invite.role].toLowerCase()} link ending ${invite.token_hint}`}
                   >
                     Revoke
                   </Button>
+                  {/* Anyone signed in can use a link, so say who did. */}
+                  {invite.joined_by?.length > 0 && (
+                    <p className="basis-full text-[12px] text-ink-3">
+                      Joined with this link: {invite.joined_by.map((person) => person.label).join(', ')}
+                    </p>
+                  )}
+                  {confirmRevoke === invite.id && (
+                    <div className="mt-1 flex basis-full flex-wrap items-center gap-2 rounded-lg bg-danger-soft px-3 py-2 text-[12.5px] text-danger" role="group" aria-label={`Confirm revoking the link ending ${invite.token_hint}`}>
+                      <span className="mr-auto">Revoke this link? It stops working; people who joined keep access.</span>
+                      <Button size="xs" variant="ghost" onClick={() => setConfirmRevoke('')}>Cancel</Button>
+                      <Button size="xs" variant="danger" loading={pending === `invite:${invite.id}`} onClick={() => revoke(invite)}>Revoke</Button>
+                    </div>
+                  )}
                 </li>
               ))}
             </ul>

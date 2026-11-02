@@ -93,6 +93,10 @@ const mockSharing = async (page, { repos = [repo({ access_role: 'owner', shared:
       }
       return json(route, SHARED_ANSWER);
     }
+    if (path.startsWith('/repos/cal.com/invites/') && method === 'DELETE') {
+      state.revokedInvites.push(decodeURIComponent(path.split('/').pop()));
+      return json(route, { revoked: true, id: path.split('/').pop() });
+    }
     if (path === '/answers/shares/share-1' && method === 'DELETE') {
       state.answerRevoked = true;
       return json(route, { revoked: true, id: 'share-1' });
@@ -101,6 +105,7 @@ const mockSharing = async (page, { repos = [repo({ access_role: 'owner', shared:
   });
   state.answerShares = [];
   state.answerRevoked = false;
+  state.revokedInvites = [];
   return state;
 };
 
@@ -143,6 +148,30 @@ test('an owner creates a viewer link, changes a member to editor and removes the
   await dialog.getByRole('group', { name: 'Confirm removing bo@example.com' }).getByRole('button', { name: 'Remove' }).click();
   await expect(dialog.getByText('bo@example.com')).toHaveCount(0);
   expect(state.removed).toEqual(['u-bo']);
+});
+
+test('each link says who joined with it, and revoking asks first (round 2, admin)', async ({ page }) => {
+  await mockApi(page);
+  const state = await mockSharing(page);
+  state.sharing.invites = [{
+    id: 'inv-old', role: 'viewer', created_at: '2026-11-01T10:00:00Z', expires_at: new Date(Date.now() + 3 * 86400000).toISOString(),
+    token_hint: 'Zq9x', accepted_count: 1, state: 'active', joined_by: [{ user_id: 'u-bo', label: 'bo@example.com' }],
+  }];
+  await page.goto('/app/r/cal.com');
+  await page.getByRole('button', { name: 'Share cal.com (shared with 1)' }).click();
+  const links = page.getByRole('dialog', { name: 'Share cal.com' }).getByRole('list', { name: 'Active invite links' });
+  await expect(links.getByText('Joined with this link: bo@example.com')).toBeVisible();
+  await links.getByRole('button', { name: 'Revoke the viewer link ending Zq9x' }).click();
+  // Nothing is revoked until it is confirmed.
+  expect(state.revokedInvites).toEqual([]);
+  const confirm = links.getByRole('group', { name: 'Confirm revoking the link ending Zq9x' });
+  await confirm.getByRole('button', { name: 'Cancel' }).click();
+  await expect(confirm).toHaveCount(0);
+  await links.getByRole('button', { name: 'Revoke the viewer link ending Zq9x' }).click();
+  await links.getByRole('group', { name: 'Confirm revoking the link ending Zq9x' }).getByRole('button', { name: 'Revoke' }).click();
+  await expect(page.getByLabel('Notifications').getByText('Invite link revoked')).toBeVisible();
+  expect(state.revokedInvites).toEqual(['inv-old']);
+  await expect(links).toHaveCount(0);
 });
 
 test('a viewer sees the repository under Shared with you, can ask, and cannot use Edit & PR or manage it', async ({ page }) => {
@@ -256,6 +285,17 @@ test('opening an invite link shows the repository, owner and role, and Join open
   await expect(page).toHaveURL(/\/app\/r\/cal\.com$/);
   expect(state.accepted).toBe(1);
   await expect(page.getByRole('navigation', { name: 'Repositories' }).getByRole('heading', { name: 'Shared with you' })).toBeVisible();
+});
+
+test('a member opening a viewer link sees their own editor role, not the link\'s (round 2, admin)', async ({ page }) => {
+  await mockApi(page);
+  await mockSharing(page, { repos: [sharedAs('editor')], invite: { preview: { status: 'member', access_role: 'editor', repo_name: 'cal.com' } } });
+  await page.goto(`/invite/${TOKEN}`);
+  await expect(page.getByRole('heading', { name: 'You already have cal.com' })).toBeVisible();
+  await expect(page.getByText('Your access')).toBeVisible();
+  await expect(page.getByText('Editor', { exact: true })).toBeVisible();
+  await expect(page.getByText('Viewer', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('You joined earlier as an editor.', { exact: false })).toBeVisible();
 });
 
 test('rejoining with a link older than the owner\'s role change says the owner\'s role stays', async ({ page }) => {
