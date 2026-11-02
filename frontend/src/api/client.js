@@ -147,11 +147,21 @@ export const streamQuery = async (payload, { signal, onEvent }) => {
 
 export const health = () => api.get('/health', { timeout: 70000 });
 export const ingestRepo = (github_url) => api.post('/ingest', { github_url });
-export const queryRepo = (repo_name, question, model_profile = 'fast', workflow = 'general', config = {}) => api.post(
-  '/query', { repo_name, question, model_profile, workflow }, { timeout: 300000, ...config },
+/** `target` is `{ conversation_id }` to continue a conversation or `{ new_conversation: true }`. */
+export const queryRepo = (repo_name, question, model_profile = 'fast', workflow = 'general', config = {}, target = {}) => api.post(
+  '/query', { repo_name, question, model_profile, workflow, ...target }, { timeout: 300000, ...config },
 );
+/** One conversation's messages, newest page first (`params`: conversation_id, limit, before). */
 export const getConversation = (repo_name, config = {}) => api.get(`/conversations/${encodeURIComponent(repo_name)}`, config);
-export const clearConversation = (repo_name) => api.delete(`/conversations/${encodeURIComponent(repo_name)}`);
+const conversationsPath = (repo_name, id = '') => (
+  `/conversations/${encodeURIComponent(repo_name)}/threads${id ? `/${encodeURIComponent(id)}` : ''}`
+);
+/** A repository's saved conversations, most recently active first (`params`: limit, before). */
+export const listConversations = (repo_name, config = {}) => api.get(conversationsPath(repo_name), config);
+export const renameConversation = (repo_name, id, title) => api.patch(conversationsPath(repo_name, id), { title });
+/** Hides a conversation; restoreConversation brings it back. Nothing is erased. */
+export const deleteConversation = (repo_name, id) => api.delete(conversationsPath(repo_name, id));
+export const restoreConversation = (repo_name, id) => api.post(`${conversationsPath(repo_name, id)}/restore`);
 export const getRepos = () => api.get('/repos');
 export const renameRepository = (repo_name, new_repo_name) => api.patch(`/repos/${encodeURIComponent(repo_name)}`, { repo_name: new_repo_name });
 export const deleteRepository = (repo_name) => api.delete(`/repos/${encodeURIComponent(repo_name)}`);

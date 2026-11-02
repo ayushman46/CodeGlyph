@@ -171,6 +171,10 @@ class TeamAccessCase(unittest.TestCase):
 # Every route that takes a repository name, and how to call it. The guard
 # test below fails when a new repository route is added without being listed
 # here, so each new route gets an access decision.
+# A well-formed conversation id; the repository check comes before any conversation lookup.
+THREAD = "c" * 32
+
+
 def repo_routes(name, ticket=""):
     return [
         ("GET", f"/status/{name}", {}),
@@ -184,6 +188,10 @@ def repo_routes(name, ticket=""):
         ("GET", f"/repos/{name}/impact/suggestions", {}),
         ("GET", f"/conversations/{name}", {}),
         ("DELETE", f"/conversations/{name}", {}),
+        ("GET", f"/conversations/{name}/threads", {}),
+        ("PATCH", f"/conversations/{name}/threads/{THREAD}", {"json": {"title": "x"}}),
+        ("DELETE", f"/conversations/{name}/threads/{THREAD}", {}),
+        ("POST", f"/conversations/{name}/threads/{THREAD}/restore", {}),
         ("POST", "/query", {"json": {"repo_name": name, "question": "Where are retries configured?"}}),
         ("POST", "/query/stream", {"json": {"repo_name": name, "question": "Where are retries configured?"}}),
         ("PATCH", f"/repos/{name}", {"json": {"repo_name": "renamed"}}),
@@ -242,7 +250,7 @@ class RouteCoverageTests(unittest.TestCase):
         from main import app
 
         listed = {(method, path) for method, path, _ in repo_routes("{repo_name}")}
-        listed = {(method, path.replace("some-invite", "{invite_id}").replace(VIEWER, "{member_id}")) for method, path in listed}
+        listed = {(method, path.replace("some-invite", "{invite_id}").replace(VIEWER, "{member_id}").replace(THREAD, "{conversation_id}")) for method, path in listed}
         found = routes_naming_a_repository(app.openapi())
         # Routes naming the repository in the body or query string are found too.
         self.assertLessEqual(

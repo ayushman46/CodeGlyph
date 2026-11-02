@@ -17,6 +17,7 @@ It is built for the first hours in an unfamiliar codebase: new engineers onboard
 - **Clear first minutes.** A queued repository shows how many are ahead of it and an estimated start (from recent indexing runs); a mistyped `owner/repo` is reported as not found before anything is added.
 - **Navigation.** `⌘K` / `Ctrl+K` jumps to any indexed file (by name or partial path) or declaration (`class ParamType` → `src/click/types.py:65`); `@` in the composer suggests files the same way. The viewer names the declaration a line sits in, lists an outline of the file, shows Markdown rendered (with a Source view keeping line numbers), and keeps the file and line in the page URL (`?file=src/app.py&line=42`), so a copied link reopens them.
 - **Team access.** Share an indexed repository with teammates through an invite link (viewer or editor, expiring in 1, 7 or 30 days) so nobody indexes it again. Viewers ask, search and browse; editors can also use Edit & PR with their own GitHub account; only the owner renames, re-indexes, deletes or shares it. Members ask against the owner's index (it counts only toward the owner's storage), keep their own conversations, and appear under **Shared with you**. The owner sees and revokes active links and changes or removes members; removal takes effect on the member's next request. **Share answer** under any answer makes a read-only link to a copy of the question, the answer and its commit-pinned sources for anyone signed in; stop sharing it from the dialog or the account page.
+- **Saved conversations.** Each repository keeps several conversations. New chat starts a fresh one without deleting anything; History lists them with titles, dates and message and proposal counts, and reopens any of them with its proposals. Follow-ups use only the open conversation. Deleting asks first, can be undone, and a deleted conversation can be restored later from Recently deleted. Conversations are private to the user who asked.
 - Light and dark themes, keyboard-first chat, and a responsive layout down to phone width.
 
 ## Architecture
@@ -88,7 +89,7 @@ Workflows: general, new-engineer onboarding, architecture, security review, open
 
 ### 1. Turso, Supabase, NVIDIA
 
-- Create a Turso database and token (`turso db create`, `turso db tokens create`). The schema is created automatically on first start; you can also apply `turso/00_init.sql` … `turso/06_scale_and_editing.sql` manually.
+- Create a Turso database and token (`turso db create`, `turso db tokens create`). The schema is created automatically on first start; you can also apply `turso/00_init.sql` … `turso/07_conversations.sql` manually.
 - In Supabase, enable the Google provider and add your frontend origins (Vercel and/or Render URL, and `http://localhost:5173`) to the redirect allow list.
 - Create an NVIDIA API key with access to the configured Nemotron models.
 
@@ -178,7 +179,11 @@ All routes require a Supabase bearer token except health/readiness and the GitHu
 | PATCH / DELETE | `/api/repos/{repo}` | Rename or delete |
 | POST | `/api/query` | Grounded answer (JSON). `done` carries `answer_references` (with a `reason` for each unverified one), `unverified_identifiers`, `truncated`, `message_id`, and `answer_failure` / `answer_notice` when a model failed |
 | POST | `/api/query/stream` | Grounded answer as server-sent events (`stage`, `citations`, `token`, `done`, `error`). A model failure after text was sent ends with `mode: "partial"` and `answer_failure` (its `cause`, such as `timeout`, says why the stream stopped). With `continue_from: <message_id>` of an answer stored as `truncated`, writes the rest into that message (`continue` event with the kept text, then `token`s and `done`) |
-| GET / DELETE | `/api/conversations/{repo}` | Conversation history (with each answer's checks) / new chat |
+| GET | `/api/conversations/{repo}?conversation_id=&limit=&before=` | One conversation's messages, newest page first (the latest conversation without an id). Questions continue one with `conversation_id`, or start one with `new_conversation: true`; `done` returns it |
+| GET | `/api/conversations/{repo}/threads` | Saved conversations: title, dates, message and proposal counts (`deleted=true`: the deleted ones, to restore) |
+| PATCH / DELETE | `/api/conversations/{repo}/threads/{id}` | Rename / delete (hidden, not erased) |
+| POST | `/api/conversations/{repo}/threads/{id}/restore` | Undo a delete |
+| DELETE | `/api/conversations/{repo}` | New chat for older clients: hides and erases nothing; the next question sent without `conversation_id` starts a new conversation |
 | GET | `/api/edits/{id}` | Saved edit proposal with a fresh editing ticket |
 | GET | `/api/github/status`, `/api/github/login`, `/api/github/callback` | GitHub connection (callback redirects to `{GITHUB_FRONTEND_ORIGIN}/github/callback`) |
 | POST | `/api/github/complete` | SPA finishes the OAuth connection with the fragment code and the user's bearer token |

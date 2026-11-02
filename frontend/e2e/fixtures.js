@@ -197,13 +197,110 @@ const sse = (events) => `: connected\n\n${events.map(([event, data]) => `event: 
 
 const json = (route, body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
 
+/** A conversation id as the server makes them (32 lowercase hex characters). */
+export const conversationId = (n) => n.toString(16).padStart(32, '0');
+
+/**
+ * A saved conversation for `mockApi({ conversations })`: `exchanges` are
+ * [question, answer, extra reply fields] triples.
+ */
+export const savedConversation = (id, title, updatedAt, exchanges) => ({
+  id, title, created_at: updatedAt, updated_at: updatedAt, deleted_at: null,
+  messages: exchanges.flatMap(([question, reply, extra = {}], index) => [
+    { id: `${id}-q${index}`, role: 'user', content: question, citations: [], tool_calls: [], mode: null, created_at: updatedAt },
+    { id: `${id}-a${index}`, role: 'assistant', content: reply, citations: [], tool_calls: [], mode: 'rag', created_at: updatedAt, ...extra },
+  ]),
+});
+
+/** An Edit & PR reply that holds `proposal` (as stored: only its id, in the tool calls). */
+export const proposalReply = {
+  mode: 'editing',
+  tool_calls: [{ tool: 'code_edit', input: { proposal_id: '11111111-2222-3333-4444-555555555555' }, result_summary: 'Send confirmation emails in the attendee timezone' }],
+};
+
+const conversationRow = (item) => ({
+  id: item.id, title: item.title, created_at: item.created_at, updated_at: item.updated_at,
+  message_count: item.messages.length,
+  proposal_count: item.messages.filter((message) => message.tool_calls?.some((call) => call.tool === 'code_edit')).length,
+  ...(item.deleted_at ? { deleted_at: item.deleted_at } : {}),
+});
+
+/** The /conversations endpoints of one repository, in memory (see backend/api/query_router.py). */
+const conversationRoutes = (state, route, path, method, url) => {
+  const match = /^\/conversations\/([^/]+)(?:\/threads(?:\/([0-9a-f]{32}))?(\/restore)?)?$/.exec(path);
+  if (!match) return null;
+  const [, repoName, id, restore] = match;
+  const isThreads = path.includes('/threads');
+  if (decodeURIComponent(repoName) !== 'cal.com' && method === 'GET') {
+    return json(route, isThreads ? { conversations: [], has_more: false, next_before: null } : { messages: [], has_more: false, next_before: null, conversation: null });
+  }
+  const active = () => state.conversations.filter((item) => !item.deleted_at)
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at) || b.id.localeCompare(a.id));
+  const find = (conversation) => state.conversations.find((item) => item.id === conversation);
+  state.conversationRequests.push(`${method} ${path}${url.search}`);
+  if (!isThreads && method === 'GET') {
+    const requested = url.searchParams.get('conversation_id');
+    const conversation = requested ? find(requested) : active()[0];
+    if (requested && (!conversation || conversation.deleted_at)) return json(route, { detail: 'Conversation not found.' }, 404);
+    if (!conversation) return json(route, { messages: [], has_more: false, next_before: null, conversation: null });
+    return json(route, {
+      messages: conversation.messages, has_more: false, next_before: null,
+      conversation: { id: conversation.id, title: conversation.title, created_at: conversation.created_at, updated_at: conversation.updated_at },
+    });
+  }
+  if (isThreads && !id && method === 'GET' && url.searchParams.get('deleted') === 'true') {
+    const deleted = state.conversations.filter((item) => item.deleted_at)
+      .sort((a, b) => b.deleted_at.localeCompare(a.deleted_at) || b.id.localeCompare(a.id));
+    return json(route, { conversations: deleted.map(conversationRow), has_more: false, next_before: null });
+  }
+  if (isThreads && !id && method === 'GET') return json(route, { conversations: active().map(conversationRow), has_more: false, next_before: null });
+  const conversation = id ? find(id) : null;
+  if (!conversation) return json(route, { detail: 'Conversation not found.' }, 404);
+  if (method === 'PATCH') {
+    conversation.title = route.request().postDataJSON().title.trim();
+    return json(route, { conversation: conversationRow(conversation) });
+  }
+  if (method === 'DELETE') {
+    conversation.deleted_at = new Date().toISOString();
+    return json(route, { deleted: true, conversation: conversationRow(conversation) });
+  }
+  if (method === 'POST' && restore) {
+    conversation.deleted_at = null;
+    return json(route, { restored: true, conversation: conversationRow(conversation) });
+  }
+  return null;
+};
+
+/** Saves a streamed exchange like the server: in the given conversation, or a new one. */
+const saveExchange = (state, payload, reply) => {
+  const now = new Date(Date.now() + (state.clock += 1000)).toISOString();
+  let conversation = payload.conversation_id ? state.conversations.find((item) => item.id === payload.conversation_id) : null;
+  if (!conversation) {
+    conversation = { id: conversationId(state.nextConversation += 1), title: payload.question, created_at: now, updated_at: now, deleted_at: null, messages: [] };
+    state.conversations.push(conversation);
+  }
+  conversation.updated_at = now;
+  conversation.messages.push(
+    { id: `${conversation.id}-q${conversation.messages.length}`, role: 'user', content: payload.question, citations: [], tool_calls: [], mode: null, created_at: now },
+    { id: `${conversation.id}-a${conversation.messages.length}`, role: 'assistant', content: reply.answer, citations: reply.citations, tool_calls: reply.tool_calls, mode: reply.mode, created_at: now },
+  );
+  return { id: conversation.id, title: conversation.title, created_at: conversation.created_at, updated_at: now };
+};
+
 /**
  * Mocks every /api call. `state.prStatus` (default: one failed check) is
  * what GET /github/pr-status returns, and can be changed mid-test;
  * `pushResult` adds fields to a successful push response.
  */
-export const mockApi = async (page, { githubConnected = false, prStatus = prStatusFailed, pushResult = {} } = {}) => {
-  const state = { github: githubConnected, pushes: [], prStatus, prStatusRequests: [] };
+export const mockApi = async (page, {
+  githubConnected = false, prStatus = prStatusFailed, pushResult = {}, conversations = [],
+} = {}) => {
+  const state = {
+    github: githubConnected, pushes: [], prStatus, prStatusRequests: [],
+    // cal.com's saved conversations (see savedConversation) and every
+    // /conversations request made, as "METHOD /path?query".
+    conversations: structuredClone(conversations), conversationRequests: [], clock: 0, nextConversation: 0x100,
+  };
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url());
     const path = url.pathname.replace(/^\/api/, '');
@@ -213,7 +310,10 @@ export const mockApi = async (page, { githubConnected = false, prStatus = prStat
     if (path === '/account/usage') {
       return json(route, { plan: 'explorer', used_bytes: 21000000, quota_bytes: 200000000, used_label: '21 MB', quota_label: '200 MB', remaining_label: '179 MB' });
     }
-    if (path.startsWith('/conversations/')) return json(route, { messages: [] });
+    if (path.startsWith('/conversations/')) {
+      const handled = conversationRoutes(state, route, path, method, url);
+      if (handled) return handled;
+    }
     if (path === '/repos/cal.com/overview') {
       return json(route, {
         repository: readyRepo, total_files: 5600,
@@ -248,6 +348,13 @@ export const mockApi = async (page, { githubConnected = false, prStatus = prStat
     if (path === '/query/stream' && method === 'POST') {
       const payload = route.request().postDataJSON();
       if (payload.workflow === 'editing') {
+        const done = {
+          answer: `## ${proposal.title}\n\nA validated change is ready for review.`, mode: 'editing', citations: [citation],
+          tool_calls: [{ tool: 'code_edit', input: { proposal_id: proposal.id }, result_summary: proposal.title }],
+          latency_ms: 4200, model_profile: 'code', workflow: 'editing', evidence_plan: {},
+          edit_suggestion: proposal, edit_ticket: 'v1.ticket.signature', snapshot: { commit_sha: SHA, github_url: GITHUB_URL },
+        };
+        done.conversation = saveExchange(state, payload, done);
         return route.fulfill({
           status: 200,
           headers: { 'content-type': 'text/event-stream' },
@@ -256,15 +363,12 @@ export const mockApi = async (page, { githubConnected = false, prStatus = prStat
             ['citations', { citations: [citation], evidence_plan: {}, snapshot: { commit_sha: SHA, github_url: GITHUB_URL } }],
             ['stage', { stage: 'planning', detail: 'Planning the change across 3 candidate files' }],
             ['stage', { stage: 'validating', detail: 'Validating every hunk against the current files' }],
-            ['done', {
-              answer: `## ${proposal.title}\n\nA validated change is ready for review.`, mode: 'editing', citations: [citation],
-              tool_calls: [{ tool: 'code_edit', input: { proposal_id: proposal.id }, result_summary: proposal.title }],
-              latency_ms: 4200, model_profile: 'code', workflow: 'editing', evidence_plan: {},
-              edit_suggestion: proposal, edit_ticket: 'v1.ticket.signature', snapshot: { commit_sha: SHA, github_url: GITHUB_URL },
-            }],
+            ['done', done],
           ]),
         });
       }
+      const done = { answer, mode: 'rag', citations: [citation], tool_calls: [], latency_ms: 1300, model_profile: 'fast', workflow: 'general', evidence_plan: {}, edit_suggestion: null, edit_ticket: null, snapshot: { commit_sha: SHA, github_url: GITHUB_URL } };
+      done.conversation = saveExchange(state, payload, done);
       return route.fulfill({
         status: 200,
         headers: { 'content-type': 'text/event-stream' },
@@ -273,7 +377,7 @@ export const mockApi = async (page, { githubConnected = false, prStatus = prStat
           ['citations', { citations: [citation], evidence_plan: {}, snapshot: { commit_sha: SHA, github_url: GITHUB_URL } }],
           ['token', { text: answer.slice(0, 40) }],
           ['token', { text: answer.slice(40) }],
-          ['done', { answer, mode: 'rag', citations: [citation], tool_calls: [], latency_ms: 1300, model_profile: 'fast', workflow: 'general', evidence_plan: {}, edit_suggestion: null, edit_ticket: null, snapshot: { commit_sha: SHA, github_url: GITHUB_URL } }],
+          ['done', done],
         ]),
       });
     }

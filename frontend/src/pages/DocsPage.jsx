@@ -124,7 +124,10 @@ const SECTIONS = [
         ],
       },
       { type: 'callout', title: 'Long answers and copying', text: 'An answer that reaches the length limit says so; Continue writes the rest into the same message. Copy reply, or Copy section on a heading, copies Markdown with each reference linked to its lines on GitHub at the answer’s commit.' },
-      { type: 'callout', title: 'Follow-up questions', text: 'Ask follow-ups in the same conversation; recent messages are kept in context. Conversations are saved per repository, so you can pick up where you left off.' },
+      { type: 'callout', title: 'Follow-up questions', text: 'Ask follow-ups in the same conversation; its recent messages are kept in context, and other conversations are not.' },
+      { type: 'h2', text: 'Saved conversations' },
+      { type: 'p', text: 'Each repository keeps as many conversations as you need. New chat starts an empty one and never deletes the one you were in. History, in the chat header, lists your conversations with their titles (the first question, which you can rename), when they were last used and how many messages and proposals they hold. Opening one shows all its messages, and its proposals still open for review. The open conversation is in the page link, so a reload brings you back to it.' },
+      { type: 'p', text: 'Deleting a conversation asks first, and the notification that follows has an Undo. Later, restore it from Recently deleted at the bottom of History. Conversations are private to you.' },
     ],
   },
   {

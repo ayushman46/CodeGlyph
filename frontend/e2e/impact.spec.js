@@ -125,7 +125,7 @@ test('a dependent opens at its import line inside the dialog and Back returns to
   await row.click();
   await expect(dialog.getByText('src/flask/testing.py imports src/flask/app.py on line 24.')).toBeVisible();
   const viewer = dialog.locator('[data-slot="artifact-panel"]');
-  await expect(viewer.getByText('src/flask · lines 24')).toBeVisible();
+  await expect(viewer.getByText('src/flask · line 24')).toBeVisible();
   await expect(viewer.locator('tr[data-line="24"]')).toHaveClass(/highlight/);
   const back = dialog.getByRole('button', { name: 'Back to impact' });
   await expect(back).toBeFocused();

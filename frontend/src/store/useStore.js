@@ -1,11 +1,15 @@
 import { create } from 'zustand';
 import {
-  ApiError, StreamUnavailableError, cancelIndexing, clearConversation, continueAnswerRequest, deleteRepository,
+  ApiError, StreamUnavailableError, cancelIndexing, continueAnswerRequest, deleteConversation as deleteConversationRequest, deleteRepository,
   errorMessage, getAccountUsage, getConversation, getEditProposal, getGithubStatus, getRepos, getRepositoryFile,
-  getRepositoryImpact, getRepositoryOverview, getStatuses, ingestRepo, queryRepo, reindexRepository, renameRepository,
+  getRepositoryImpact, getRepositoryOverview, getStatuses, ingestRepo, listConversations, queryRepo, reindexRepository,
+  renameConversation as renameConversationRequest, renameRepository, restoreConversation as restoreConversationRequest,
   streamQuery,
 } from '../api/client';
 import { isSupabaseConfigured, supabase } from '../api/supabase';
+import {
+  appendConversations, cleanTitle, conversationFromLocation, recordExchange, rememberedConversationKey, upsertConversation,
+} from '../lib/conversations';
 
 let historyController = null;
 let queryController = null;
@@ -84,6 +88,67 @@ const afterNextPaint = () => new Promise((resolve) => {
   else setTimeout(resolve, 0);
 });
 
+// ------------------------------------------------------------ conversations
+
+/** Conversations per page of the history list. */
+const CONVERSATION_PAGE_SIZE = 30;
+/** Messages per request when a whole conversation is exported. */
+const EXPORT_PAGE_SIZE = 200;
+let conversationListRevision = 0;
+const closedSources = () => ({ open: false, messageId: null, activeIndex: null, file: null, stack: [] });
+const emptyConversationList = (repoName = null) => ({
+  repoName, items: [], loaded: false, loading: false, error: '', hasMore: false, cursor: null,
+});
+
+const rememberConversation = (repoName, conversationId) => {
+  try {
+    if (conversationId) window.localStorage.setItem(rememberedConversationKey(repoName), conversationId);
+    else window.localStorage.removeItem(rememberedConversationKey(repoName));
+  } catch {
+    // Storage can be unavailable; the repository then opens its latest conversation.
+  }
+};
+
+/**
+ * The conversation a repository opens with: the page's `?c=<id>` (a reload
+ * or a link), else the one last open there. The server falls back to the
+ * latest conversation when neither is given.
+ */
+const preferredConversation = (repoName) => {
+  if (typeof window === 'undefined') return null;
+  const linked = conversationFromLocation(window.location, repoName);
+  if (linked) return linked;
+  try {
+    return window.localStorage.getItem(rememberedConversationKey(repoName)) || null;
+  } catch {
+    return null;
+  }
+};
+
+const firstPageParams = (conversationId) => ({
+  limit: FIRST_HISTORY_PAGE_SIZE, ...(conversationId ? { conversation_id: conversationId } : {}),
+});
+
+/**
+ * The first history page of a repository's conversation. A remembered or
+ * linked conversation that is gone (deleted, or another account's) opens
+ * the latest one instead of an error.
+ */
+const loadFirstPage = async (repoName, conversationId, { signal, prefetched = null } = {}) => {
+  const request = (id) => getConversation(repoName, { signal, params: firstPageParams(id) });
+  try {
+    if (prefetched) {
+      // A failed prefetch is not an error: ask again (a 404 falls back below).
+      const response = await prefetched.catch((error) => (error?.response?.status === 404 ? Promise.reject(error) : null));
+      if (response) return response;
+    }
+    return await request(conversationId);
+  } catch (error) {
+    if (conversationId && error?.response?.status === 404) return request(null);
+    throw error;
+  }
+};
+
 const useStore = create((set, get) => ({
   user: null,
   repos: [],
@@ -97,6 +162,13 @@ const useStore = create((set, get) => ({
   historyHasMore: false,
   historyCursor: null,
   isLoadingOlder: false,
+  // The open conversation ({ id, title, created_at, updated_at }); null in a
+  // new chat or a repository without one. `newChat` is a new chat the user
+  // started: nothing asked yet, and the earlier conversation stays saved.
+  conversation: null,
+  newChat: false,
+  // The selected repository's saved conversations, loaded when History opens.
+  conversationList: emptyConversationList(),
   isQuerying: false,
   queryEpoch: 0,
   isSigningIn: false,
@@ -127,6 +199,9 @@ const useStore = create((set, get) => ({
       reposLoaded: false,
       selectedRepo: null,
       messages: [],
+      conversation: null,
+      newChat: false,
+      conversationList: emptyConversationList(),
       accountUsage: null,
       overviews: {},
       files: {},
@@ -176,6 +251,7 @@ const useStore = create((set, get) => ({
         user: null, selectedRepo: null, messages: [], repos: [], reposLoaded: false, accountUsage: null,
         overviews: {}, files: {}, review: null, isQuerying: false, queryEpoch: state.queryEpoch + 1,
         sources: { open: false, messageId: null, activeIndex: null, file: null, stack: [] },
+        conversation: null, newChat: false, conversationList: emptyConversationList(),
       }));
     }
   },
@@ -267,6 +343,8 @@ const useStore = create((set, get) => ({
     set((state) => ({
       repos: state.repos.map((item) => (item.id === repo.id ? { ...item, repo_name: repoName } : item)),
       selectedRepo: state.selectedRepo === repo.repo_name ? repoName : state.selectedRepo,
+      conversationList: state.conversationList.repoName === repo.repo_name
+        ? { ...state.conversationList, repoName } : state.conversationList,
     }));
     return repoName;
   },
@@ -275,7 +353,9 @@ const useStore = create((set, get) => ({
     await deleteRepository(repo.repo_name);
     set((state) => ({
       repos: state.repos.filter((item) => item.id !== repo.id),
-      ...(state.selectedRepo === repo.repo_name ? { selectedRepo: null, messages: [] } : {}),
+      ...(state.selectedRepo === repo.repo_name
+        ? { selectedRepo: null, messages: [], conversation: null, newChat: false, conversationList: emptyConversationList() }
+        : {}),
     }));
     void get().fetchAccountUsage({ silent: true });
   },
@@ -332,41 +412,56 @@ const useStore = create((set, get) => ({
   /** Start a repository's first history page and overview before its workspace code has loaded. */
   prefetchRepo: (repoName) => {
     if (!repoName || historyPrefetch?.repoName === repoName) return;
-    const promise = getConversation(repoName, { params: { limit: FIRST_HISTORY_PAGE_SIZE } });
+    const conversationId = preferredConversation(repoName);
+    const promise = getConversation(repoName, { params: firstPageParams(conversationId) });
     // A failed prefetch is not an error: selectRepo simply asks again.
     promise.catch(() => {});
-    historyPrefetch = { repoName, promise, at: Date.now() };
+    historyPrefetch = { repoName, conversationId, promise, at: Date.now() };
     void get().loadOverview(repoName);
   },
 
+  /**
+   * Open a repository with its conversation: the one in the URL or last
+   * open there, else the latest. A new chat the user started is kept.
+   */
   selectRepo: async (repoName) => {
-    if (get().selectedRepo === repoName && (get().messages.length || get().isHistoryLoading)) return;
-    const prefetched = historyPrefetch?.repoName === repoName && Date.now() - historyPrefetch.at < HISTORY_PREFETCH_TTL_MS
+    const { selectedRepo, messages, isHistoryLoading, newChat } = get();
+    if (selectedRepo === repoName && (messages.length || isHistoryLoading || newChat)) return;
+    const conversationId = repoName ? preferredConversation(repoName) : null;
+    const prefetched = historyPrefetch?.repoName === repoName && historyPrefetch.conversationId === conversationId
+      && Date.now() - historyPrefetch.at < HISTORY_PREFETCH_TTL_MS
       ? historyPrefetch.promise : null;
     historyPrefetch = null;
     historyController?.abort();
     queryController?.abort();
     historyController = null;
     queryController = null;
-    const closedSources = { open: false, messageId: null, activeIndex: null, file: null, stack: [] };
+    const reset = (state) => ({
+      selectedRepo: repoName || null, messages: [], conversation: null, newChat: false, isHistoryLoading: Boolean(repoName),
+      historyError: '', historyHasMore: false, historyCursor: null, isLoadingOlder: false, isQuerying: false,
+      queryEpoch: state.queryEpoch + 1, sources: closedSources(),
+      conversationList: state.conversationList.repoName === repoName ? state.conversationList : emptyConversationList(repoName || null),
+    });
     if (!repoName) {
-      set((state) => ({ selectedRepo: null, messages: [], isHistoryLoading: false, historyError: '', historyHasMore: false, historyCursor: null, isLoadingOlder: false, isQuerying: false, queryEpoch: state.queryEpoch + 1, sources: closedSources }));
+      set(reset);
       return;
     }
-    set((state) => ({ selectedRepo: repoName, messages: [], isHistoryLoading: true, historyError: '', historyHasMore: false, historyCursor: null, isLoadingOlder: false, isQuerying: false, queryEpoch: state.queryEpoch + 1, sources: closedSources }));
+    set(reset);
     const controller = new AbortController();
     historyController = controller;
     try {
-      const response = (prefetched && await prefetched.catch(() => null))
-        || await getConversation(repoName, { signal: controller.signal, params: { limit: FIRST_HISTORY_PAGE_SIZE } });
+      const response = await loadFirstPage(repoName, conversationId, { signal: controller.signal, prefetched });
       if (get().selectedRepo === repoName && historyController === controller) {
+        const conversation = response.data.conversation || null;
         set({
           messages: (response.data.messages || []).map(normalizeMessage),
+          conversation,
           isHistoryLoading: false,
           historyError: '',
           historyHasMore: Boolean(response.data.has_more),
           historyCursor: response.data.next_before || null,
         });
+        rememberConversation(repoName, conversation?.id);
       }
     } catch (error) {
       if (error?.code === 'ERR_CANCELED' || error?.name === 'CanceledError') return;
@@ -379,17 +474,175 @@ const useStore = create((set, get) => ({
     }
   },
 
-  /** Prepend the next older page of the selected repository's history. */
+  /** Open one of the selected repository's saved conversations. */
+  selectConversation: async (conversationId, { force = false } = {}) => {
+    const repoName = get().selectedRepo;
+    if (!repoName || !conversationId) return;
+    if (!force && get().conversation?.id === conversationId && !get().newChat) return;
+    historyController?.abort();
+    queryController?.abort();
+    queryController = null;
+    const listed = get().conversationList.items.find((item) => item.id === conversationId);
+    set((state) => ({
+      messages: [], conversation: listed || { id: conversationId }, newChat: false, isHistoryLoading: true, historyError: '',
+      historyHasMore: false, historyCursor: null, isLoadingOlder: false, isQuerying: false, queryEpoch: state.queryEpoch + 1,
+      sources: closedSources(),
+    }));
+    const controller = new AbortController();
+    historyController = controller;
+    const current = () => historyController === controller && get().selectedRepo === repoName;
+    try {
+      const response = await getConversation(repoName, { signal: controller.signal, params: firstPageParams(conversationId) });
+      if (!current()) return;
+      set({
+        messages: (response.data.messages || []).map(normalizeMessage),
+        conversation: response.data.conversation || listed || { id: conversationId },
+        isHistoryLoading: false,
+        historyHasMore: Boolean(response.data.has_more),
+        historyCursor: response.data.next_before || null,
+      });
+      rememberConversation(repoName, conversationId);
+    } catch (error) {
+      if (error?.code === 'ERR_CANCELED' || error?.name === 'CanceledError' || !current()) return;
+      const gone = error?.response?.status === 404;
+      set((state) => ({
+        isHistoryLoading: false,
+        historyError: gone ? 'This conversation was deleted. Pick another one from History or start a new chat.' : errorMessage(error, 'This conversation could not be loaded.'),
+        conversationList: gone
+          ? { ...state.conversationList, items: state.conversationList.items.filter((item) => item.id !== conversationId) }
+          : state.conversationList,
+        ...(gone ? { conversation: null } : {}),
+      }));
+    } finally {
+      if (historyController === controller) historyController = null;
+    }
+  },
+
+  /** Start an empty conversation. The open one stays saved in the history list. */
+  startNewChat: () => {
+    const repoName = get().selectedRepo;
+    if (!repoName) return;
+    historyController?.abort();
+    queryController?.abort();
+    historyController = null;
+    queryController = null;
+    set((state) => ({
+      messages: [], conversation: null, newChat: true, isHistoryLoading: false, historyError: '', historyHasMore: false,
+      historyCursor: null, isLoadingOlder: false, isQuerying: false, queryEpoch: state.queryEpoch + 1, sources: closedSources(),
+    }));
+  },
+
+  /** Load (or refresh) the selected repository's saved conversations; `more` adds the next older page. */
+  loadConversations: async ({ more = false } = {}) => {
+    const repoName = get().selectedRepo;
+    if (!repoName) return;
+    const list = get().conversationList.repoName === repoName ? get().conversationList : emptyConversationList(repoName);
+    if (more && (!list.hasMore || !list.cursor || list.loading)) return;
+    const revision = ++conversationListRevision;
+    set({ conversationList: { ...list, loading: true, error: '' } });
+    const current = () => revision === conversationListRevision && get().selectedRepo === repoName;
+    try {
+      const response = await listConversations(repoName, {
+        params: { limit: CONVERSATION_PAGE_SIZE, ...(more ? { before: list.cursor } : {}) },
+      });
+      if (!current()) return;
+      const page = response.data.conversations || [];
+      set((state) => ({
+        conversationList: {
+          repoName,
+          items: more ? appendConversations(state.conversationList.items, page) : page,
+          loaded: true,
+          loading: false,
+          error: '',
+          hasMore: Boolean(response.data.has_more),
+          cursor: response.data.next_before || null,
+        },
+      }));
+    } catch (error) {
+      if (!current()) return;
+      set((state) => ({
+        conversationList: { ...state.conversationList, loading: false, error: errorMessage(error, 'Your conversations could not be loaded.') },
+      }));
+    }
+  },
+
+  renameConversation: async (conversationId, title) => {
+    const repoName = get().selectedRepo;
+    const response = await renameConversationRequest(repoName, conversationId, cleanTitle(title));
+    const renamed = response.data.conversation;
+    set((state) => ({
+      conversation: state.conversation?.id === conversationId ? { ...state.conversation, title: renamed.title } : state.conversation,
+      conversationList: state.conversationList.repoName === repoName
+        ? { ...state.conversationList, items: state.conversationList.items.map((item) => (item.id === conversationId ? { ...item, ...renamed } : item)) }
+        : state.conversationList,
+    }));
+    return renamed;
+  },
+
+  /**
+   * Delete (hide) a conversation. Deleting the open one starts a new chat.
+   * Resolves with `{ wasOpen }` so an Undo can reopen it.
+   */
+  deleteConversation: async (conversationId) => {
+    const repoName = get().selectedRepo;
+    await deleteConversationRequest(repoName, conversationId);
+    const wasOpen = get().selectedRepo === repoName && get().conversation?.id === conversationId;
+    set((state) => (state.conversationList.repoName === repoName ? {
+      conversationList: { ...state.conversationList, items: state.conversationList.items.filter((item) => item.id !== conversationId) },
+    } : {}));
+    if (wasOpen) {
+      rememberConversation(repoName, null);
+      get().startNewChat();
+    }
+    return { wasOpen, repoName };
+  },
+
+  /** Undo a delete; `reopen` opens it again if nothing was asked since. */
+  restoreConversation: async (conversationId, { repoName = get().selectedRepo, reopen = false } = {}) => {
+    const response = await restoreConversationRequest(repoName, conversationId);
+    const restored = response.data.conversation;
+    set((state) => (state.conversationList.repoName === repoName ? {
+      conversationList: { ...state.conversationList, items: upsertConversation(state.conversationList.items, restored) },
+    } : {}));
+    const state = get();
+    if (reopen && state.selectedRepo === repoName && state.newChat && !state.messages.length && !state.isQuerying) {
+      void get().selectConversation(conversationId);
+    }
+    return restored;
+  },
+
+  /** Every message of the open conversation, oldest first (older pages fetched as needed), for export. */
+  collectConversation: async () => {
+    const { selectedRepo: repoName, conversation, messages, historyHasMore, historyCursor } = get();
+    let all = messages.filter((message) => !message.streaming);
+    let cursor = historyHasMore ? historyCursor : null;
+    while (repoName && cursor) {
+      const response = await getConversation(repoName, {
+        params: { limit: EXPORT_PAGE_SIZE, before: cursor, ...(conversation?.id ? { conversation_id: conversation.id } : {}) },
+      });
+      all = [...(response.data.messages || []).map(normalizeMessage), ...all];
+      cursor = response.data.has_more ? response.data.next_before : null;
+    }
+    return all;
+  },
+
+  /** Prepend the next older page of the open conversation. */
   loadOlderMessages: async () => {
-    const { selectedRepo: repoName, historyHasMore, historyCursor, isLoadingOlder, isHistoryLoading } = get();
+    const {
+      selectedRepo: repoName, conversation, historyHasMore, historyCursor, isLoadingOlder, isHistoryLoading,
+    } = get();
     if (!repoName || !historyHasMore || !historyCursor || isLoadingOlder || isHistoryLoading) return;
+    const conversationId = conversation?.id || null;
     set({ isLoadingOlder: true });
     try {
-      const response = await getConversation(repoName, { params: { limit: HISTORY_PAGE_SIZE, before: historyCursor } });
+      const response = await getConversation(repoName, {
+        params: { limit: HISTORY_PAGE_SIZE, before: historyCursor, ...(conversationId ? { conversation_id: conversationId } : {}) },
+      });
       const older = (response.data.messages || []).map(normalizeMessage);
       // The cursor moves only once the whole page is in, so a page cut short
-      // (another repository, a cleared chat) is never skipped.
-      const current = () => get().selectedRepo === repoName && get().historyCursor === historyCursor;
+      // (another repository or conversation, a new chat) is never skipped.
+      const current = () => get().selectedRepo === repoName && (get().conversation?.id || null) === conversationId
+        && get().historyCursor === historyCursor;
       for (let end = older.length; end > 0; end -= OLDER_BATCH_SIZE) {
         if (!current()) return;
         const batch = older.slice(Math.max(0, end - OLDER_BATCH_SIZE), end);
@@ -409,17 +662,13 @@ const useStore = create((set, get) => ({
   },
 
   retryHistory: () => {
-    const repo = get().selectedRepo;
+    const { selectedRepo: repo, conversation } = get();
+    if (conversation?.id && !get().messages.length) {
+      void get().selectConversation(conversation.id, { force: true });
+      return;
+    }
     set({ selectedRepo: null });
     void get().selectRepo(repo);
-  },
-
-  clearChat: async () => {
-    const repo = get().selectedRepo;
-    if (!repo) return;
-    queryController?.abort();
-    await clearConversation(repo);
-    set((state) => ({ messages: [], historyHasMore: false, historyCursor: null, isQuerying: false, queryEpoch: state.queryEpoch + 1, sources: { open: false, messageId: null, activeIndex: null, file: null, stack: [] } }));
   },
 
   stopQuery: () => {
@@ -491,8 +740,24 @@ const useStore = create((set, get) => ({
       finished = true;
       const normalized = normalizeMessage({ ...data, id: assistantId, role: 'assistant', content: data.answer, created_at: now });
       update(() => normalized);
+      // The answer was saved in this conversation (a new chat's first answer
+      // creates it): the next question continues it.
+      const saved = data.conversation;
+      if (!saved?.id) return;
+      set((state) => (isCurrent(state) ? {
+        conversation: { ...state.conversation, ...saved },
+        newChat: false,
+        conversationList: state.conversationList.repoName === repo && state.conversationList.loaded
+          ? { ...state.conversationList, items: recordExchange(state.conversationList.items, saved, { proposal: Boolean(normalized.proposal_id) }) }
+          : state.conversationList,
+      } : {}));
+      if (get().selectedRepo === repo) rememberConversation(repo, saved.id);
     };
-    const payload = { repo_name: repo, question: text, model_profile: modelProfile, workflow };
+    // Continue the open conversation, or start one (a new chat, or a
+    // repository's first question).
+    const conversationId = get().conversation?.id;
+    const target = conversationId ? { conversation_id: conversationId } : { new_conversation: true };
+    const payload = { repo_name: repo, question: text, model_profile: modelProfile, workflow, ...target };
 
     try {
       let received = 0;
@@ -527,7 +792,7 @@ const useStore = create((set, get) => ({
         if (!(error instanceof StreamUnavailableError) || received > 0) throw error;
         // The connection cannot stream (proxy, old browser): use JSON.
         update({ stage: { stage: 'generating', detail: 'Writing the answer — it appears all at once on this connection' } });
-        const response = await queryRepo(repo, text, modelProfile, workflow, { signal: controller.signal });
+        const response = await queryRepo(repo, text, modelProfile, workflow, { signal: controller.signal }, target);
         finish(response.data);
       }
       if (!finished) throw new ApiError('The answer stream ended before the answer was complete.');

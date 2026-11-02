@@ -660,6 +660,7 @@ REQUIRED_TABLES = (
     "ingestion_jobs", "chat_messages", "kt_cache", "account_entitlements", "billing_orders",
     "repo_index_state", "ingestion_job_meta", "embedding_cache", "ingestion_metrics",
     "repo_snapshots", "file_vectors", "repo_index_runs", "edit_proposals",
+    "conversations",
 )
 
 # Each migration runs only when one of its marker tables is missing, so a
@@ -672,6 +673,7 @@ MIGRATIONS: tuple[tuple[str, frozenset[str]], ...] = (
     ("03_github.sql", frozenset({"user_github_tokens", "github_oauth_states", "github_change_operations"})),
     ("05_performance.sql", frozenset({"repo_index_state", "ingestion_job_meta", "embedding_cache", "ingestion_metrics"})),
     ("06_scale_and_editing.sql", frozenset({"repo_snapshots", "file_vectors", "repo_index_runs", "edit_proposals"})),
+    ("07_conversations.sql", frozenset({"conversations"})),
     ("08_sharing.sql", frozenset({"repo_members", "repo_invites", "answer_shares"})),
 )
 
@@ -713,6 +715,25 @@ async def _existing_tables(store) -> set[str]:
     return {str(row.get("name")) for row in rows}
 
 
+_ADD_COLUMN = re.compile(r"^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+(?:COLUMN\s+)?(\w+)", re.IGNORECASE)
+
+
+async def _column_already_added(store, statement: str) -> bool:
+    """True for an ALTER TABLE ... ADD COLUMN whose column already exists.
+
+    SQLite has no ADD COLUMN IF NOT EXISTS. A migration that stopped after
+    adding a column runs again on the next start, and must skip that step.
+    """
+    match = _ADD_COLUMN.match(statement)
+    if not match:
+        return False
+    try:
+        rows = await store.fetch_all("SELECT name FROM pragma_table_info(?)", [match.group(1)])
+    except Exception:
+        return False
+    return any(str(row.get("name") or "").lower() == match.group(2).lower() for row in rows)
+
+
 async def apply_migrations(store) -> list[str]:
     """Apply missing additive migrations and return the files that ran."""
     directory = migrations_directory()
@@ -729,6 +750,8 @@ async def apply_migrations(store) -> list[str]:
             logger.warning("Turso migration %s is missing; skipping", filename)
             continue
         for statement in split_sql_script(path.read_text(encoding="utf-8")):
+            if await _column_already_added(store, statement):
+                continue
             await store.execute(statement)
         applied.append(filename)
         existing = await _existing_tables(store)
@@ -758,7 +781,7 @@ async def assert_turso_schema() -> None:
             if missing:
                 raise DatabaseConfigurationError(
                     "Turso schema is missing required tables: " + ", ".join(missing)
-                    + ". Run the SQL files in turso/ (00 through 06) or enable AUTO_MIGRATE."
+                    + ". Run the SQL files in turso/ (00 through 08) or enable AUTO_MIGRATE."
                 )
         except DatabaseConfigurationError:
             raise
@@ -767,7 +790,7 @@ async def assert_turso_schema() -> None:
                 raise
             raise DatabaseConfigurationError(
                 "Turso schema is not initialized or is unavailable. Run the SQL files in turso/ "
-                "(00 through 06) in the Turso SQL shell, then restart the backend."
+                "(00 through 08) in the Turso SQL shell, then restart the backend."
             ) from error
         _turso_schema_verified = True
 
