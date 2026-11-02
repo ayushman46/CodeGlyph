@@ -297,7 +297,9 @@ class NamedFileSectionTests(unittest.TestCase):
         self.assertTrue(any(covers(item, "httpx/_client.py", 1694) for item in result[:2]))
         self.assertLessEqual(len(result), 8)
         sql, args = next(item for item in store.executed if "AS focus_score" in item[0])
-        self.assertIn("ORDER BY focus_score DESC", sql)
+        # Sections rank by what the question is about, not by line order
+        # (after the exactly named path, which comes before its namesakes).
+        self.assertIn("THEN 0 ELSE 1 END, focus_score DESC, file_path, start_line", sql)
         self.assertEqual(args[0], "_send_single_request")
         self.assertNotIn("unretrieved_identifiers", result[0]["_evidence_plan"])
 

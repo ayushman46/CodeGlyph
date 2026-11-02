@@ -853,17 +853,31 @@ async def requested_files_chunks(
     if staging_prefix:
         staging_filter = " AND id NOT LIKE ?"
         args.append(f"{staging_prefix}%")
+    # A path named exactly (the root `index.js`) comes before same-named
+    # files deeper down (`examples/*/index.js`), which used to fill the
+    # budget first because they sort before it (round 3).
+    exact_paths = [file_path.lower() for file_path in file_paths]
+    exact_sql = f"CASE WHEN lower(file_path) IN ({', '.join('?' for _ in exact_paths)}) THEN 0 ELSE 1 END"
+    args.extend(exact_paths)
     args.append(max(1, limit) * len(file_paths))
     rows = await store.fetch_all(
         f"SELECT id, file_path, start_line, end_line, language, symbols, content, ({score_sql}) AS focus_score FROM chunks "
         f"WHERE repo_id = ? AND ({' OR '.join(conditions)}){staging_filter} "
-        "ORDER BY focus_score DESC, file_path, start_line LIMIT ?",
+        f"ORDER BY {exact_sql}, focus_score DESC, file_path, start_line LIMIT ?",
         args,
     )
+    found_exact = {str(row.get("file_path") or "").lower() for row in rows if isinstance(row, dict)} & set(exact_paths)
+    kept = []
     for row in rows:
-        if isinstance(row, dict):
-            row.pop("focus_score", None)
-    return rows
+        if not isinstance(row, dict):
+            continue
+        row.pop("focus_score", None)
+        path = str(row.get("file_path") or "").lower()
+        # A bare name that exists exactly means that file, not its namesakes.
+        if path not in found_exact and any(path.endswith(f"/{name}") for name in found_exact if "/" not in name):
+            continue
+        kept.append(row)
+    return kept
 
 
 # Ranking of the sections inside a named file. Declaring a name the question

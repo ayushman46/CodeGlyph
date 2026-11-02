@@ -488,3 +488,22 @@ class ChangeRiskTests(ExactEvidenceStoreCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NamedRootFileTests(ExactEvidenceStoreCase):
+    """Round 3 (express): "What does the root index.js file load?" got
+    examples/downloads/index.js, because same-named files deeper down sort
+    before the root one and filled the budget."""
+
+    async def test_a_bare_name_that_exists_exactly_means_that_file(self):
+        files = {"index.js": "'use strict';\n\nmodule.exports = require('./lib/express');\n"}
+        for name in ("auth", "downloads", "mvc", "session", "static-files"):
+            files[f"examples/{name}/index.js"] = f"var express = require('../../');\nvar app = module.exports = express();\n// {name}\n"
+        files["examples/auth/server.js"] = "app.listen(3000);\n"
+        files["examples/mvc/server.js"] = "app.listen(3001);\n"
+        repo_id = await self.add_repo(files)
+        rows = await retriever.requested_files_chunks(self.store, repo_id, ["index.js"], limit=2)
+        self.assertEqual({row["file_path"] for row in rows}, {"index.js"})
+        # A bare name with no exact file still finds its namesakes.
+        rows = await retriever.requested_files_chunks(self.store, repo_id, ["server.js"], limit=4)
+        self.assertEqual({row["file_path"] for row in rows}, {"examples/auth/server.js", "examples/mvc/server.js"})
