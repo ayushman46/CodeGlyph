@@ -198,7 +198,10 @@ test('a slow refresh of an earlier proposal never leaks into a newer review', as
   await page.unroute('**/api/query/stream');
   await streamOnce(page, { answer: 'Second.', mode: 'editing', citations: [], edit_suggestion: editProposal('p-new', 'New attempt', [lazyFile('NEW_ATTEMPT')]), edit_ticket: 't2' });
   await askForEdit(page, 'second');
-  await page.locator('[data-slot="proposal"]').getByRole('button', { name: 'Review & open PR' }).last().click();
+  // The new proposal's own card: `.last()` could click the old card's button
+  // before the new card had rendered (seen under load), opening the old review.
+  await page.locator('[data-slot="proposal"]').filter({ hasText: 'New attempt' })
+    .getByRole('button', { name: 'Review & open PR' }).click();
   await expect(dialog.getByText('NEW_ATTEMPT').first()).toBeVisible();
   await page.waitForTimeout(1800);
   await expect(dialog.getByText('OLD_ATTEMPT')).toHaveCount(0);
