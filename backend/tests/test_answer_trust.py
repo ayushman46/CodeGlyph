@@ -587,6 +587,24 @@ class ReferenceReasonTests(answers.DatabaseTestCase):
         self.assertEqual(len(ambiguous["candidates"]), 8)
         self.assertNotIn("test/fixtures/deep/server.js", ambiguous["candidates"])
 
+    def test_same_named_evidence_files_do_not_hide_the_exact_indexed_file(self):
+        """Round 2 (express): with two examples/*/index.js in the evidence, a bare
+        `index.js` was "matches several files" listing only those two."""
+        files = {"index.js": "module.exports = require('./lib/express');"}
+        files.update({f"examples/demo{n}/index.js": "app.listen(3000)" for n in range(3)})
+        files.update({f"examples/demo{n}/server.js": "app.listen(3000)" for n in range(3)})
+        run(answers.seed_files(self.store, files))
+        evidence = [answers.chunk("examples/demo0/index.js", 1, "app.listen(3000)"),
+                    answers.chunk("examples/demo1/index.js", 1, "app.listen(3000)"),
+                    answers.chunk("examples/demo0/server.js", 1, "app.listen(3000)"),
+                    answers.chunk("examples/demo1/server.js", 1, "app.listen(3000)")]
+        _, refs = run(validate_answer_references(self.store, answers.REPO_ID, "Start at `index.js`, then `server.js`.", evidence))
+        root, server = refs
+        self.assertEqual((root["valid"], root["file_path"], root["reason"]), (True, "index.js", None))
+        # No exact file: every indexed match is listed, not only the evidence's two.
+        self.assertEqual((server["reason"], server["candidate_count"]), ("ambiguous", 3))
+        self.assertEqual(server["candidates"], [f"examples/demo{n}/server.js" for n in range(3)])
+
 
 # ---------------------------------------------------------------------------
 # The answer pipeline: stored truncated flag, Continue, checks after reload

@@ -666,7 +666,11 @@ async def validate_answer_references(
     for reference in references:
         matches = _suffix_matches([*evidence_paths, *extra], reference["path"])
         reference["_evidence_matches"] = list(dict.fromkeys(matches))
-        if not reference["_evidence_matches"]:
+        several = len(reference["_evidence_matches"]) > 1 and not any(
+            item.lower() == reference["path"].lower() for item in reference["_evidence_matches"])
+        if not reference["_evidence_matches"] or several:
+            # Several evidence files share a bare name (examples/*/index.js):
+            # the index may hold the file it names exactly (the root index.js).
             unresolved.append(reference["path"])
     indexed = await _indexed_paths_for(store, repo_id, unresolved) if (unresolved and repo_id) else {}
 
@@ -687,7 +691,12 @@ async def validate_answer_references(
         if len(candidates) == 1:
             resolved = candidates[0]
         elif len(candidates) > 1:
-            reason, ambiguous_files = "ambiguous", candidates
+            in_index = (indexed or {}).get(path) or []
+            exact_in_index = [item for item in in_index if item.lower() == path.lower()]
+            if len(exact_in_index) == 1:
+                resolved = exact_in_index[0]
+            else:
+                reason, ambiguous_files = "ambiguous", list(dict.fromkeys([*candidates, *in_index]))
         else:
             in_index = (indexed or {}).get(path) if indexed is not None else None
             # `index.js` is the root index.js even when examples/*/index.js exist.
