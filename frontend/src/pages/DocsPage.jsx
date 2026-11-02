@@ -148,7 +148,7 @@ const SECTIONS = [
           ['The agent plans', 'It decides which files must change across the repository, including call sites and tests, up to 8 files per change.'],
           ['Exact, validated hunks', 'It reads the current files from GitHub and writes exact search/replace hunks. Every hunk is validated against the real file; nothing unvalidated is shown as a patch.'],
           ['Review the diff', 'Changes appear as a GitHub-style green and red diff, unified or split. You can edit the result before pushing.'],
-          ['Revise it', 'Ask a follow-up in Edit & PR, such as "also handle the case where the key is an int". The new proposal starts from the previous one and keeps its changes unless you ask to drop them. Say "start over" for a separate change.'],
+          ['Revise it', 'Start a follow-up in Edit & PR with "Also", such as "also handle the case where the key is an int", or name the earlier proposal ("drop the test change from your patch"). The new proposal starts from the previous one and keeps its changes unless you ask to drop them. Other requests start a new proposal.'],
           ['Open a pull request', 'Connect GitHub from the review when you are ready. The description fills the repository\'s PR template and closes the issue with `Fixes #N`. With write access the PR comes from a new branch in your repository; otherwise from a fork. Or download a `.patch` instead.'],
         ],
       },

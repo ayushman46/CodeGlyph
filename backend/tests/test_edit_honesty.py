@@ -360,11 +360,27 @@ class PullRequestBodyTests(unittest.TestCase):
 class RevisionIntentTests(unittest.TestCase):
     def test_follow_ups_amend_and_start_over_does_not(self):
         for question in ("also handle the case where the key is an int", "Also cover the filename fallback",
-                         "Now add a test for it", "Drop the test change", "Revise the patch to use str()",
-                         "handle int keys in the files loop too", "Keep the data loop change but rename the helper"):
+                         "OK, and also add a test for it", "Can you also handle bytes keys?", "Additionally, add a test",
+                         "Drop the test change", "Drop the test change, keep the rest", "Revise the patch to use str()",
+                         "Update your patch so int keys work", "In the previous proposal, convert bytes keys too",
+                         "Keep the data loop change but rename the helper"):
             self.assertTrue(wants_revision(question), question)
         for question in ("Fix https://github.com/psf/requests/issues/7634", "Add a timeout option to Session.send",
                          "Start over: also convert the keys", "Make a new proposal that also converts keys"):
+            self.assertFalse(wants_revision(question), question)
+
+    def test_an_ordinary_new_request_is_not_a_revision(self):
+        # A bare "too", "as well", "now", "this change", "keep the ..." or
+        # "revert the ..." is how many new requests read; merging one of them
+        # into the earlier patch (and closing its issue) would be wrong.
+        for question in ("The login button is too small on mobile, make it bigger",
+                         "Make this change: rename fetchUser to loadUser", "Now add a dark mode toggle to the settings page",
+                         "Keep the existing API but add a timeout parameter to Session.get",
+                         "Revert the change from commit abc123 in utils.py", "Fix the bug where the cache is too large",
+                         "Add retries to the HTTP client as well as a backoff", "handle int keys in the files loop too",
+                         "Now add a test for it", "In addition to retries, add a backoff", "Fix the diff algorithm for large files",
+                         "Update the PR template to add a checklist", "Port the fix from the previous PR #99",
+                         "Remove the changes section from the README", "Undo the changes in commit 1a2b3c4d"):
             self.assertFalse(wants_revision(question), question)
 
 
@@ -594,6 +610,27 @@ class RevisionTests(EditHonestyCase):
         self.assertEqual([item["file_path"] for item in result.proposal["files"]], ["src/requests/models.py"])
         self.assertEqual(result.proposal["revision_of"]["dropped_files"], ["tests/test_requests.py"])
         self.assertIn("the earlier change was dropped, as asked", result.markdown)
+        # Dropped as asked is not "planned but not changed" (no incomplete warning beside it).
+        self.assertEqual(result.proposal["unchanged_files"], [])
+        self.assertFalse(result.proposal["incomplete"])
+        self.assertNotIn("## Not changed", result.markdown)
+
+    def test_a_hunk_that_writes_a_kept_earlier_change_again_is_ignored(self):
+        # "Keep the rest": the model re-sends the earlier models.py hunk,
+        # searching for the original lines that the revision's file no
+        # longer has. It changes nothing and must not fail the edit.
+        question, first = self.first_proposal()
+        history = self.remember(question, first)
+        revert = {"old": NEW_TEST["new"], "new": NEW_TEST["old"]}
+        responses = [plan("src/requests/models.py", "tests/test_requests.py"),
+                     edit([{"file_path": "src/requests/models.py", "action": "modify", "changes": [FILE_NAME_FIX]},
+                           {"file_path": "tests/test_requests.py", "action": "modify", "changes": [revert]}])]
+        result = self.revise(history, responses=responses, question="Drop the test change from your patch, keep the rest")
+        self.assertEqual([item["file_path"] for item in result.proposal["files"]], ["src/requests/models.py"])
+        self.assertEqual(result.proposal["files"][0]["after"], first.proposal["files"][0]["after"])
+        self.assertEqual(result.proposal["revision_of"]["dropped_files"], ["tests/test_requests.py"])
+        self.assertEqual(result.proposal["revision_of"]["kept_files"], ["src/requests/models.py"])
+        self.assertEqual(result.proposal["unchanged_files"], [])
 
     def test_an_earlier_change_that_no_longer_applies_is_reported(self):
         question, first = self.first_proposal()
@@ -605,6 +642,8 @@ class RevisionTests(EditHonestyCase):
         self.assertEqual(revision["not_reapplied"][0]["file_path"], "tests/test_requests.py")
         self.assertIn("no longer applies", revision["not_reapplied"][0]["reason"])
         self.assertEqual([item["file_path"] for item in result.proposal["files"]], ["src/requests/models.py"])
+        # Reported once, under revision_of, not again as "not changed".
+        self.assertEqual(result.proposal["unchanged_files"], [])
         call = next(call for call in result.tool_calls if call["tool"] == "revise_proposal")
         self.assertEqual(call["status"], "warn")
 
@@ -622,6 +661,50 @@ class RevisionTests(EditHonestyCase):
         # Another user, even with the same history text, never reaches this user's proposal.
         other = self.edit(self.REVISION, list(fresh), issue=ISSUE, history=history, user=base.OTHER)
         self.assertIsNone(other.proposal["revision_of"])
+
+    def test_an_unrelated_request_after_a_proposal_is_a_new_proposal(self):
+        question, first = self.first_proposal()
+        history = self.remember(question, first)
+        responses = [plan("src/requests/models.py"),
+                     edit([{"file_path": "src/requests/models.py", "action": "modify", "summary": "Fallback",
+                            "changes": [FALLBACK_FIX]}], title="Use the key as the filename", pr_body="## Summary\n\nUnrelated.")]
+        for request in ("The default filename is too generic; use str(k) as the filename fallback",
+                        "Make this change: use str(k) as the filename fallback"):
+            result = self.edit(request, list(responses), issue=ISSUE, history=history)
+            proposal = result.proposal
+            self.assertIsNone(proposal["revision_of"], request)
+            # Only this request's change, and the earlier issue is not carried over or closed.
+            self.assertEqual([item["file_path"] for item in proposal["files"]], ["src/requests/models.py"])
+            self.assertEqual(proposal["files"][0]["after"], MODELS.replace(FALLBACK_FIX["old"], FALLBACK_FIX["new"]))
+            self.assertIsNone(proposal["issue_reference"])
+            self.assertNotIn("#7634", proposal["pr_body"])
+            self.assertFalse(any(call["tool"] in {"revise_proposal", "read_github_issue"} for call in result.tool_calls))
+            # The answer says how to revise the earlier proposal instead.
+            self.assertTrue(result.markdown.startswith(
+                '> This is a new proposal. To change the previous one ("Fix non-string form field names") instead, '
+                'start the request with "Also" or say "revise the previous proposal".'), result.markdown[:200])
+
+    def test_a_proposal_from_hours_ago_is_not_revised(self):
+        question, first = self.first_proposal()
+        history = self.remember(question, first)
+        run(self.store.execute("UPDATE chat_messages SET created_at = ? WHERE repo_id = ?",
+                               ["2026-01-01T09:00:00+00:00", self.repo["id"]]))
+        fresh = [plan("src/requests/models.py"),
+                 edit([{"file_path": "src/requests/models.py", "action": "modify", "changes": [FALLBACK_FIX]}])]
+        result = self.revise(history, responses=fresh)
+        self.assertIsNone(result.proposal["revision_of"])
+        self.assertFalse(result.markdown.startswith("> This is a new proposal"))
+
+    def test_previous_proposal_for_reads_only_the_history_it_is_given(self):
+        question, first = self.first_proposal()
+        history = self.remember(question, first)
+        repo_id = self.repo["id"]
+        found = run(previous_proposal_for(self.store, repo_id, base.USER, self.REVISION, history))
+        self.assertEqual(found["id"], first.proposal["id"])
+        # Not a revision, another conversation's history, or another user: none.
+        self.assertIsNone(run(previous_proposal_for(self.store, repo_id, base.USER, "Make this change: use str(k)", history)))
+        self.assertIsNone(run(previous_proposal_for(self.store, repo_id, base.USER, self.REVISION, [])))
+        self.assertIsNone(run(previous_proposal_for(self.store, repo_id, base.OTHER, self.REVISION, history)))
 
     def test_a_different_issue_is_a_separate_change(self):
         question, first = self.first_proposal()

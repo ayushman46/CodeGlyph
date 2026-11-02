@@ -44,6 +44,7 @@ import posixpath
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
@@ -153,19 +154,34 @@ lines show shows first last before after field value values set sets get gets pl
 your you function component instead rename renamed move moved fix fixes fixed bug issue
 """.split())
 _MAX_NEW_FILES = 3
-# A follow-up that amends the proposal already in the conversation ("also
-# handle int keys", "drop the test change", "revise the patch") instead of
-# asking for a separate change. "Start over" opts out.
+# A follow-up that amends the proposal already in the conversation instead of
+# asking for a separate change. Only an explicit reference to that proposal
+# counts, because an ordinary request ("the button is too small", "now add
+# dark mode", "make this change: ...") must never be merged into an earlier,
+# unrelated patch:
+# - a leading "also" / "additionally" / "in addition" ("also handle int
+#   keys", "OK, and also add a test");
+# - the proposal named as such ("the previous proposal", "your patch",
+#   "revise the diff to ..."), but not a PR or commit with a number;
+# - dropping or keeping one of its changes ("drop the test change", "keep the
+#   data loop change but ..."), but not "revert the change from commit abc".
+# "Start over" opts out.
 _REVISION_CUE = re.compile(
-    r"^\s*(?:(?:ok(?:ay)?|great|thanks|thank you|good|nice|looks good)[,.!]?\s+)?"
-    r"(?:also|and(?:\s+also)?|plus|additionally|but|now|then|instead|however|in addition|actually)\b"
-    r"|\b(?:also|as well|too|additionally|in addition|on top of (?:that|this|it)|revise|amend)\b"
-    r"|\bthe\s+(?:proposal|patch|diff)\b"
-    r"|\b(?:this|that|your)\s+(?:proposal|patch|diff|pr|pull request|change|fix)\b"
-    r"|\b(?:the\s+)?(?:previous|last|earlier|current|same)\s+(?:proposal|patch|diff|pr|pull request|change|fix|edit)\b"
-    r"|\b(?:drop|keep|undo|revert)\s+(?:the|that|this|those|these|your)\b",
+    r"^\s*(?:(?:ok(?:ay)?|great|thanks|thank you|good|nice|looks good|perfect|cool)[,.!]?\s+)?"
+    r"(?:(?:and|now|then|please|but|can you|could you|would you)\s+)*"
+    r"(?:also|additionally|in addition(?!\s+to\b)|on top of (?:that|this|it))\b"
+    r"|\b(?:the|this|that|your|my)\s+(?:previous|last|earlier|proposed)\s+"
+    r"(?:proposal|patch|diff|pr|pull request|change|changes|fix|edit)\b(?!\s*\(?#\d)"
+    r"|\byour\s+(?:proposal|patch|diff|pr|pull request|change|changes|fix|edit|edits)\b(?!\s*\(?#\d)"
+    r"|\b(?:the|this|that)\s+(?:proposal|patch|diff)(?=\s*(?:$|[,.;:!?)])|\s+(?:to|so|and|but|too|also|as|above|again|instead)\b)"
+    r"|\b(?:drop|undo|remove|revert|keep)\s+(?:the|that|this|those|these|your)\s+(?:[\w./-]+\s+){0,3}?"
+    r"(?:change|changes|edit|edits|hunk|hunks)(?=\s*(?:$|[,.;:!?)])|\s+(?:to|in|for|but|and|so|that|you)\b)"
+    r"(?!\s+(?:in|to)\s+(?:commit|pr\b|pull request|#|[0-9a-f]{7,40}\b))",
     re.IGNORECASE,
 )
+# A proposal older than this is never revised, even when the conversation
+# still holds it: an explicit "also ..." days later is most likely a new request.
+_REVISION_WINDOW_SECONDS = 6 * 3600
 _FRESH_START = re.compile(
     r"\b(?:start (?:over|again|fresh)|from scratch|(?:a |an )?(?:new|separate|fresh) (?:proposal|patch|pr|pull request)|"
     r"ignore (?:the|that|your) (?:previous|last|earlier))\b",
@@ -552,20 +568,28 @@ def _issue_mentions(text: str) -> set[str]:
     return found
 
 
-async def previous_proposal_for(store: Any, repo_id: str, user_id: str, question: str,
-                                history: list[dict]) -> dict | None:
-    """The proposal a follow-up request revises, or None.
+def _within_revision_window(created_at: Any, now: datetime | None = None) -> bool:
+    """Whether a message stored at ``created_at`` (ISO 8601) is recent enough to revise; False when unreadable."""
+    try:
+        moment = datetime.fromisoformat(str(created_at or "").strip().replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return (now or datetime.now(UTC)) - moment <= timedelta(seconds=_REVISION_WINDOW_SECONDS)
+
+
+async def recent_proposal_for(store: Any, repo_id: str, user_id: str, history: list[dict]) -> dict | None:
+    """The newest proposal of this conversation, if it was made recently; else None.
 
     Only a proposal of this conversation counts: the newest assistant reply
     that produced one (its ``code_edit`` call) and whose text is among the
     assistant messages of ``history``, which the caller already scoped to the
-    conversation. The request must read as an amendment (``wants_revision``)
-    and must not name a different issue. The proposal is read for this user
-    and repository only. Returns ``{id, title, summary, question, files,
-    issue_reference, issue_confirmed, issue_repository}``.
+    conversation. That reply must be at most ``_REVISION_WINDOW_SECONDS``
+    old. The proposal is read for this user and repository only. Returns
+    ``{id, title, summary, question, files, issue_reference,
+    issue_confirmed, issue_repository}``.
     """
-    if not wants_revision(question):
-        return None
     replies = [str(entry.get("content") or "").strip() for entry in history or []
                if isinstance(entry, dict) and entry.get("role") == "assistant"]
     replies = [text for text in replies if text]
@@ -589,6 +613,8 @@ async def previous_proposal_for(store: Any, repo_id: str, user_id: str, question
                             if isinstance(call, dict) and call.get("tool") == "code_edit"), "")
         if not proposal_id:
             continue
+        if not _within_revision_window(row.get("created_at")):
+            return None  # the newest proposal is old; older ones are older still
         stored = await store.fetch_one(
             "SELECT payload_json FROM edit_proposals WHERE id = ? AND user_id = ? AND repo_id = ?",
             [proposal_id, user_id, repo_id],
@@ -604,20 +630,47 @@ async def previous_proposal_for(store: Any, repo_id: str, user_id: str, question
             "ORDER BY created_at DESC, id DESC LIMIT 1",
             [repo_id, user_id, row.get("created_at")],
         )
-        reference = str(proposal.get("issue_reference") or "")
-        named = _issue_mentions(question)
-        if named and named != {reference}:
-            return None  # a different issue is a separate change
         files = [item for item in proposal.get("files") or [] if isinstance(item, dict) and item.get("file_path")]
         if not files:
             return None
         return {
             "id": str(proposal.get("id") or proposal_id), "title": str(proposal.get("title") or ""),
             "summary": str(proposal.get("summary") or ""), "question": str((asked or {}).get("content") or ""),
-            "files": files, "issue_reference": reference or None, "issue_confirmed": bool(proposal.get("issue_confirmed")),
+            "files": files, "issue_reference": str(proposal.get("issue_reference") or "") or None,
+            "issue_confirmed": bool(proposal.get("issue_confirmed")),
             "issue_repository": str(proposal.get("issue_repository") or ""),
         }
     return None
+
+
+def revises(proposal: dict | None, question: str) -> bool:
+    """Whether ``question`` amends ``proposal`` (``recent_proposal_for``'s).
+
+    The request must read as an amendment (``wants_revision``: an explicit
+    reference such as a leading "also" or "the previous proposal") and must
+    not name a different issue, which is a separate change.
+    """
+    if not proposal or not wants_revision(question):
+        return False
+    named = _issue_mentions(question)
+    return not named or named == {str(proposal.get("issue_reference") or "")}
+
+
+async def previous_proposal_for(store: Any, repo_id: str, user_id: str, question: str,
+                                history: list[dict]) -> dict | None:
+    """The proposal ``question`` revises (``recent_proposal_for`` when ``revises``), or None."""
+    if not wants_revision(question):
+        return None
+    proposal = await recent_proposal_for(store, repo_id, user_id, history)
+    return proposal if revises(proposal, question) else None
+
+
+def _already_applied(content: str, change: dict) -> bool:
+    """Whether a hunk's search text is absent from ``content`` but its replacement is there exactly once."""
+    text = str(content or "").replace("\r\n", "\n")
+    old = str(change.get("old") or "").replace("\r\n", "\n")
+    new = str(change.get("new") or "").replace("\r\n", "\n")
+    return bool(old.strip()) and bool(new.strip()) and old not in text and text.count(new) == 1
 
 
 def _references(text: str, name: str) -> bool:
@@ -682,7 +735,7 @@ class CodeEditor:
         self._rename_fallback = ""
         # The referenced issue's own text, for the reproduction cases it quotes.
         self.issue_body = ""
-        # The proposal this request revises (previous_proposal_for), and per
+        # The proposal this request revises (``revises``), and per
         # previous file: the current file it is rebased on and the content
         # the revision starts from (the previous change re-applied to it).
         self.previous: dict | None = None
@@ -691,6 +744,8 @@ class CodeEditor:
         # Previous files whose change could not be carried over, with the reason.
         self.revision_lost: dict[str, str] = {}
         self.revision_dropped: list[str] = []
+        # For a new request made right after a proposal: how to revise that one instead.
+        self.revision_hint = ""
 
     def _issue_link(self, number: str) -> str:
         """GitHub's closing reference; a bare #N always means this repository."""
@@ -1491,6 +1546,15 @@ Rules:
             if not clean_changes:
                 continue
             clean_changes = unescape_hunks(target.content, clean_changes)
+            if path in self.revision_starts:
+                # A revision's FILE section already holds the earlier change. A
+                # hunk that writes it again (searching for the original lines,
+                # whose replacement is already there, as when the request says
+                # "keep the rest") changes nothing; it must not sink the edit.
+                kept = [change for change in clean_changes if not _already_applied(target.content, change)]
+                if not kept:
+                    continue
+                clean_changes = kept
             # A hunk whose replacement repeats its search text changes nothing
             # (the model "keeps" a file the request names, such as the source
             # under test of a new test file). Dropping it is lossless; rejecting
@@ -2673,13 +2737,20 @@ Rules:
         request = self.request
         self.started = time.monotonic()
         try:
-            self.previous = await previous_proposal_for(
-                request.store, str(request.repo.get("id") or ""), request.user_id, request.question,
-                request.conversation_history,
+            recent = await recent_proposal_for(
+                request.store, str(request.repo.get("id") or ""), request.user_id, request.conversation_history,
             )
         except Exception:
             logger.warning("Could not look up the proposal to revise", exc_info=True)
-            self.previous = None
+            recent = None
+        if revises(recent, request.question):
+            self.previous = recent
+        elif recent and not _FRESH_START.search(request.question) and not _issue_mentions(request.question):
+            # A new request right after a proposal: say how to revise it instead.
+            self.revision_hint = (
+                f"This is a new proposal. To change the previous one (\"{recent['title'] or 'Proposed change'}\") instead, "
+                "start the request with \"Also\" or say \"revise the previous proposal\"."
+            )
         issue_text, issue_reference = await self._issue_context()
         request_text = request.question.strip()
         if self.previous:
@@ -3055,9 +3126,12 @@ Rules:
 
         changed_paths = {item["file_path"] for item in files}
         model_reasons = _unchanged_reasons(payload)
+        # A revision's file whose earlier change was dropped as asked, or
+        # could not be re-applied (revision_of says so), is not "unchanged".
+        accounted = set(self.revision_dropped) | set(self.revision_lost)
         unchanged_files = [
             {"file_path": path, "reason": model_reasons.get(path) or "The model did not change this planned file."}
-            for path in loaded if path not in changed_paths
+            for path in loaded if path not in changed_paths and path not in accounted
         ] + [{"file_path": path, "reason": reason} for path, reason in self.not_loaded.items() if path not in changed_paths]
         # A file that still uses a renamed/removed export gets that concrete
         # reason, replacing the generic "not changed" one.
@@ -3070,7 +3144,7 @@ Rules:
             unchanged_files.append({"file_path": path, "reason": reason})
         dangling_open = {path: names for path, names in self.dangling.items() if path not in changed_paths}
         incomplete = bool([path for path in self.not_loaded if path not in changed_paths]) or bool(dangling_open) or any(
-            path not in changed_paths and path not in model_reasons for path in required_paths
+            path not in changed_paths and path not in model_reasons and path not in accounted for path in required_paths
         )
         approximate = sorted(item["file_path"] for item in files
                              if item.get("action") == "modify" and item["file_path"] in loaded and not loaded[item["file_path"]].exact)
@@ -3492,4 +3566,7 @@ async def run_code_edit(request: EditRequest) -> tuple[str, list[dict], dict | N
             editor.tool_calls,
             None,
         )
-    return format_proposal_markdown(proposal), editor.tool_calls, proposal
+    markdown = format_proposal_markdown(proposal)
+    if editor.revision_hint:
+        markdown = f"> {editor.revision_hint}\n\n{markdown}"
+    return markdown, editor.tool_calls, proposal
