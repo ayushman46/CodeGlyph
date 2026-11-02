@@ -162,6 +162,37 @@ export const prStatusPassed = {
   checks: prStatusFailed.checks.map((check) => ({ ...check, conclusion: 'success' })),
 };
 
+// ------------------------------------------------- code navigation (files, symbols)
+
+/** Indexed files of the mocked cal.com, for /files (search and folder listing). */
+export const INDEXED_FILES = [
+  CITED_PATH, 'packages/features/bookings/lib/getBooking.ts', 'packages/lib/timezone.ts', 'apps/web/pages/index.tsx',
+  '.github/workflows/ci.yml', 'README.md', 'package.json',
+];
+const SUPPORT_FOLDER = /^(\.|tests?$|examples?$|docs?$)/;
+const listFolder = (dir) => {
+  const base = dir ? `${dir}/` : '';
+  const folders = new Map();
+  const files = [];
+  INDEXED_FILES.filter((path) => path.startsWith(base)).forEach((path) => {
+    const rest = path.slice(base.length);
+    if (rest.includes('/')) {
+      const name = rest.split('/')[0];
+      folders.set(name, (folders.get(name) || 0) + 1);
+    } else files.push({ path, name: rest, bytes: 100 });
+  });
+  const directories = [...folders].map(([name, count]) => ({ path: `${base}${name}`, name, files: count }))
+    .sort((a, b) => Number(SUPPORT_FOLDER.test(a.name)) - Number(SUPPORT_FOLDER.test(b.name)) || a.name.localeCompare(b.name));
+  return { path: dir, directories, files: files.sort((a, b) => a.name.localeCompare(b.name)), total_files: INDEXED_FILES.length };
+};
+export const SYMBOLS = [
+  { name: 'handleConfirmation', kind: 'function', path: CITED_PATH, line: 42, container: null },
+  { name: 'getBooking', kind: 'function', path: 'packages/features/bookings/lib/getBooking.ts', line: 3, container: null },
+];
+const OUTLINE = [{ name: 'handleConfirmation', kind: 'function', line: 42, end_line: 118, depth: 0 }];
+/** The mocked cal.com repository, for tests that change a repository's state (status polls). */
+export const READY_REPO = readyRepo;
+
 const sse = (events) => `: connected\n\n${events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join('')}`;
 
 const json = (route, body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
@@ -193,10 +224,26 @@ export const mockApi = async (page, { githubConnected = false, prStatus = prStat
       });
     }
     if (path === '/repos/cal.com/search') {
-      return json(route, { query: url.searchParams.get('q'), results: [{ file_path: CITED_PATH, start_line: 40, end_line: 60, language: 'ts', matches: [{ line: 42, text: 'export async function handleConfirmation(booking: Booking) {' }] }] });
+      return json(route, {
+        query: url.searchParams.get('q'), searchable: true, mode: 'exact', more_files: false, line_count: 1,
+        results: [{
+          file_path: CITED_PATH, start_line: 42, end_line: 42, language: 'ts', match_count: 1, definitions: 1, truncated: false,
+          matches: [{ line: 42, text: 'export async function handleConfirmation(booking: Booking) {', spans: [[22, 40]], definition: true }],
+        }],
+      });
     }
     if (path === '/repos/cal.com/file') {
-      return json(route, { path: url.searchParams.get('path'), content: fileContent, source: 'github', ref: SHA, language: 'typescript', line_count: 160, github_url: `https://github.com/calcom/cal.com/blob/${SHA}/${CITED_PATH}` });
+      return json(route, { path: url.searchParams.get('path'), content: fileContent, source: 'github', ref: SHA, language: 'typescript', line_count: 160, github_url: `https://github.com/calcom/cal.com/blob/${SHA}/${CITED_PATH}`, outline: OUTLINE });
+    }
+    if (path === '/repos/cal.com/files') {
+      const q = (url.searchParams.get('q') || '').toLowerCase();
+      if (!q) return json(route, listFolder(url.searchParams.get('dir') || ''));
+      const files = INDEXED_FILES.filter((item) => item.toLowerCase().includes(q)).map((item) => ({ path: item, name: item.split('/').pop(), bytes: 100 }));
+      return json(route, { query: q, files, total_matches: files.length, total_files: INDEXED_FILES.length });
+    }
+    if (path === '/repos/cal.com/symbols') {
+      const q = (url.searchParams.get('q') || '').toLowerCase();
+      return json(route, { query: q, searchable: true, symbols: SYMBOLS.filter((symbol) => symbol.name.toLowerCase().includes(q)) });
     }
     if (path === '/query/stream' && method === 'POST') {
       const payload = route.request().postDataJSON();

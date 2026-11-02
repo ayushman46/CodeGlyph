@@ -1,14 +1,20 @@
-import { AlertCircle, AlertTriangle, Check, ChevronDown, ChevronUp, Copy, ExternalLink, Link2, RotateCcw, X } from 'lucide-react';
+import {
+  AlertCircle, AlertTriangle, Check, ChevronDown, ChevronUp, Code, Copy, ExternalLink, Eye, Link2, ListTree, RotateCcw, X,
+} from 'lucide-react';
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { isBeyondEnd } from '../../lib/lines';
 import { highlightLines } from '../../lib/prism';
 import { basename, dirname, githubBlobUrl } from '../../lib/citations';
+import { isMarkdownPath } from '../../lib/codeNav';
 import { shortSha } from '../../lib/format';
 import useStore from '../../store/useStore';
 import { ArtifactPanel } from '../ai/ArtifactPanel';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
 import { mergeRefs } from '../ui/Popover';
+import Segmented from '../ui/Segmented';
+import { OutlineList, SymbolBreadcrumb } from './FileOutline';
+import MarkdownPreview from './MarkdownPreview';
 
 // Rows never wrap (whitespace-pre) and use a fixed 20px line box, so large
 // files can be windowed: only the rows near the viewport are in the DOM.
@@ -19,6 +25,7 @@ const OVERSCAN = 60;
 const reducedMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 const anchorFor = (start, end) => (start ? `#L${start}${end && end !== start ? `-L${end}` : ''}` : '');
 const rangeText = (start, end) => (end && end !== start ? `${start}–${end}` : `${start}`);
+const linesText = (start, end) => `${end && end !== start ? 'lines' : 'line'} ${rangeText(start, end)}`;
 const inside = (number, range) => Boolean(range?.start) && number >= range.start && number <= (range.end || range.start);
 
 // The Artifact Panel body is the code's scroll container: dark like the
@@ -68,12 +75,17 @@ const IconButton = ({ label, onClick, children }) => (
  * it, Copy GitHub link / Open on GitHub (at the pinned commit) sit in the
  * header. Other ranges the same answer cites in this file get a lighter tint
  * and can be stepped through; clicking line numbers selects lines for a
- * GitHub link. The panel body is the scroll container (keyboard-scrollable);
- * the file toolbar stays pinned at its top.
+ * GitHub link (and `onSelectionChange`, which puts them in the page URL).
+ * The toolbar names the declaration the line sits in and opens an outline
+ * of the file's declarations; Markdown files can be read rendered. The
+ * panel body is the scroll container (keyboard-scrollable); the file
+ * toolbar stays pinned at its top. `targetLabel` names the opened lines
+ * ("Cited lines" for a citation, "Line 245" for a search match).
  */
 const FileViewer = ({
   repoName, path, startLine, endLine, githubUrl, commitSha, ranges = [],
   onClose, navigation = null, autoFocus = false, panelRef, panelProps,
+  targetLabel = 'Cited lines', onSelectionChange, onOpenPath,
 }) => {
   const loadFile = useStore((state) => state.loadFile);
   const entry = useStore((state) => state.files[`${repoName}::${path}`]);
@@ -86,7 +98,13 @@ const FileViewer = ({
   const [selection, setSelection] = useState(null);
   const [lineInput, setLineInput] = useState('');
   const [lineError, setLineError] = useState('');
+  const [outlineOpen, setOutlineOpen] = useState(false);
+  // Markdown opens rendered unless it was opened at specific lines.
+  const markdown = isMarkdownPath(path);
+  const [mode, setMode] = useState(markdown && !startLine ? 'rendered' : 'source');
+  const rendered = markdown && mode === 'rendered';
   const lineInputId = useId();
+  const outlineId = useId();
 
   // The Artifact Panel's body scrolls the code.
   useLayoutEffect(() => {
@@ -143,6 +161,8 @@ const FileViewer = ({
 
   const totalLines = Number(data?.total_lines) || Number(data?.line_count) || lines.length;
   const truncated = Boolean(data?.truncated);
+  // An empty file (an __init__.py) has nothing to number or render.
+  const empty = Boolean(data) && data.content === '' && !truncated;
   const activeStart = active?.start || null;
   // Past the real end of the file (not just past a truncated view).
   const beyondEnd = Boolean(data) && isBeyondEnd(activeStart, truncated ? totalLines : lines.length);
@@ -171,9 +191,28 @@ const FileViewer = ({
   }, [virtual, tableTop]);
 
   useEffect(() => {
-    if (!lines.length || !activeStart || beyondEnd || beyondShown) return;
+    if (rendered || !lines.length || !activeStart || beyondEnd || beyondShown) return;
     scrollToLine(activeStart);
-  }, [lines, activeStart, beyondEnd, beyondShown, scrollToLine]);
+  }, [lines, activeStart, beyondEnd, beyondShown, scrollToLine, rendered]);
+
+  // The page URL follows the selected lines.
+  useEffect(() => {
+    onSelectionChange?.(selection ? { start: selection.start, end: selection.end } : null);
+  }, [selection?.start, selection?.end]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Jumping to a declaration (breadcrumb, outline) selects its line; from the
+  // rendered Markdown view it first switches to the source with line numbers.
+  const [jump, setJump] = useState(null);
+  const jumpTo = (line) => {
+    setLineError('');
+    setOutlineOpen(false);
+    setMode('source');
+    setSelection({ start: line, end: line, anchor: line });
+    setJump({ line, at: Date.now() });
+  };
+  useEffect(() => {
+    if (jump && !rendered && lines.length) scrollToLine(jump.line);
+  }, [jump, rendered, lines.length, scrollToLine]);
 
   const first = virtual ? Math.max(0, Math.floor(viewport.top / ROW_HEIGHT) - OVERSCAN) : 0;
   const last = virtual ? Math.min(lines.length, Math.ceil((viewport.top + viewport.height) / ROW_HEIGHT) + OVERSCAN) : lines.length;
@@ -235,11 +274,14 @@ const FileViewer = ({
   };
 
   const otherRanges = allRanges.filter((_, index) => index !== activeIndex);
+  const outline = useMemo(() => (Array.isArray(data?.outline) ? data.outline : []), [data]);
+  // The line the breadcrumb describes: the selection, else the opened lines.
+  const focusLine = selection?.start || active?.start || null;
   const folder = dirname(path);
   const description = (
     <span title={path}>
       {folder || 'Repository root'}
-      {active ? ` · lines ${rangeText(active.start, active.end)}` : ''}
+      {active ? ` · ${linesText(active.start, active.end)}` : ''}
     </span>
   );
 
@@ -284,11 +326,11 @@ const FileViewer = ({
             {active ? (
               <button
                 type="button"
-                onClick={() => { setSelection(null); scrollToLine(active.start); }}
+                onClick={() => { setSelection(null); setMode('source'); setJump({ line: active.start, at: Date.now() }); }}
                 className="rounded-full focus-visible:outline-offset-1"
-                title="Scroll to the cited lines"
+                title={`Scroll to ${linesText(active.start, active.end)}`}
               >
-                <Badge tone={beyondEnd ? 'warning' : 'accent'}>Cited lines</Badge>
+                <Badge tone={beyondEnd ? 'warning' : 'accent'}>{targetLabel}</Badge>
               </button>
             ) : null}
             {allRanges.length > 1 && (
@@ -311,11 +353,21 @@ const FileViewer = ({
               </span>
             )}
             {data?.source === 'github' && <Badge tone="neutral" title={data.ref ? `Commit ${data.ref}` : undefined}>GitHub @ {shortSha(data.ref) || 'HEAD'}</Badge>}
-            {data?.source === 'index' && <Badge tone="warning">From the index</Badge>}
-            {data && totalLines ? <span className="text-[11px] text-ink-3">{totalLines.toLocaleString()} lines</span> : null}
+            {data?.source === 'index' && !empty && <Badge tone="warning">From the index</Badge>}
+            {data && totalLines && !empty ? <span className="text-[11px] text-ink-3">{totalLines.toLocaleString()} {totalLines === 1 ? 'line' : 'lines'}</span> : null}
           </div>
           <div className="flex shrink-0 items-center gap-0.5">
-            {data && lines.length > 0 && (
+            {markdown && data && !empty && (
+              <Segmented
+                size="xs"
+                label="Show the file"
+                className="mr-1"
+                value={mode}
+                onChange={setMode}
+                options={[{ value: 'rendered', label: 'Rendered', icon: Eye }, { value: 'source', label: 'Source', icon: Code, title: 'Source with line numbers' }]}
+              />
+            )}
+            {data && !rendered && !empty && lines.length > 0 && (
               <form onSubmit={goToLine} className="mr-1 flex items-center">
                 <label htmlFor={lineInputId} className="sr-only">Go to line</label>
                 <input
@@ -332,6 +384,19 @@ const FileViewer = ({
                 />
               </form>
             )}
+            {outline.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setOutlineOpen((value) => !value)}
+                aria-expanded={outlineOpen}
+                aria-controls={outlineOpen ? outlineId : undefined}
+                className={`inline-flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-surface-2 hover:text-ink ${outlineOpen ? 'bg-surface-2 text-ink' : 'text-ink-3'}`}
+                aria-label="Outline"
+                title={`Outline: ${outline.length} ${markdown ? 'headings' : 'declarations'}`}
+              >
+                <ListTree className="h-4 w-4" aria-hidden="true" />
+              </button>
+            )}
             <IconButton
               label={copied === 'path' ? 'Copied path and lines' : 'Copy path and lines'}
               onClick={() => copyText(linkStart ? `${path}:L${linkStart}-L${linkEnd || linkStart}` : path, 'path')}
@@ -341,6 +406,8 @@ const FileViewer = ({
           </div>
         </div>
         {lineError && <p id={`${lineInputId}-error`} className="text-[12px] text-danger" role="alert">{lineError}</p>}
+        {!rendered && <SymbolBreadcrumb outline={outline} line={focusLine} onJump={jumpTo} />}
+        {outlineOpen && <OutlineList id={outlineId} outline={outline} line={focusLine} onJump={jumpTo} />}
         <p className="sr-only" aria-live="polite">
           {copied === 'link' ? 'GitHub link copied.' : copied === 'path' ? 'Path and lines copied.' : ''}
         </p>
@@ -391,7 +458,13 @@ const FileViewer = ({
           </div>
         </div>
       )}
-      {data && (
+      {empty && <p className="px-4 py-3 text-[13px] text-code-muted">This file is empty.</p>}
+      {data && rendered && !empty && (
+        <div className="min-h-full bg-surface">
+          <MarkdownPreview content={data.content || ''} path={path} onOpenPath={onOpenPath} />
+        </div>
+      )}
+      {data && !rendered && !empty && (
         <table
           ref={tableRef}
           className="code-tokens w-full border-collapse font-mono text-[12.5px] leading-5"

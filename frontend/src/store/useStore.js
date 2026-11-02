@@ -566,11 +566,21 @@ const useStore = create((set, get) => ({
 
   closeSources: () => set({ sources: { open: false, messageId: null, activeIndex: null, file: null, stack: [] } }),
 
+  // Lines selected in the open file (a line-number click, Go to line). The
+  // workspace URL follows them, so a copied link reopens those lines.
+  setSourcesSelection: (selection) => set((state) => {
+    if (!state.sources.file) return state;
+    const next = selection?.start ? { start: selection.start, end: selection.end || selection.start } : null;
+    const current = state.sources.selection || null;
+    if (current?.start === next?.start && current?.end === next?.end) return state;
+    return { sources: { ...state.sources, selection: next } };
+  }),
+
   backToSources: () => set((state) => {
     const stack = [...(state.sources.stack || [])];
     const previous = stack.pop();
-    if (!previous) return { sources: { ...state.sources, file: null, activeIndex: null, stack: [] } };
-    return { sources: { ...state.sources, file: previous.file, messageId: previous.messageId ?? state.sources.messageId, activeIndex: null, stack } };
+    if (!previous) return { sources: { ...state.sources, file: null, selection: null, activeIndex: null, stack: [] } };
+    return { sources: { ...state.sources, file: previous.file, selection: null, messageId: previous.messageId ?? state.sources.messageId, activeIndex: null, stack } };
   }),
 
   // ------------------------------------------------------------------ review

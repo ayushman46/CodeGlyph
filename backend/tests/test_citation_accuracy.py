@@ -545,20 +545,23 @@ class EditCitationTests(unittest.TestCase):
 
 class SearchAndMapTests(unittest.TestCase):
     def test_code_search_prefers_distinct_files_and_dedupes_lines(self):
+        # Search now returns one result per file with all of its lines, and
+        # ranks the file that declares the name above a test file that only
+        # calls it (BUG-03); it used to return the test file's sections first.
         rows = [
-            {**chunk("big.test.ts", 1, content="handleNewBooking()\nhandleNewBooking()"), "score": -9},
-            {**chunk("big.test.ts", 2, content="handleNewBooking()"), "score": -8},
-            {**chunk("big.test.ts", 50, content="handleNewBooking() again"), "score": -7},
-            {**chunk("impl.ts", 10, content="export function handleNewBooking() {}"), "score": -6},
+            {**chunk("big.test.ts", 1, content="handleNewBooking()\nhandleNewBooking()"), "row_id": 1},
+            {**chunk("big.test.ts", 2, content="handleNewBooking()"), "row_id": 2},
+            {**chunk("big.test.ts", 50, content="handleNewBooking() again"), "row_id": 3},
+            {**chunk("impl.ts", 10, content="export function handleNewBooking() {}"), "row_id": 4},
         ]
-        store = FakeStore([("chunks_fts", rows)])
+        store = FakeStore([("WHERE rowid IN", rows), ("chunks_fts", rows)])
         results = run(retriever.search_code(store, "r", "handleNewBooking", limit=2))
-        self.assertEqual([item["file_path"] for item in results], ["big.test.ts", "impl.ts"])
-        sql = store.executed[0][0]
-        self.assertIn("PARTITION BY file_path", sql)
+        self.assertEqual([item["file_path"] for item in results], ["impl.ts", "big.test.ts"])
+        self.assertTrue(results[0]["matches"][0]["definition"])
         results = run(retriever.search_code(store, "r", "handleNewBooking", limit=10))
         lines = [(item["file_path"], match["line"]) for item in results for match in item["matches"]]
         self.assertEqual(len(lines), len(set(lines)))
+        self.assertEqual([line for path, line in lines if path == "big.test.ts"], [1, 2, 50])
 
     def test_repo_map_keeps_every_extension(self):
         rows = [{"file_path": f"src/f{n}.ext{n}", "byte_size": 1} for n in range(20)] + [{"file_path": "a.yaml", "byte_size": 1}]

@@ -1980,20 +1980,6 @@ async def _retrieve_context(
 # Code search, symbol usages, and the repository map
 # ---------------------------------------------------------------------------
 
-_CODE_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+")
-
-
-def _matching_lines(content: str, start_line: int, needles: list[str], limit: int = 3) -> list[dict]:
-    matches: list[dict] = []
-    lowered = [needle.lower() for needle in needles if needle]
-    for offset, line in enumerate(str(content or "").splitlines()):
-        lower_line = line.lower()
-        if any(needle in lower_line for needle in lowered):
-            matches.append({"line": int(start_line) + offset, "text": line[:400]})
-            if len(matches) >= limit:
-                break
-    return matches
-
 
 async def search_code(
     store,
@@ -2003,77 +1989,15 @@ async def search_code(
     limit: int = 30,
     staging_prefix: str | None = None,
 ) -> list[dict]:
-    """Instant keyword search across the indexed source (no model call)."""
-    raw = str(query or "").strip()[:200]
-    tokens = list(dict.fromkeys(token for token in _CODE_TOKEN.findall(raw) if len(token) >= 2))[:8]
-    if not tokens:
-        return []
-    staging_filter, staging_args = ("", []) if not staging_prefix else (" AND c.id NOT LIKE ?", [f"{staging_prefix}%"])
+    """Instant exact search across the indexed source (no model call).
 
-    fetch_limit = max(1, limit) * 4
+    A thin wrapper kept for existing callers: ``retrieval.code_search`` owns
+    the implementation and returns one entry per file with every matching line.
+    """
+    from retrieval.code_search import search_code as search_lines
 
-    async def run(expression: str) -> list[dict]:
-        # Cap each file to two chunks inside SQL so one heavily matching file
-        # (a large test suite) cannot use up the whole result budget.
-        try:
-            return await store.fetch_all(
-                "WITH matched AS (SELECT c.id, c.file_path, c.start_line, c.end_line, c.language, c.content, "
-                "bm25(chunks_fts, 1.0, 4.0) AS score FROM chunks_fts JOIN chunks c ON c.rowid = chunks_fts.rowid "
-                f"WHERE chunks_fts MATCH ? AND c.repo_id = ?{staging_filter}), "
-                "ranked AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY file_path ORDER BY score ASC, start_line ASC) AS file_rank FROM matched) "
-                "SELECT id, file_path, start_line, end_line, language, content, score FROM ranked "
-                "WHERE file_rank <= 2 ORDER BY score ASC, file_path ASC, start_line ASC LIMIT ?",
-                [expression, repo_id, *staging_args, fetch_limit],
-            )
-        except Exception as error:
-            logger.debug("Windowed code search unavailable (%s)", type(error).__name__)
-            return await store.fetch_all(
-                "SELECT c.id, c.file_path, c.start_line, c.end_line, c.language, c.content, "
-                "bm25(chunks_fts, 1.0, 4.0) AS score FROM chunks_fts JOIN chunks c ON c.rowid = chunks_fts.rowid "
-                f"WHERE chunks_fts MATCH ? AND c.repo_id = ?{staging_filter} ORDER BY score ASC LIMIT ?",
-                [expression, repo_id, *staging_args, fetch_limit],
-            )
-
-    # All terms first (precise), then any term (recall).
-    strict = " AND ".join(fts_match_expression([token]) for token in tokens)
-    rows = await run(strict)
-    if not rows and len(tokens) > 1:
-        rows = await run(fts_match_expression(tokens))
-    rows = exclude_staged(rows, staging_prefix)
-    results: list[dict] = []
-    seen_files: dict[str, int] = {}
-    seen_lines: set[tuple[str, int]] = set()
-    # Best chunk of every file first, then second chunks: distinct files
-    # fill the result budget before any file repeats.
-    first_seen: set[str] = set()
-    firsts, seconds = [], []
-    for row in rows:
-        path = str(row.get("file_path") or "")
-        (seconds if path in first_seen else firsts).append(row)
-        first_seen.add(path)
-    for row in [*firsts, *seconds]:
-        path = str(row.get("file_path") or "")
-        if seen_files.get(path, 0) >= 2:
-            continue
-        # Overlapping chunks repeat lines: report each file:line once.
-        matches = [
-            match for match in _matching_lines(row.get("content") or "", int(row.get("start_line") or 1), tokens, limit=6)
-            if (path, match["line"]) not in seen_lines
-        ][:3]
-        if not matches:
-            continue
-        seen_lines.update((path, match["line"]) for match in matches)
-        seen_files[path] = seen_files.get(path, 0) + 1
-        results.append({
-            "file_path": path,
-            "start_line": row.get("start_line"),
-            "end_line": row.get("end_line"),
-            "language": row.get("language"),
-            "matches": matches,
-        })
-        if len(results) >= limit:
-            break
-    return results
+    found = await search_lines(store, repo_id, query, limit=limit, staging_prefix=staging_prefix)
+    return found["results"]
 
 
 async def find_symbol_usages(

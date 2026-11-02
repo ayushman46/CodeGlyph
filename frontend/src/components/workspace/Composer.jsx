@@ -3,9 +3,10 @@ import {
   MessageCircleQuestion, MessageSquareText, ShieldCheck, Sparkles, Users, Zap,
 } from 'lucide-react';
 import { forwardRef, useCallback, useEffect, useId, useImperativeHandle, useMemo, useRef, useState } from 'react';
-import { searchRepository } from '../../api/client';
+import { listRepositoryFiles } from '../../api/client';
 import useMediaQuery from '../../hooks/useMediaQuery';
 import { findSuggestion } from '../../lib/ai/promptBar';
+import { pathScore } from '../../lib/codeNav';
 import useStore from '../../store/useStore';
 import { PromptBar } from '../ai/PromptBar';
 import Button from '../ui/Button';
@@ -48,8 +49,9 @@ const WARN_QUESTION_LENGTH = 7000;
 
 const PREFERENCES_KEY = 'ci-composer';
 
-// `@` file suggestions: at most this many are offered; code search runs
-// (debounced) once the typed word has two characters.
+// `@` file suggestions: at most this many are offered; the indexed file list
+// is searched by name and path (debounced) once the typed word has two
+// characters.
 export const MENTION_LIMIT = 50;
 const MENTION_SEARCH_MIN = 2;
 const MENTION_SEARCH_DELAY_MS = 150;
@@ -103,9 +105,10 @@ export const applyWorkflowCommands = (text, picked = []) => {
 
 /**
  * Orders indexed paths for the `@` list and caps it. Paths containing the
- * query come first (file name prefix, then file name, then a folder, then
- * anywhere; shorter paths first); the rest follow so the list never empties
- * (the Prompt Bar hides non-matches and says "No matches").
+ * query come first, best match first (the file's own name, then a name
+ * prefix, the name, a folder, anywhere; shorter paths first); the rest
+ * follow so the list never empties (the Prompt Bar hides non-matches and
+ * says "No matches").
  *
  * @param {string[]} paths
  * @param {string} [query]
@@ -118,35 +121,14 @@ export const rankMentionPaths = (paths, query = '', limit = MENTION_LIMIT) => {
   const matched = [];
   const rest = [];
   paths.forEach((path, order) => {
-    const lower = path.toLowerCase();
-    if (!lower.includes(needle)) {
+    if (!path.toLowerCase().includes(needle)) {
       rest.push(path);
       return;
     }
-    const name = lower.slice(lower.lastIndexOf('/') + 1);
-    let rank = 3;
-    if (name.startsWith(needle)) rank = 0;
-    else if (name.includes(needle)) rank = 1;
-    else if (lower.startsWith(needle) || lower.includes(`/${needle}`)) rank = 2;
-    matched.push({ path, rank, order });
+    matched.push({ path, score: pathScore(path, needle), order });
   });
-  matched.sort((a, b) => a.rank - b.rank || a.path.length - b.path.length || a.order - b.order);
+  matched.sort((a, b) => b.score - a.score || a.path.length - b.path.length || a.order - b.order);
   return [...matched.map((item) => item.path), ...rest].slice(0, limit);
-};
-
-/**
- * What code search looks for while an `@` mention is typed: the word itself,
- * or for a path the file name being typed without its extension
- * (`source/utils/normalize.ts` → `normalize`; `src/` → `src`).
- *
- * @param {string} query the typed mention word (lower-case)
- * @returns {string}
- */
-export const mentionSearchTerm = (query = '') => {
-  if (!/[/.]/.test(query)) return query;
-  const segment = query.split('/').filter(Boolean).pop() ?? '';
-  const stem = segment.split('.')[0];
-  return stem.length >= MENTION_SEARCH_MIN ? stem : segment;
 };
 
 const DOCUMENT_FILE = /\.(md|mdx|markdown|txt|rst|adoc)$/i;
@@ -168,7 +150,8 @@ const NO_SEARCHES = { repo: null, queries: [], paths: [] };
 /**
  * The `@` suggestions: the repository's indexed files, loaded lazily on the
  * first `@` (the overview's key, root and starter-question files, the files
- * this conversation cited) and widened by code search as the word grows.
+ * this conversation cited) and widened, as the word grows, by the indexed
+ * files whose name or path matches it (`@_client`, `@httpx/_cl`).
  *
  * @param {string | null} repoName
  * @param {{ kind: 'mention' | 'command', query: string } | null} suggestion the word at the caret
@@ -181,10 +164,8 @@ function useFileMentions(repoName, suggestion) {
   const [pendingQuery, setPendingQuery] = useState(null);
   const active = Boolean(repoName && suggestion?.kind === 'mention');
   const query = active ? suggestion.query : '';
-  // Code search matches file text, not paths: for a typed path search the
-  // file name being typed (`source/utils/norm` searches `norm`); the list
-  // then keeps the paths that contain the whole typed path.
-  const term = mentionSearchTerm(query);
+  // The whole typed word: a file name, or a partial path.
+  const term = query;
   const searches = found.repo === repoName ? found : NO_SEARCHES;
   const needsSearch = active && term.length >= MENTION_SEARCH_MIN && !searches.queries.includes(term);
 
@@ -199,8 +180,8 @@ function useFileMentions(repoName, suggestion) {
     const timer = window.setTimeout(async () => {
       let paths = [];
       try {
-        const response = await searchRepository(repoName, term, { signal: controller.signal });
-        paths = (response.data?.results || []).map((result) => result.file_path);
+        const response = await listRepositoryFiles(repoName, { q: term, limit: MENTION_LIMIT }, { signal: controller.signal });
+        paths = (response.data?.files || []).map((file) => file.path);
       } catch {
         if (controller.signal.aborted) return;
       }
