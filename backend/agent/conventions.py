@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import posixpath
 import re
 import time
 from typing import Any, Awaitable, Callable
@@ -52,6 +53,8 @@ COMMITLINT_PATHS = (
     ".commitlintrc.cjs",
 )
 VISIBLE_CONFIG_PATHS = ("package.json", "pyproject.toml", ".github/dco.yml", "release-please-config.json")
+# Where a repository says how its tests run (read only when the index lists them).
+TEST_SETUP_PATHS = ("Makefile", "tox.ini", "setup.cfg", "pytest.ini", "noxfile.py", "scripts/test", "go.mod", "Cargo.toml")
 LOCKFILES = {"package-lock.json": "npm", "npm-shrinkwrap.json": "npm", "pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn",
              "bun.lockb": "bun", "bun.lock": "bun"}
 HIDDEN_CONFIG_PATHS = (
@@ -76,7 +79,8 @@ def empty_conventions(note: str = "") -> dict:
         "pr_template_path": None, "pr_template": "", "commit_style": "unknown", "commit_style_source": "",
         "contributing_path": None, "contributing_excerpt": "", "agent_instructions_path": None,
         "agent_instructions": "", "dco_required": False, "notes": [note] if note else [],
-        "repo_style": build_repo_style(), "sources": [], "test_command": "", "package_manager": "", "complete": False,
+        "repo_style": build_repo_style(), "sources": [], "test_command": "", "test_command_source": "", "test_runner": "",
+        "package_manager": "", "complete": False,
     }
 
 
@@ -244,7 +248,8 @@ async def detect_conventions(*, owner: str, name: str, repo_id: str, commit_sha:
     if cached and now - cached[0] < CONVENTIONS_CACHE_SECONDS:
         return cached[1]
     started = time.monotonic()
-    candidates = [*PR_TEMPLATE_PATHS, *CONTRIBUTING_PATHS, *AGENT_PATHS, *COMMITLINT_PATHS, *VISIBLE_CONFIG_PATHS]
+    candidates = [*PR_TEMPLATE_PATHS, *CONTRIBUTING_PATHS, *AGENT_PATHS, *COMMITLINT_PATHS, *VISIBLE_CONFIG_PATHS,
+                  *TEST_SETUP_PATHS]
     listed, template_dir, _workflows = await _manifest_hits(store, repo_id, [*candidates, *LOCKFILES])
     excluded, budget_omitted = await _coverage(store, repo_id)
     signals = await _workflow_signals(store, repo_id)
@@ -377,13 +382,10 @@ async def detect_conventions(*, owner: str, name: str, repo_id: str, commit_sha:
                  "pyproject.toml" if ("[tool.black]" in pyproject or "[tool.ruff" in pyproject) else None):
         if path and path in texts:
             sources.append(path)
-    scripts = package.get("scripts") if isinstance(package.get("scripts"), dict) else {}
     manager = _package_manager(package, listed | (excluded or set()), texts)
     conventions["package_manager"] = manager
-    if isinstance(scripts.get("test"), str) and "no test specified" not in scripts["test"]:
-        conventions["test_command"] = f"{manager or 'npm'} test"
-    elif "[tool.pytest" in pyproject:
-        conventions["test_command"] = "pytest"
+    command, command_source, runner = test_setup(texts, package=package, manager=manager)
+    conventions.update({"test_command": command, "test_command_source": command_source, "test_runner": runner})
     if timed_out:
         notes.append(f"Some convention files could not be read within {budget_seconds:g} s; the change follows what was read.")
     conventions["notes"] = notes
@@ -410,6 +412,117 @@ def _package_manager(package: dict, paths: set[str], texts: dict[str, str]) -> s
     if not found and (".npmrc" in paths or ".npmrc" in texts):
         return "npm"
     return ""
+
+
+_TEST_RUNNER = re.compile(
+    r"\b(?:pytest|py\.test|unittest|nose2?|tox|nox|jest|vitest|mocha|ava|tap|go\s+test|cargo\s+test|rspec|phpunit|"
+    r"(?:npm|yarn|pnpm|bun)\s+(?:run\s+)?test)\b"
+)
+_MAKE_TEST_TARGET = re.compile(r"^test\s*:(?!=)[^\n]*\n((?:[ \t]*\n|\t[^\n]*\n?)*)", re.MULTILINE)
+_INI_SECTION = re.compile(r"^\s*\[([^\]]+)\]\s*$", re.MULTILINE)
+
+
+def _ini_value(text: str, section: str, key: str) -> str:
+    """A (possibly multi-line) value of ``key`` in ``[section]`` of an INI file, or ""."""
+    matches = list(_INI_SECTION.finditer(text or ""))
+    for index, match in enumerate(matches):
+        if match.group(1).strip() != section:
+            continue
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = text[match.end():end]
+        found = re.search(rf"^{re.escape(key)}\s*=\s*(.*(?:\n[ \t]+.*)*)", body, re.MULTILINE)
+        return found.group(1).strip() if found else ""
+    return ""
+
+
+def _runner_of(command: str) -> str:
+    if re.search(r"\b(?:pytest|py\.test)\b", command):
+        return "pytest"
+    if re.search(r"\bgo\s+test\b", command):
+        return "go"
+    if re.search(r"\bcargo\s+test\b", command):
+        return "cargo"
+    if re.search(r"\b(?:npm|yarn|pnpm|bun)\b", command):
+        return "node"
+    return "other"
+
+
+def test_setup(texts: dict[str, str], *, package: dict | None = None, manager: str = "") -> tuple[str, str, str]:
+    """(command, where it comes from, runner) for the repository's own way of running its tests.
+
+    In order: package.json's test script, the Makefile's ``test`` target (its
+    recipe when it is one plain command), tox's ``commands``, a pytest config
+    (pyproject.toml, setup.cfg, pytest.ini), noxfile.py, ``scripts/test``,
+    go.mod and Cargo.toml. ("", "", "") when none of them says.
+    """
+    package = package or {}
+    scripts = package.get("scripts") if isinstance(package.get("scripts"), dict) else {}
+    if isinstance(scripts.get("test"), str) and scripts["test"].strip() and "no test specified" not in scripts["test"]:
+        return f"{manager or 'npm'} test", "the test script in package.json", "node"
+    makefile = texts.get("Makefile") or ""
+    target = _MAKE_TEST_TARGET.search(makefile)
+    if target:
+        recipe = [re.sub(r"^[@\-+]+", "", line.strip()) for line in target.group(1).split("\n") if line.strip()]
+        if len(recipe) == 1 and "$" not in recipe[0] and _TEST_RUNNER.search(recipe[0]):
+            return recipe[0], "the test target in the Makefile", _runner_of(recipe[0])
+        return "make test", "the test target in the Makefile", _runner_of(" ".join(recipe))
+    tox = texts.get("tox.ini") or ""
+    commands = _ini_value(tox, "testenv", "commands")
+    if commands:
+        first = commands.split("\n")[0].strip()
+        first = re.sub(r"\{posargs:([^}]*)\}", r"\1", first)
+        first = re.sub(r"\{posargs\}|\{toxinidir\}/?", "", first)
+        first = re.sub(r"\s+", " ", first).strip()
+        if first and _TEST_RUNNER.search(first) and "{" not in first:
+            return first, "the commands in tox.ini", _runner_of(first)
+        return "tox", "tox.ini", "other"
+    pyproject = texts.get("pyproject.toml") or ""
+    if "[tool.pytest" in pyproject:
+        return "pytest", "the pytest settings in pyproject.toml", "pytest"
+    if "[tool:pytest]" in (texts.get("setup.cfg") or ""):
+        return "pytest", "the pytest settings in setup.cfg", "pytest"
+    if "pytest.ini" in texts:
+        return "pytest", "pytest.ini", "pytest"
+    if "noxfile.py" in texts:
+        return "nox", "noxfile.py", "other"
+    if "scripts/test" in texts:
+        return "scripts/test", "scripts/test", "other"
+    if "go.mod" in texts:
+        return "go test ./...", "go.mod", "go"
+    if "Cargo.toml" in texts:
+        return "cargo test", "Cargo.toml", "cargo"
+    return "", "", ""
+
+
+# Files pytest collects tests from by default (python_files = test_*.py *_test.py).
+_PYTEST_FILE = re.compile(r"(?:^|/)(?:test_[^/]*|[^/]*_test)\.py$")
+
+
+def targeted_test_command(conventions: dict | None, test_paths: list[str]) -> str:
+    """The repository's test command narrowed to the changed test files when its runner takes paths, else the whole command.
+
+    Only files the runner collects count: pytest finds no tests in
+    conftest.py, helpers or fixtures (and exits with "no tests ran"). A
+    command that changes directory or chains commands ("cd backend &&
+    pytest") is never narrowed, since repository paths would be wrong there.
+    """
+    data = conventions or {}
+    command = str(data.get("test_command") or "").strip()
+    runner = str(data.get("test_runner") or "")
+    if not command:
+        return ""
+    if re.search(r"(?:^|[\s;&|(])(?:cd|pushd)\s|&&|\|\||;", command):
+        return command
+    if runner == "pytest":
+        python_tests = [path for path in test_paths if _PYTEST_FILE.search(path)][:6]
+        prefix = re.match(r"^(.*?\b(?:pytest|py\.test))\b", command)
+        if python_tests and prefix:
+            return f"{prefix.group(1)} {' '.join(python_tests)}"
+    if runner == "go":
+        folders = sorted({posixpath.dirname(path) for path in test_paths if path.endswith("_test.go")})[:6]
+        if folders:
+            return "go test " + " ".join(f"./{folder}" if folder else "." for folder in folders)
+    return command
 
 
 async def _has_manifest(store: Any, repo_id: str) -> bool:
@@ -491,6 +604,9 @@ def _shorten(text: str, limit: int = TITLE_LIMIT) -> str:
     if len(text) <= limit:
         return text
     cut = text[:limit].rsplit(" ", 1)[0].rstrip(",;:-")
+    if cut.count("(") > cut.count(")"):
+        # A parenthetical cut in the middle ("... (including int") reads as a typo.
+        cut = cut[:cut.rindex("(")].rstrip(" ,;:-") or cut
     return cut or text[:limit]
 
 
@@ -598,8 +714,9 @@ def _section_kind(heading: str) -> str:
 
 
 def _bullets(items: list[str], *, boxes: bool = False) -> str:
+    """A Markdown list; an item's further lines (a code block) are indented to stay inside it."""
     prefix = "- [ ] " if boxes else "- "
-    return "\n".join(f"{prefix}{item}" for item in items if str(item).strip())
+    return "\n".join(f"{prefix}{str(item).rstrip()}".replace("\n", "\n  ") for item in items if str(item).strip())
 
 
 def change_lines(files: list[dict]) -> list[str]:
@@ -649,6 +766,12 @@ def fill_pr_template(template: str, *, summary: str, files: list[dict], validati
             boxes = [line.rstrip() for line in original.split("\n") if re.match(r"^\s*[-*]\s*\[[ xX]\]", line)]
             content = "\n".join(boxes)
         parts.append(f"{match.group(0).strip()}\n\n{content}".rstrip() if content else match.group(0).strip())
+    if "testing" not in used and any(str(step).strip() for step in validation):
+        # The template has no testing section: the steps still belong in the
+        # body, before its checklist when it has one (parts[0] is the preamble).
+        kinds = [None, *(_section_kind(match.group(2)) for match in matches)]
+        at = next((index for index, kind in enumerate(kinds) if kind == "checklist"), len(parts))
+        parts.insert(at, f"## How to verify\n\n{_bullets(validation)}")
     if "summary" not in used and summary.strip():
         parts.insert(1 if parts[0] else 0, summary.strip())
     body = "\n\n".join(part for part in parts if part)
@@ -796,19 +919,52 @@ def normalise_command(text: str, conventions: dict | None) -> str:
     return _PACKAGE_MANAGER_TEST.sub(lambda match: match.group(0) if match.group(1) == manager else f"{manager} test", str(text))
 
 
+def fill_empty_sections(body: str, template: str, *, summary: str, files: list[dict], validation: list[str],
+                        issue_line: str = "") -> str:
+    """Fill the template sections a template-following body left empty (the model kept only the headings)."""
+    preamble, sections = _sections(body)
+    used: set[str] = set()
+    filled: list[tuple[str, str]] = []
+    for heading, content in sections:
+        kind = _section_kind(_HEADING.match(heading).group(2))
+        if not content.strip() and kind not in used:
+            if kind == "summary":
+                content = summary.strip()
+            elif kind == "changes":
+                content = _bullets(change_lines(files))
+            elif kind == "testing":
+                content = _bullets(validation, boxes=True)
+            elif kind == "issue":
+                content = issue_line
+        used.add(kind)
+        filled.append((heading, content))
+    text = _join_sections(preamble, filled)
+    if summary.strip() and not preamble.strip() and not any(
+            _section_kind(_HEADING.match(heading).group(2)) == "summary" and content.strip() for heading, content in filled):
+        text = f"{summary.strip()}\n\n{text}".strip()
+    if not has_verify_section(text) and not any(_section_kind(heading) == "testing" for heading in template_headings(template)) \
+            and any(str(step).strip() for step in validation):
+        text = f"{text}\n\n## How to verify\n\n{_bullets(validation)}".strip()
+    return text
+
+
 def finalize_pr_body(body: str, *, template: str = "", summary: str, files: list[dict], validation: list[str],
-                     regenerate_changes: bool = False) -> tuple[str, str]:
+                     regenerate_changes: bool = False, issue_line: str = "") -> tuple[str, str]:
     """Return (body, how it was produced).
 
-    The model's text is cleaned first: paragraphs about the review are
+    The model's text is cleaned first: HTML comments (a template's
+    instructions to the author) are removed, paragraphs about the review are
     dropped and duplicate sections merged (one "how to verify"). A
-    template-following body is kept (boxes unticked); otherwise the
-    template is filled deterministically. Without a template the body keeps
+    template-following body is kept with its empty sections filled (boxes
+    unticked); otherwise the template is filled deterministically, so a body
+    is never only the template's comments. Without a template the body keeps
     the model's text and gains a "How to verify" section when it has none.
     ``regenerate_changes`` rewrites the Changes section from the final files
     (the self-review changed or added some after the body was written).
+    ``issue_line`` ("Fixes #12") goes into the template's issue section.
     """
-    text = strip_meta_text(str(body or "")).strip()
+    text = strip_meta_text(_HTML_COMMENT.sub("", str(body or ""))).strip()
+    text = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", text)
     protected = set(template_headings(template)) if template else set()
     text = dedupe_sections(text, protected=protected) if text else ""
     if template:
@@ -816,8 +972,11 @@ def finalize_pr_body(body: str, *, template: str = "", summary: str, files: list
             if regenerate_changes:
                 text = replace_changes_section(text, files) if any(
                     _section_kind(heading) == "changes" for heading in template_headings(template)) else text
+            text = fill_empty_sections(text, template, summary=summary, files=files, validation=validation,
+                                       issue_line=issue_line)
             return untick(text)[:PR_BODY_LIMIT], "template"
-        return fill_pr_template(template, summary=summary, files=files, validation=validation), "template_filled"
+        return fill_pr_template(template, summary=summary, files=files, validation=validation,
+                                issue_line=issue_line), "template_filled"
     if not text:
         return default_pr_body(summary=summary, files=files, validation=validation), "generated"
     if regenerate_changes:
@@ -826,6 +985,41 @@ def finalize_pr_body(body: str, *, template: str = "", summary: str, files: list
         text = f"{text}\n\n## How to verify\n\n{_bullets(validation)}"
         return untick(text)[:PR_BODY_LIMIT], "verify_added"
     return untick(text)[:PR_BODY_LIMIT], "model"
+
+
+_CLOSING_WORD = r"(?<![\w-])(close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
+
+
+def closes_reference(body: str, link: str) -> bool:
+    """Whether ``body`` closes ``link`` ("#12", "owner/repo#12") with GitHub's syntax: "Fixes #12", "closes: #12"."""
+    if not link:
+        return False
+    return bool(re.search(rf"{_CLOSING_WORD}:?\s+{re.escape(link)}(?!\d)", body or "", re.IGNORECASE))
+
+
+def ensure_issue_reference(body: str, link: str, *, closes: bool) -> str:
+    """The body with exactly the issue reference GitHub acts on.
+
+    "Fixes issue #12" or "Fixes GitHub issue #12" closes nothing on GitHub:
+    the keyword must be followed by the reference itself, so those phrases
+    become "Fixes #12". A closing body without a valid closing reference
+    gets "Fixes #12" first; a body that should only link the issue gets
+    "Refs #12" when it does not mention it at all.
+    """
+    text = str(body or "")
+    if not link:
+        return text
+    if closes:
+        text = re.sub(
+            rf"{_CLOSING_WORD}(\s*:?\s+)(?:(?:the|this)\s+)?(?:github\s+)?issue\s+(?:number\s+)?({re.escape(link)})(?!\d)",
+            lambda match: f"{match.group(1)} {match.group(3)}", text, flags=re.IGNORECASE,
+        )
+        if not closes_reference(text, link):
+            text = f"Fixes {link}\n\n{text}".strip()
+        return text
+    if not re.search(rf"(?<![\w./-]){re.escape(link)}(?!\d)", text, re.IGNORECASE):
+        text = f"Refs {link}\n\n{text}".strip()
+    return text
 
 
 _DOUBLE_TICKS = re.compile(r"`{2,}\s?(.*?)\s?`{2,}")

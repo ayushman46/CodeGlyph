@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test';
 import {
-  CITED_PATH, FAILING_PROPOSAL_ID, SHA, failingProposal, failingToolCalls, mockApi, prStatusPassed, proposal as fixtureProposal,
+  CITED_PATH, FAILING_PROPOSAL_ID, ISSUE_CASE, ISSUE_LOOP, REVISED_PROPOSAL_ID, SHA, failingProposal, failingToolCalls, mockApi,
+  prStatusPassed, proposal as fixtureProposal, revisedProposal,
 } from './fixtures.js';
 
 test.use({ baseURL: process.env.E2E_WORKSPACE_URL || 'http://127.0.0.1:4174' });
@@ -504,4 +505,49 @@ test('(d) a legacy proposal without quality shows no quality UI and pushes witho
   await expect(page.getByText('Pull request #123 created')).toBeVisible();
   expect(state.pushes[0].acknowledge_quality).toBe(false);
   expect(state.pushes[0].pr_body).toContain('## Testing\n- [ ] yarn test bookings');
+});
+
+// ------------------------------------------- honesty and revisions (BUG-08, BUG-16, FEAT-13)
+
+test('(e) a revision whose tests were not run says so on the card and in the review, and its PR closes the issue', async ({ page }) => {
+  const state = await mockApi(page, { githubConnected: true });
+  await streamOnce(page, {
+    answer: '## Convert non-string form field names and file names\n\nA validated change is ready for review.', mode: 'editing', citations: [],
+    tool_calls: [{ tool: 'code_edit', input: { proposal_id: REVISED_PROPOSAL_ID }, result_summary: revisedProposal.title }],
+    edit_suggestion: revisedProposal, edit_ticket: 't',
+  });
+  await page.goto('/app/r/cal.com');
+  await askForEdit(page, 'also handle the case where the key is an int');
+  const card = page.locator('[data-slot="proposal"]').last();
+  // The card names the proposal it revises and never says "checks passed" on its own.
+  await expect(card.locator('[data-slot="proposal-revision"]')).toContainText('Revises the previous proposal “Fix non-string form field names”');
+  await expect(card.locator('[data-slot="proposal-revision"]')).toContainText('Keeps its changes to src/requests/models.py');
+  await expect(card.locator('[data-slot="artifact-card"]')).toContainText('1 file · +2 −2 · tests not run · static checks passed · Fixes #7634');
+  const notRun = card.locator('[data-slot="tests-not-run"]');
+  await expect(notRun).toContainText('Tests not run');
+  await expect(notRun.locator('[data-slot="test-command"]')).toHaveText('python -m pytest tests/test_requests.py');
+  await expect(notRun).toContainText('(from the test target in the Makefile)');
+  await expect(notRun.locator('[data-slot="how-to-verify"]')).toContainText(ISSUE_CASE);
+  // A loop from the issue keeps its lines and indentation.
+  expect(await notRun.locator('[data-slot="case-block"]').textContent()).toBe(ISSUE_LOOP);
+  await expect(card.locator('[data-slot="quality-passed"]')).toHaveText('Static checks passed: syntax, style, tests touched.');
+  await expect(card.locator('[data-slot="quality-review"]')).toContainText('Self-review: No problems found by reading the diff (nothing was run)');
+
+  await card.getByRole('button', { name: 'Review & open PR' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Review changes' });
+  const summary = dialog.locator('[data-slot="quality-summary"]');
+  await expect(summary).toContainText('Static checks passed · tests not run');
+  await expect(summary).not.toContainText('All checks passed');
+  await expect(summary.locator('[data-slot="quality-tests"]')).toContainText('Run python -m pytest tests/test_requests.py before merging.');
+  await expect(dialog.locator('[data-slot="proposal-revision"]')).toContainText('Revises the previous proposal');
+  await expect(dialog.locator('[data-slot="how-to-verify"]')).toContainText(ISSUE_CASE);
+  await expect(dialog.getByRole('navigation', { name: 'Changed files' }).locator('[data-quality="pass"]')).toContainText('Static checks passed');
+  // "Fixes issue #7634" closes nothing on GitHub: the prefilled body says "Fixes #7634".
+  const body = dialog.getByRole('textbox', { name: 'Description' });
+  await expect(body).toHaveValue(/Fixes #7634 where non-string names fail\./);
+  await expect(body).not.toHaveValue(/issue #7634/);
+  await dialog.getByRole('button', { name: 'Create pull request' }).click();
+  await expect(page.getByText('Pull request #123 created')).toBeVisible();
+  expect(state.pushes[0].pr_body).toMatch(/Fixes #7634 where/);
+  expect(state.pushes[0].acknowledge_quality).toBe(false);
 });

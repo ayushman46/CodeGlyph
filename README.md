@@ -81,7 +81,9 @@ Workflows: general, new-engineer onboarding, architecture, security review, open
 1. Switch the composer to **Edit & PR** and describe the change, or paste a GitHub issue URL (its title and body become acceptance criteria and the PR says `Fixes #N`).
 2. The agent ranks candidate files, plans the change (files to modify or create, symbols to trace), finds usages of those symbols, and reads the complete current files from GitHub.
 3. The code model returns exact search/replace hunks. Every hunk must match its file exactly once (a trailing-whitespace-tolerant match is accepted only when unique); one repair round fixes imperfect copies. Unvalidated output is never shown as a patch.
-4. The proposal appears in the chat with per-file green/red diffs and is saved, so it survives a reload.
+4. The proposal appears in the chat with per-file green/red diffs and is saved, so it survives a reload. Nothing is executed: the card and the review screen say **Tests not run**, with the command from the repository's own test setup (package.json, Makefile, tox.ini, pytest config) and a **How to verify** list that includes every reproduction case the issue quotes. Static checks are labelled as static checks.
+   - A follow-up Edit & PR request in the same chat that starts with "Also" or names the earlier proposal ("also handle the case where the key is an int", "drop the test change from your patch") revises that proposal if it is at most 6 hours old: its changes are re-applied to the current files and kept unless you ask to drop them, and the card says which proposal it revises. Any other request is a new proposal. Say "start over" for a separate change.
+   - The prefilled PR description fills the repository's PR template (never only its comments) and closes the issue with GitHub's syntax, `Fixes #N`.
 5. **Review & create PR** opens the review screen: file list with stats, unified or split diff with word-level highlights, edit mode with a live diff, title/description/branch/commit fields, GitHub connection, `.patch` download and copy.
 6. On push, the server verifies the short-lived, file-scoped editing ticket and the reviewed blob SHA of every modified file (and that new files do not already exist), creates one atomic commit on a new `codebase-intel/` branch, and opens the pull request. A stale file returns a conflict and the review screen can re-apply the change to the latest revision.
 
@@ -184,7 +186,7 @@ All routes require a Supabase bearer token except health/readiness and the GitHu
 | PATCH / DELETE | `/api/conversations/{repo}/threads/{id}` | Rename / delete (hidden, not erased) |
 | POST | `/api/conversations/{repo}/threads/{id}/restore` | Undo a delete |
 | DELETE | `/api/conversations/{repo}` | New chat for older clients: hides and erases nothing; the next question sent without `conversation_id` starts a new conversation |
-| GET | `/api/edits/{id}` | Saved edit proposal with a fresh editing ticket |
+| GET | `/api/edits/{id}` | Saved edit proposal (`verification`: test command and issue cases, nothing run; `revision_of`: the proposal it revises) with a fresh editing ticket |
 | GET | `/api/github/status`, `/api/github/login`, `/api/github/callback` | GitHub connection (callback redirects to `{GITHUB_FRONTEND_ORIGIN}/github/callback`) |
 | POST | `/api/github/complete` | SPA finishes the OAuth connection with the fragment code and the user's bearer token |
 | GET | `/api/github/file` | Current file revision for review (works before connecting GitHub) |

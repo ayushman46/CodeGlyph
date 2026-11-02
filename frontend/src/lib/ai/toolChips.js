@@ -329,7 +329,10 @@ const describeCall = (tool, input, summary) => {
       const issues = isFiniteCount(input.issues) ? input.issues : null;
       const fixed = isFiniteCount(input.fixed) ? input.fixed : null;
       const detail = issues ? `${fixed ?? 0} of ${plural(issues, 'issue')} fixed` : filesDetail(textList(input.files)).detail;
-      return { detail, output: proseLines(summary.split(/;\s+/)) };
+      // Older proposals stored a bare "No problems found"; the review only read the diff.
+      const parts = summary.split(/;\s+/).map((part) => (
+        /^no (?:problems|issues) found\.?$/i.test(part.trim()) ? 'No problems found by reading the diff (nothing was run)' : part));
+      return { detail, output: proseLines(parts) };
     }
     default: {
       const detail = firstInputValue(input);

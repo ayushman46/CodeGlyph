@@ -61,22 +61,54 @@ const TESTING_HEADING = new RegExp(String.raw`^\s{0,3}(?:#{1,6}\s+.*${TESTING_WO
 /** Whether a PR body already has a testing / how-to-verify section. */
 export const hasTestingSection = (body) => TESTING_HEADING.test(String(body ?? ''));
 
+const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const CLOSING_WORD = '(?<![\\w-])(close[sd]?|fix(?:e[sd])?|resolve[sd]?)';
+
+/**
+ * The body with the issue reference GitHub acts on, for a proposal whose
+ * label is "Fixes #N": "Fixes issue #N" closes nothing (the keyword must be
+ * followed by the reference), so it becomes "Fixes #N", and a body without a
+ * valid closing reference gets "Fixes #N" first. Older proposals need this;
+ * the server already does it for new ones.
+ */
+export const withClosingReference = (body, proposal) => {
+  const label = issueLabel(proposal);
+  if (!label.startsWith('Fixes ')) return body;
+  const repository = typeof proposal.issue_repository === 'string' ? proposal.issue_repository.trim() : '';
+  const link = `${repository}#${proposal.issue_reference}`;
+  const reference = escapeRegExp(link);
+  let text = body.replace(
+    new RegExp(`${CLOSING_WORD}(\\s*:?\\s+)(?:(?:the|this)\\s+)?(?:github\\s+)?issue\\s+(?:number\\s+)?(${reference})(?!\\d)`, 'gi'),
+    (_match, keyword, _space, ref) => `${keyword} ${ref}`,
+  );
+  if (!new RegExp(`${CLOSING_WORD}:?\\s+(?:[\\w.-]+/[\\w.-]+)?${reference}(?!\\d)`, 'i').test(text)) text = `Fixes ${link}\n\n${text}`;
+  return text;
+};
+
 /**
  * Pull request description: the server's body (which follows the
  * repository's PR template when it has one) plus a testing checklist only
- * when the body has no testing section of its own, then a footer. Checklist
- * boxes are never ticked. At most PR_BODY_LIMIT characters, footer included.
+ * when the body has no testing section of its own, then a footer. A body
+ * that is only a template's HTML comments counts as empty, and a confirmed
+ * issue is closed with GitHub's exact syntax. Checklist boxes are never
+ * ticked. At most PR_BODY_LIMIT characters, footer included.
  */
 export const buildPrBody = (proposal) => {
-  const body = String(proposal?.pr_body || '').trim() || `## Summary\n\n${proposal?.summary || 'Reviewed change.'}`;
+  const own = String(proposal?.pr_body || '').replace(/<!--[\s\S]*?-->/g, '').replace(/\n{3,}/g, '\n\n').trim();
+  const body = withClosingReference(own || `## Summary\n\n${proposal?.summary || 'Reviewed change.'}`, proposal);
   const validation = (Array.isArray(proposal?.validation) ? proposal.validation : [])
     .filter((step) => typeof step === 'string' && step.trim())
     .map((step) => step.trim());
-  // A step the body already lists as a bullet or checkbox is not repeated.
+  // A step the body already lists as a bullet or checkbox is not repeated
+  // (a step with a code block is matched by its first line).
   const listed = new Set(body.split(/\r?\n/).map((line) => line.replace(/^\s*[-*+]\s+(?:\[[ xX]\]\s+)?/, '').trim()));
-  const missing = validation.filter((step) => !listed.has(step) && !listed.has(`\`${step}\``));
+  const missing = validation.filter((step) => {
+    const first = step.split('\n')[0].trim();
+    return !listed.has(first) && !listed.has(`\`${first}\``);
+  });
+  // A step's further lines (a code block) are indented to stay in its item.
   const checklist = missing.length && !hasTestingSection(body)
-    ? `\n\n## Testing\n${missing.map((step) => `- [ ] ${step}`).join('\n')}`
+    ? `\n\n## Testing\n${missing.map((step) => `- [ ] ${step.replace(/\n/g, '\n  ')}`).join('\n')}`
     : '';
   return `${body}${checklist}`.slice(0, PR_BODY_LIMIT - PR_FOOTER.length) + PR_FOOTER;
 };
@@ -189,10 +221,12 @@ const checksOf = (quality) => (Array.isArray(quality?.checks) ? quality.checks :
  */
 export const qualitySummary = (proposal) => {
   const quality = qualityOf(proposal);
+  // The server never runs tests; only an explicit `tests_run: true` says otherwise.
+  const testsRun = isRecord(proposal?.verification) && proposal.verification.tests_run === true;
   if (!quality) {
     return {
       status: null, failing: [], warnings: [], skipped: [], passed: [], reviewed: false, reviewSummary: '',
-      reviewSkippedOnPurpose: false, reviewIssues: [], autofixed: [],
+      reviewSkippedOnPurpose: false, reviewIssues: [], autofixed: [], testsRun,
     };
   }
   const checks = checksOf(quality);
@@ -231,6 +265,93 @@ export const qualitySummary = (proposal) => {
     autofixed: (Array.isArray(quality.autofixed) ? quality.autofixed : [])
       .filter((fix) => isRecord(fix) && text(fix.file_path) && text(fix.rule))
       .map((fix) => ({ file_path: text(fix.file_path), rule: text(fix.rule), lines: Number.isInteger(fix.lines) && fix.lines > 0 ? fix.lines : 0 })),
+    testsRun,
+  };
+};
+
+// A test runner ("pytest tests/x.py -v", "npm test", "go test ./...").
+const TEST_RUNNER = String.raw`(?:python3?\s+-m\s+pytest|pytest|py\.test|(?:npm|yarn|pnpm|bun)\s+(?:run\s+)?test|go\s+test|cargo\s+test|make\s+test|tox|nox|jest|vitest|mocha|rspec|phpunit)\b`;
+const TEST_COMMAND = new RegExp(String.raw`\b${TEST_RUNNER}`, 'i');
+const STARTS_WITH_TEST_COMMAND = new RegExp(String.raw`^${TEST_RUNNER}`, 'i');
+// Words of a sentence, never arguments of a test command ("pytest and confirm that ...").
+const PROSE_WORD = /^(?:and|or|to|the|that|then|make|sure|confirm|check|verify|ensure|see|it|is|are|should|pass(?:es)?|fail(?:s)?|nothing|breaks?|with|for|a|an|all|this|if|when|in|on|of|still|works?|before|after|again)$/i;
+
+/**
+ * The test command a "How to verify" step runs, or '' when the step does not
+ * name one exactly: a backtick span that is a test command ("Run `npm test`
+ * and ..."), or a step that is only the command ("python -m pytest tests -x",
+ * "Run pytest tests/test_x.py"). Prose around a command ("Run pytest and
+ * confirm that test_x passes") is never shown as the command.
+ */
+export const stepCommand = (step) => {
+  const value = text(step);
+  const spans = [...value.matchAll(/`([^`]+)`/g)].map((match) => match[1].trim());
+  if (spans.length) return spans.find((span) => TEST_COMMAND.test(span)) || '';
+  const rest = value.replace(/^run\b:?\s*/i, '').replace(/(?<!\.)[.;]\s*$/, '').trim();
+  const runner = STARTS_WITH_TEST_COMMAND.exec(rest);
+  if (!runner) return '';
+  const words = rest.slice(runner[0].length).replace(/"[^"]*"|'[^']*'/g, ' ').split(/\s+/).filter(Boolean);
+  return words.some((word) => PROSE_WORD.test(word)) ? '' : rest;
+};
+
+/**
+ * What a proposal says about running it: `{ testsRun, command, suiteCommand,
+ * source, testFiles, cases, steps }`, or null for a legacy proposal that has
+ * neither `verification` nor `quality` (it renders exactly as before).
+ * - command: the repository's test command (narrowed to the changed tests);
+ *   for an older proposal, the first "How to verify" step that names one
+ *   exactly (stepCommand), else '' ("no test command was found").
+ * - cases: the issue's reproduction cases `{ code, note, covered }`.
+ * - steps: the "How to verify" steps (they include the cases).
+ */
+export const verificationOf = (proposal) => {
+  const stored = isRecord(proposal?.verification) ? proposal.verification : null;
+  if (!stored && !qualityOf(proposal)) return null;
+  const steps = (Array.isArray(proposal?.validation) ? proposal.validation : []).map(text).filter(Boolean);
+  let command = text(stored?.command);
+  if (!stored) command = steps.map(stepCommand).find(Boolean) || '';
+  return {
+    testsRun: stored?.tests_run === true,
+    command,
+    suiteCommand: text(stored?.suite_command),
+    source: text(stored?.command_source),
+    testFiles: (Array.isArray(stored?.test_files) ? stored.test_files : []).map(text).filter(Boolean),
+    cases: (Array.isArray(stored?.cases) ? stored.cases : [])
+      .filter((item) => isRecord(item) && text(item.code))
+      .slice(0, 12)
+      .map((item) => ({ code: text(item.code), note: text(item.note), covered: item.covered === true })),
+    steps,
+  };
+};
+
+/**
+ * The self-review line. A clean review never reads as an unqualified "No
+ * problems found": it read the change and ran nothing.
+ */
+export const reviewLine = (summary) => {
+  const value = text(summary?.reviewSummary);
+  if (summary?.reviewed) {
+    if (!value || /^no (?:problems|issues) found\.?$/i.test(value)) return 'Self-review: no problems found by reading the diff (nothing was run).';
+    return /^self-review\b/i.test(value) ? value : `Self-review: ${value}`;
+  }
+  if (!value) return 'Self-review skipped.';
+  return /^self-review skipped\b/i.test(value) ? value : `Self-review skipped: ${value}`;
+};
+
+/** The revision a proposal makes of an earlier one (`revision_of`), or null. */
+export const revisionOf = (proposal) => {
+  const revision = isRecord(proposal?.revision_of) ? proposal.revision_of : null;
+  if (!revision || !text(revision.id)) return null;
+  const paths = (value) => (Array.isArray(value) ? value : []).map(text).filter(Boolean);
+  return {
+    id: text(revision.id),
+    title: text(revision.title) || 'the previous proposal',
+    kept: paths(revision.kept_files),
+    dropped: paths(revision.dropped_files),
+    added: paths(revision.added_files),
+    notReapplied: (Array.isArray(revision.not_reapplied) ? revision.not_reapplied : [])
+      .filter((item) => isRecord(item) && text(item.file_path))
+      .map((item) => ({ file_path: text(item.file_path), reason: text(item.reason) })),
   };
 };
 
@@ -258,7 +379,12 @@ export const fileQuality = (proposal, path) => {
   return found;
 };
 
-/** The card's quality note: "checks passed", "2 warnings", "syntax errors"; '' without quality. */
+/**
+ * The card's quality note: "tests not run · static checks passed", "tests
+ * not run · 2 warnings", "syntax errors"; '' without quality. Only a
+ * proposal whose tests actually ran may say "checks passed". "tests not
+ * run" comes first so a narrow card never cuts it off.
+ */
 export const qualityNote = (summary) => {
   if (!summary?.status) return '';
   if (summary.status === 'fail') {
@@ -267,11 +393,12 @@ export const qualityNote = (summary) => {
     if (ids.has('imports')) return 'import errors';
     return summary.failing.length ? `${summary.failing.length} failed check${summary.failing.length === 1 ? '' : 's'}` : 'checks failed';
   }
+  const notRun = summary.testsRun === true ? '' : 'tests not run · ';
   if (summary.status === 'warn') {
     const count = summary.warnings.length;
-    return count ? `${count} warning${count === 1 ? '' : 's'}` : 'warnings';
+    return `${notRun}${count ? `${count} warning${count === 1 ? '' : 's'}` : 'warnings'}`;
   }
-  return 'checks passed';
+  return summary.testsRun === true ? 'checks passed' : 'tests not run · static checks passed';
 };
 
 /** A response header by case-insensitive name (axios headers, or a plain object). */

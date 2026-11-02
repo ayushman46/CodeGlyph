@@ -15,16 +15,17 @@ import { ArtifactCard } from '../ai/ArtifactPanel';
 import { ToolChips } from '../ai/ToolChips';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
-import ProposalNotices, { usePullRequestStatus } from './ProposalNotices';
+import ProposalNotices, { RevisionNote, usePullRequestStatus } from './ProposalNotices';
 
 /*
  * The code-change part of an Edit & PR answer:
  * - `ProposalToolChips`: the editor's run (its stored `tool_calls`, a failed
  *   validation as an error call) and one chip per changed file with the diff
  *   of its real hunks in a popover. Rendered above the answer text.
- * - `EditProposalCard` (default): the proposal's warnings, then an Artifact
- *   Card that opens the proposal in the Artifact Panel (useArtifacts), next
- *   to the review / pull request entry point and the .patch download.
+ * - `EditProposalCard` (default): the proposal it revises (if any), its
+ *   warnings and "Tests not run" note, then an Artifact Card that opens the
+ *   proposal in the Artifact Panel (useArtifacts), next to the review / pull
+ *   request entry point and the .patch download.
  */
 
 /**
@@ -53,10 +54,11 @@ const validationFailed = (message) => !message.streaming && message.mode === 'ed
 const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
 
 /**
- * The card's note: "2 files · +2 −1", plus "· Refs #7" when the change names
- * an issue, plus the quality gates ("· checks passed", "· 2 warnings",
- * "· syntax errors") when the proposal has them. (Tool Chips above already
- * say "N files changed".)
+ * The card's note: "2 files · +2 −1", plus the quality gates ("· tests not
+ * run · static checks passed", "· tests not run · 2 warnings", "· syntax
+ * errors") when the proposal has them, plus "· Fixes #7" when the change
+ * names an issue. The quality comes before the issue so a narrow card never
+ * cuts off "tests not run". (Tool Chips above already say "N files changed".)
  */
 export const describeProposal = (proposal) => {
   if (!proposal) return undefined;
@@ -67,7 +69,7 @@ export const describeProposal = (proposal) => {
   const removed = stats.deletions ?? files.reduce((sum, file) => sum + (file.deletions || 0), 0);
   const issue = issueLabel(proposal);
   const quality = qualityNote(qualitySummary(proposal));
-  return `${plural(count, 'file')} · +${added} −${removed}${issue ? ` · ${issue}` : ''}${quality ? ` · ${quality}` : ''}`;
+  return `${plural(count, 'file')} · +${added} −${removed}${quality ? ` · ${quality}` : ''}${issue ? ` · ${issue}` : ''}`;
 };
 
 // A check that warned or was skipped stays a finished step, with a quieter sign.
@@ -198,6 +200,7 @@ const EditProposalCard = ({ message }) => {
 
   return (
     <div ref={rootRef} data-slot="proposal" className="mt-4 space-y-3">
+      {proposal && <RevisionNote proposal={proposal} />}
       {proposal && <ProposalNotices proposal={proposal} />}
       <div className="flex flex-wrap items-center gap-2">
         <div className="min-w-0 max-w-sm flex-1 basis-64">

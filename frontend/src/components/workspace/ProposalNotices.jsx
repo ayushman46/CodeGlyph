@@ -1,11 +1,11 @@
 import {
-  AlertTriangle, CircleCheck, CircleSlash, CircleX, ExternalLink, Info, RefreshCw, Wrench,
+  AlertTriangle, CircleCheck, CircleSlash, CircleX, ExternalLink, FlaskConical, GitCompareArrows, Info, RefreshCw, Wrench,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getPullRequestStatus } from '../../api/client';
 import {
   approximatePaths, ciCheckOutcome, ciCountsText, ciError, ciPollDelay, ciStateLabel, ciStateTone, incompleteness,
-  mergeStateMessage, qualityNote, qualitySummary, safeGithubUrl, safeHttpsUrl,
+  mergeStateMessage, qualityNote, qualitySummary, reviewLine, revisionOf, safeGithubUrl, safeHttpsUrl, verificationOf,
 } from '../../lib/proposal';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
@@ -53,18 +53,109 @@ const CheckList = ({ checks }) => (
   </ul>
 );
 
-/** "Self-review: …" / "Self-review skipped: …" (the server may already say "Self-review skipped:"). */
-const reviewLine = (summary) => {
-  const text = summary.reviewSummary;
-  if (summary.reviewed) return text ? (/^self-review\b/i.test(text) ? text : `Self-review: ${text}`) : 'Self-review: no issues found.';
-  if (!text) return 'Self-review skipped.';
-  return /^self-review skipped\b/i.test(text) ? text : `Self-review skipped: ${text}`;
+/**
+ * Text with `code spans` (as the server writes verification steps) rendered
+ * as code, and a fenced block (a multi-line case from the issue, such as a
+ * loop) as a preformatted block that keeps its indentation.
+ */
+const WithCode = ({ text }) => {
+  const fenced = /^(`{3,}|~{3,})[^\n]*\n([\s\S]*?)\n\1[ \t]*$/m.exec(text);
+  if (fenced) {
+    const before = text.slice(0, fenced.index).trim();
+    const after = text.slice(fenced.index + fenced[0].length).trim();
+    return (
+      <>
+        {before && <WithCode text={before} />}
+        <pre data-slot="case-block" className="scroll-thin my-1 overflow-x-auto rounded bg-surface px-2 py-1.5 font-mono text-[11.5px] leading-snug text-ink">{fenced[2]}</pre>
+        {after && <WithCode text={after} />}
+      </>
+    );
+  }
+  const parts = [];
+  const pattern = /(`+)([\s\S]*?[^`])\1(?!`)/g;
+  let last = 0;
+  let match = pattern.exec(text);
+  while (match) {
+    if (match.index > last) parts.push(text.slice(last, match.index));
+    parts.push(<code key={match.index} className="break-all rounded bg-surface-2 px-1 py-px font-mono text-[11.5px] text-ink">{match[2].trim()}</code>);
+    last = match.index + match[0].length;
+    match = pattern.exec(text);
+  }
+  if (last < text.length) parts.push(text.slice(last));
+  return <>{parts}</>;
+};
+
+/**
+ * Nothing in a proposal is executed: say so, with the repository's own test
+ * command and the "How to verify" steps (every reproduction case the issue
+ * quotes is one of them).
+ */
+export const TestsNotRun = ({ proposal, className = '' }) => {
+  const verification = verificationOf(proposal);
+  if (!verification || verification.testsRun) return null;
+  const { command, source, steps } = verification;
+  return (
+    <div className={`rounded-xl border border-line bg-surface-2/60 px-3.5 py-3 text-[12.5px] leading-relaxed text-ink-2 ${className}`} role="note" data-slot="tests-not-run">
+      <p className="m-0 flex items-center gap-2 font-semibold text-ink">
+        <FlaskConical className="h-4 w-4 shrink-0 text-warning" aria-hidden="true" />
+        Tests not run
+      </p>
+      <p className="m-0 mt-1">
+        {command
+          ? 'Nothing in this proposal was executed. Run the tests before merging:'
+          : "Nothing in this proposal was executed, and no test command was found in the repository's setup. Run its tests before merging."}
+      </p>
+      {command && (
+        <p className="m-0 mt-1 break-words">
+          <code data-slot="test-command" className="break-all rounded bg-surface px-1.5 py-0.5 font-mono text-[11.5px] text-ink">{command}</code>
+          {source ? <span className="text-ink-3"> (from {source})</span> : null}
+        </p>
+      )}
+      {steps.length > 0 && (
+        <div className="mt-2" data-slot="how-to-verify">
+          <p className="m-0 font-semibold text-ink">How to verify</p>
+          <ol className="mt-1 list-decimal space-y-0.5 ps-5">
+            {steps.map((step, index) => (
+              // eslint-disable-next-line react/no-array-index-key
+              <li key={index} className="break-words"><WithCode text={step} /></li>
+            ))}
+          </ol>
+        </div>
+      )}
+    </div>
+  );
+};
+
+/** "Revises the previous proposal …": which proposal a revision builds on and what happened to its files. */
+export const RevisionNote = ({ proposal, className = '' }) => {
+  const revision = revisionOf(proposal);
+  if (!revision) return null;
+  const list = (paths) => paths.map((path, index) => (
+    <span key={path}>{index ? ', ' : ''}<span className="font-mono text-[11.5px] text-ink">{path}</span></span>
+  ));
+  return (
+    <div className={`flex items-start gap-2 rounded-xl border border-accent/30 bg-accent-soft px-3.5 py-2.5 text-[12.5px] leading-relaxed text-ink-2 ${className}`} role="note" data-slot="proposal-revision">
+      <GitCompareArrows className="mt-0.5 h-4 w-4 shrink-0 text-accent" aria-hidden="true" />
+      <div className="min-w-0 space-y-0.5">
+        <p className="m-0"><span className="font-semibold text-ink">Revises the previous proposal</span> “{revision.title}”.</p>
+        <p className="m-0">
+          {revision.kept.length
+            // A request that only drops an earlier change adds nothing.
+            ? <>Keeps its changes to {list(revision.kept)}{revision.dropped.length ? '.' : <> and adds this request&apos;s changes.</>}</>
+            : 'This request’s changes replace its changes.'}
+        </p>
+        {revision.dropped.length > 0 && <p className="m-0">Dropped, as asked: {list(revision.dropped)}.</p>}
+        {revision.notReapplied.map((item) => <p key={item.file_path} className="m-0 text-warning">{item.reason || item.file_path}</p>)}
+      </div>
+    </div>
+  );
 };
 
 /**
  * Warnings the server attached to a proposal: its quality gates (failed
  * checks in a danger box, warnings in a warning box, the self-review line,
- * automatic fixes), files it planned to change but did not
+ * automatic fixes), that its tests were not run (with the command and the
+ * "How to verify" steps), files it planned to change but did not
  * (`unchanged_files` / `incomplete`) and files whose content was
  * reconstructed from the index (`approximate_files`). A proposal without
  * `quality` (an older one) renders exactly as before.
@@ -74,7 +165,8 @@ const ProposalNotices = ({ proposal, refreshedPaths = new Set(), className = '' 
   const approximate = [...approximatePaths(proposal)].filter((path) => !refreshedPaths.has(path));
   const quality = qualitySummary(proposal);
   const hasQuality = Boolean(quality.status);
-  if (!incomplete && !approximate.length && !hasQuality) return null;
+  const verification = verificationOf(proposal);
+  if (!incomplete && !approximate.length && !hasQuality && !verification) return null;
   // The self-review has its own line below; its unfixed issues join the warnings.
   const warnings = quality.warnings.filter((check) => check.id !== 'review');
   const unfixed = quality.reviewIssues.filter((issue) => !issue.fixed && issue.verified);
@@ -118,12 +210,13 @@ const ProposalNotices = ({ proposal, refreshedPaths = new Set(), className = '' 
           )}
         </div>
       )}
+      <TestsNotRun proposal={proposal} />
       {hasQuality && (
         <div className="space-y-1 px-0.5 text-[12px] leading-relaxed text-ink-3" data-slot="quality-notes">
           {passed.length > 0 && (
             <p className="m-0 flex items-start gap-1.5" data-slot="quality-passed">
               <CircleCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-success" aria-hidden="true" />
-              <span>Passed: {passed.join(', ')}.</span>
+              <span>{quality.testsRun ? 'Passed' : 'Static checks passed'}: {passed.join(', ')}.</span>
             </p>
           )}
           <p className="m-0 flex items-start gap-1.5" data-slot="quality-review">
@@ -233,23 +326,30 @@ const ProposalNotices = ({ proposal, refreshedPaths = new Set(), className = '' 
 
 const SUMMARY_STYLE = {
   pass: { box: 'border-success/30 bg-success-soft', icon: CircleCheck, iconClass: 'text-success' },
+  static: { box: 'border-line bg-surface-2/60', icon: FlaskConical, iconClass: 'text-warning' },
   warn: { box: 'border-warning/40 bg-warning-soft', icon: AlertTriangle, iconClass: 'text-warning' },
   fail: { box: 'border-danger/30 bg-danger-soft', icon: CircleX, iconClass: 'text-danger' },
 };
 
 /**
  * The quality gates in a few lines (the review's PR form): what failed and
- * what to check, with the full list in ProposalNotices beside the diff.
- * Nothing for a proposal without `quality`.
+ * what to check, and that the tests were not run (with the command), with
+ * the full list in ProposalNotices beside the diff. Nothing for a proposal
+ * without `quality`.
  */
 export const QualitySummary = ({ proposal, className = '' }) => {
   const quality = qualitySummary(proposal);
+  const verification = verificationOf(proposal);
   if (!quality.status) return null;
-  const style = SUMMARY_STYLE[quality.status];
+  const notRun = verification && !verification.testsRun;
+  // Static checks alone are not a green light.
+  const style = quality.status === 'pass' && notRun ? SUMMARY_STYLE.static : SUMMARY_STYLE[quality.status];
   const Icon = style.icon;
   const headline = quality.status === 'pass'
-    ? 'All checks passed'
-    : quality.status === 'fail' ? `Checks failed: ${qualityNote(quality)}` : `${plural(Math.max(1, quality.warnings.length), 'warning')} to check`;
+    ? (notRun ? 'Static checks passed · tests not run' : 'All checks passed')
+    : quality.status === 'fail'
+      ? `Checks failed: ${qualityNote(quality)}`
+      : `${plural(Math.max(1, quality.warnings.length), 'warning')} to check${notRun ? ' · tests not run' : ''}`;
   const items = [...quality.failing, ...quality.warnings.filter((check) => check.id !== 'review')];
   return (
     <div className={`rounded-xl border px-3 py-2.5 text-[12.5px] leading-relaxed text-ink-2 ${style.box} ${className}`} data-slot="quality-summary" data-status={quality.status}>
@@ -267,6 +367,13 @@ export const QualitySummary = ({ proposal, className = '' }) => {
             </li>
           ))}
         </ul>
+      )}
+      {notRun && (
+        <p className="m-0 mt-1 ps-6 text-[12px] text-ink-2" data-slot="quality-tests">
+          {verification.command
+            ? <>Tests not run. Run <code className="break-all font-mono text-[11.5px] text-ink">{verification.command}</code> before merging.</>
+            : 'Tests not run. Run the repository’s tests before merging.'}
+        </p>
       )}
       <p className="m-0 mt-1 ps-6 text-[12px] text-ink-3">{reviewLine(quality)}</p>
     </div>
