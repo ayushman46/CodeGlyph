@@ -848,11 +848,23 @@ _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z`*(\[\"'])")
 _CLAIM_LIST_PREFIX = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?)")
 
 
+_COMMAND_SPAN = re.compile(
+    r"`(?:\$\s*)?(?:python3?|pytest|py\.test|tox|nox|make|npm|npx|pnpm|yarn|bun|node|go|cargo|uv|poetry|pip3?|git|bash|sh|"
+    r"\./)[^`\n]*`"
+)
+_QUOTED_PROSE = re.compile(r"\"[^\"\n]*\"|(?<![\w])'[^'\n]*'(?![\w])")
+
+
 def _prose_names(sentence: str) -> list[str]:
-    """Code names a sentence of PR prose mentions (see ``_PROSE_NAME``), outside URLs and paths."""
+    """Code names a sentence of PR prose mentions (see ``_PROSE_NAME``).
+
+    URLs, shell commands in backticks (``pytest -k "non_string"``) and quoted
+    strings are not names of the code, so they are skipped.
+    """
     names: list[str] = []
-    ticked = {match.group(1).strip().rstrip("()") for match in re.finditer(r"`([^`\n]+)`", sentence)}
-    for match in _PROSE_NAME.finditer(re.sub(r"https?://\S+", " ", sentence)):
+    text = _QUOTED_PROSE.sub(" ", _COMMAND_SPAN.sub(" ", re.sub(r"https?://\S+", " ", sentence)))
+    ticked = {match.group(1).strip().rstrip("()") for match in re.finditer(r"`([^`\n]+)`", text)}
+    for match in _PROSE_NAME.finditer(text):
         name = match.group(1)
         if name in _KNOWN_GLOBALS or name.strip("_") == "" or name in names:
             continue
@@ -3507,7 +3519,8 @@ Rules:
         candidates: list[str] = []
         for _key, value in fields:
             for name in _prose_names(value):
-                if name not in candidates and not _references(corpus, name):
+                # Part of a known identifier counts as known (a -k filter, a prefix).
+                if name not in candidates and name not in corpus:
                     candidates.append(name)
         unknown: set[str] = set()
         if candidates:

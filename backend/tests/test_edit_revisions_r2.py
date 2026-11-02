@@ -177,7 +177,9 @@ class UnsupportedClaimTests(EditHonestyCase):
 
     def test_existing_names_and_ordinary_prose_are_kept(self):
         body = ("## Summary\n\n`_encode_files` now passes `str(k)` to `RequestField`. If a timeout is not provided, "
-                "nothing changes. Run `python -m pytest tests` (see `test_int_field_name`).")
+                "nothing changes. Run `python -m pytest tests` (see `test_int_field_name`). "
+                # A -k filter or a quoted string is not a code name (live round 2 run).
+                'Run `pytest tests/test_requests.py -k "non_string"` to confirm the new tests, which send "form_name".')
         responses = [plan("src/requests/models.py", "tests/test_requests.py"),
                      edit([{"file_path": "src/requests/models.py", "action": "modify", "changes": [NAME_FIX]},
                            {"file_path": "tests/test_requests.py", "action": "modify", "changes": [NEW_TEST]}], pr_body=body)]
