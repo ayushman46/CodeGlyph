@@ -97,8 +97,9 @@ def exact_search_notes(plan: dict) -> list[str]:
             f"The evidence starts with a generated static change impact summary for {impact['target']}{symbol} "
             "(importers, affected test files and the test functions that use the name). Use it for the tests and "
             "coverage part of the answer: name the affected test files and test functions it lists, and say it is "
-            "static import analysis, not measured coverage. Test functions shown as evidence windows may be cited "
-            "with their line ranges; for the others, name the file and the test function without a line number."
+            "static import analysis, not measured coverage. Its path:line entries are not evidence lines: write a line "
+            "number or range only for lines shown in an evidence window (the test functions shown as windows, for "
+            "example); name every other file, importer or test function without a line number."
         )
     return notes
 

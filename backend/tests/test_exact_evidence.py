@@ -465,6 +465,7 @@ class ChangeRiskTests(ExactEvidenceStoreCase):
         self.assertEqual(plan["change_impact"]["test_functions"], 1)
         notes = " ".join(exact_search_notes(plan))
         self.assertIn("static change impact summary for src/flask/app.py and `make_response`", notes)
+        self.assertIn("name every other file, importer or test function without a line number", notes)
         messages = build_answer_messages(question, context, evidence_plan=plan)
         self.assertIn("Use it for the tests and coverage part", messages[-1]["content"])
 
