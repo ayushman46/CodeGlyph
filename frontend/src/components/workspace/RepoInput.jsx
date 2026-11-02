@@ -90,6 +90,8 @@ const RepoInput = ({ size = 'lg', showExamples = true, autoFocus = false, initia
         // Only one indexing job runs per workspace: point at the running one.
         action: status === 409 && indexing ? { label: `Open ${indexing.repo_name}`, to: repoPath(indexing.repo_name) } : null,
       });
+      // GitHub has no such repository and nothing was added: keep the text to correct it.
+      if (status === 404) window.setTimeout(() => inputRef.current?.focus(), 0);
     } finally {
       setBusy(false);
     }

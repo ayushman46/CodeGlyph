@@ -14,12 +14,13 @@ from agent.code_edit import CodeEditValidationError, normalise_repository_path
 from agent.editor import language_for, reconstruct_indexed_file
 from api.auth import get_current_user
 from api.repository_state import fetch_owned_repository, public_view, raise_storage_error
+from api.start_here import gather_start_here
 from config import settings
 from database import assert_turso_schema, get_turso_store
 from github.github_client import GitHubAPIError, fetch_raw_file
 from ingest.chunker import LONG_LINE_OVERLAP
 from ingest.cloner import RepositoryValidationError, parse_github_repository
-from retrieval.retriever import build_repo_map, search_code
+from retrieval.retriever import build_repo_map, invalidate_repo_map, search_code
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -750,13 +751,101 @@ def language_breakdown(repo_map: dict) -> list[dict]:
     ]
 
 
+# The folder map is cached by the retriever for a short while. A map built
+# while indexing ran covers only the files published so far, so the overview
+# drops it whenever the index it describes has changed since the last load.
+_MAP_VERSIONS: dict[str, tuple] = {}
+_UNSEARCHABLE_LIMIT = 2_000
+
+
+def _index_version(repo: dict) -> tuple:
+    return (
+        repo.get("status"), repo.get("is_indexing"), repo.get("chunk_count"), repo.get("keyword_files"),
+        repo.get("commit_sha"), repo.get("indexed_at"), repo.get("staging_prefix"),
+    )
+
+
+async def current_repo_map(store, repo: dict) -> dict:
+    repo_id = str(repo["id"])
+    version = _index_version(repo)
+    if _MAP_VERSIONS.get(repo_id) != version:
+        invalidate_repo_map(repo_id)
+        _MAP_VERSIONS[repo_id] = version
+        if len(_MAP_VERSIONS) > 1024:
+            _MAP_VERSIONS.pop(next(iter(_MAP_VERSIONS)), None)
+    return await build_repo_map(store, repo_id)
+
+
+def without_files(repo_map: dict, removed: list[tuple[str, int]]) -> dict:
+    """A copy of the folder map without ``removed`` ``(path, bytes)`` files.
+
+    The map counts the file manifest, which also lists files that produced no
+    searchable sections (empty or unreadable). The overview counts what can be
+    searched, so its folder total matches "Indexed files".
+    """
+    if not removed:
+        return repo_map
+    gone: dict[str, list[int]] = {}
+    root_gone: set[str] = set()
+    extensions = dict(repo_map.get("extensions") or {})
+    for path, size in removed:
+        parts = path.split("/")
+        extension = path.rsplit(".", 1)[-1].lower() if "." in parts[-1] else parts[-1].lower()
+        if extensions.get(extension):
+            extensions[extension] -= 1
+            if extensions[extension] <= 0:
+                extensions.pop(extension)
+        if len(parts) == 1:
+            root_gone.add(path)
+            continue
+        for depth in range(1, min(len(parts), 4)):
+            totals = gone.setdefault("/".join(parts[:depth]), [0, 0])
+            totals[0] += 1
+            totals[1] += int(size or 0)
+
+    def prune(nodes: list[dict]) -> list[dict]:
+        kept = []
+        for node in nodes:
+            files, size = gone.get(node["path"], (0, 0))
+            remaining = int(node.get("files") or 0) - files
+            if remaining <= 0:
+                continue
+            kept.append({**node, "files": remaining, "bytes": max(0, int(node.get("bytes") or 0) - size),
+                         "children": prune(node.get("children") or [])})
+        return sorted(kept, key=lambda node: (-node["files"], node["path"]))
+
+    return {
+        **repo_map,
+        "total_files": max(0, int(repo_map.get("total_files") or 0) - len(removed)),
+        "root_files": [path for path in repo_map.get("root_files") or [] if path not in root_gone],
+        "tree": prune(repo_map.get("tree") or []),
+        "extensions": extensions,
+    }
+
+
+async def _unsearchable_files(store, repo: dict) -> list[tuple[str, int]]:
+    """Manifest files without any published section (bounded)."""
+    staging = repo.get("staging_prefix")
+    stage_sql, stage_args = ("", []) if not staging else (" AND c.id NOT LIKE ?", [f"{staging}%"])
+    rows = await store.fetch_all(
+        "SELECT f.file_path, f.byte_size FROM repo_files f WHERE f.repo_id = ? AND NOT EXISTS ("
+        f"SELECT 1 FROM chunks c WHERE c.repo_id = f.repo_id AND c.file_path = f.file_path{stage_sql}) LIMIT ?",
+        [repo["id"], *stage_args, _UNSEARCHABLE_LIMIT],
+    )
+    return [(str(row.get("file_path") or ""), int(row.get("byte_size") or 0)) for row in rows if row.get("file_path")]
+
+
 @router.get("/repos/{repo_name}/overview")
 async def repository_overview(repo_name: str, current_user=Depends(get_current_user)):
     try:
         await assert_turso_schema()
         store = get_turso_store()
         repo = await fetch_owned_repository(store, current_user.id, repo_name)
-        repo_map = await build_repo_map(store, repo["id"])
+        repo_map = await current_repo_map(store, repo)
+        try:
+            repo_map = without_files(repo_map, await _unsearchable_files(store, repo))
+        except Exception:
+            logger.warning("Could not reconcile the folder map with the searchable files", exc_info=True)
         facts: dict | None = None
         try:
             facts = await gather_question_facts(store, repo)
@@ -764,6 +853,12 @@ async def repository_overview(repo_name: str, current_user=Depends(get_current_u
             # Starter questions are a convenience; folder-based ones still work.
             logger.warning("Could not read file facts for starter questions", exc_info=True)
         details = suggest_question_details(repo_map, facts)
+        start_here = None
+        try:
+            start_here = await gather_start_here(store, repo, repo_map, facts)
+        except Exception:
+            # Like the starter questions: the rest of the overview still loads.
+            logger.warning("Could not build the Start here card", exc_info=True)
         return {
             "repository": public_view(repo),
             "total_files": repo_map.get("total_files", 0),
@@ -775,6 +870,9 @@ async def repository_overview(repo_name: str, current_user=Depends(get_current_u
             # The same questions with their kind ("overview", "where", "how",
             # "change") and the indexed files each one names.
             "suggested_question_details": details,
+            # Entry file, core folder, cited commands and a reading path
+            # (api/start_here.py); null when nothing could be derived.
+            "start_here": start_here,
             "notice": _overview_notice(repo),
         }
     except Exception as error:

@@ -37,6 +37,7 @@ from ingest.embedder import EmbeddingUnavailableError, embed_chunks
 from ingest.memory import pressure_level, rss_mb, wait_for_memory_headroom
 from ingest.summarizer import build_kt_cache
 from quota import RepositoryQuotaExceededError, quota_exceeded_message, repository_byte_budget
+from retrieval.retriever import invalidate_repo_map
 
 logger = logging.getLogger(__name__)
 
@@ -1679,6 +1680,9 @@ async def _run_ingestion_for_repo(
             initial_run = False
         final_count = await get_repo_chunk_count(store, repo_id)
         await update_repo(store, repo_id, status="ready", chunk_count=final_count, error_message=completion_message)
+        # The folder map cached while indexing ran covers only part of the
+        # files; the next overview or answer must read the published index.
+        invalidate_repo_map(repo_id)
         metrics["total_ms"] = int((time.perf_counter() - started_at) * 1000)
         metrics["peak_rss_mb"] = max(metrics["peak_rss_mb"], round(rss_mb(), 1))
         await persist_ingestion_metrics(store, job_id, repo_id, metrics)

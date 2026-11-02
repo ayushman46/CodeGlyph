@@ -22,6 +22,67 @@ export const phaseIndex = (repo) => PHASE_INDEX[repo?.status] ?? PHASE_INDEX[rep
 const isSearchable = (repo) => repo?.status === 'searchable' || repo?.index_phase === 'searchable';
 const clampPercent = (value) => Math.max(0, Math.min(100, Number(value) || 0));
 
+/**
+ * "Step 5 of 7": the API's own position (`phase_step` / `phase_steps`)
+ * when it sends one, so the card and API clients count the same steps.
+ * @returns {{ step: number, steps: number }}
+ */
+export const stepPosition = (repo) => {
+  const steps = Number(repo?.phase_steps) > 0 ? Number(repo.phase_steps) : STEPS.length;
+  const step = Number(repo?.phase_step) > 0 ? Number(repo.phase_step) : phaseIndex(repo) + 1;
+  return { step: Math.min(step, steps), steps };
+};
+
+/**
+ * Sections embedded so far and the total while a first index builds its
+ * semantic index; null when unknown (and during a refresh). The API sends
+ * `semantic_sections`; older payloads only have the worker's message
+ * ("Building the semantic index: 258 of 465 code sections").
+ * @returns {{ embedded: number, total: number } | null}
+ */
+export const semanticSections = (repo) => {
+  if (!repo?.is_indexing || repo.refreshing || phaseIndex(repo) < 5) return null;
+  if (repo.semantic_sections !== undefined) {
+    const sections = repo.semantic_sections;
+    return sections && Number(sections.total) > 0 ? { embedded: Number(sections.embedded) || 0, total: Number(sections.total) } : null;
+  }
+  if (!/semantic index/i.test(String(repo.message || ''))) return null;
+  const counts = messageCounts(repo.message);
+  return counts ? { embedded: counts.done, total: counts.total } : null;
+};
+
+/**
+ * The semantic index's percentage: embedded / total, the same numbers the
+ * detail line shows. The API already reconciles `semantic_progress` with
+ * `semantic_sections`; for older payloads it is computed from the message.
+ */
+export const semanticPercent = (repo) => {
+  if (repo?.semantic_sections === undefined) {
+    const sections = semanticSections(repo);
+    if (sections) return Math.round((sections.embedded / sections.total) * 100);
+  }
+  return clampPercent(repo?.semantic_progress);
+};
+
+const count = (value) => {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.round(number) : 0;
+};
+
+/**
+ * Files questions and code search can use right now. `indexed_files` is
+ * only written when a run finishes (and is 0 while the next run selects
+ * files); `keyword_files` follows the published sections while indexing.
+ */
+export const searchableFiles = (repo) => {
+  if (!repo) return 0;
+  if (repo.searchable_files != null) return count(repo.searchable_files);
+  if (!repo.queryable) return 0;
+  return repo.is_indexing
+    ? count(repo.keyword_files) || count(repo.indexed_files)
+    : count(repo.indexed_files) || count(repo.keyword_files);
+};
+
 export const phaseLabel = (repo) => {
   if (!repo) return '';
   if (repo.status === 'failed') return 'Needs attention';
@@ -31,7 +92,7 @@ export const phaseLabel = (repo) => {
     return keywordOnly ? 'Ready · keyword search' : 'Ready';
   }
   if (repo.refreshing) return `Refreshing · ${STEPS[phaseIndex(repo)]?.label || 'Working'}`;
-  if (isSearchable(repo)) return `Ready · semantic ${clampPercent(repo.semantic_progress)}%`;
+  if (isSearchable(repo)) return `Ready · semantic ${semanticPercent(repo)}%`;
   return STEPS[phaseIndex(repo)]?.label || 'Indexing';
 };
 
@@ -57,7 +118,7 @@ export const overallProgress = (repo) => {
   if (!repo) return 0;
   if (!repo.is_indexing) return 100;
   const index = phaseIndex(repo);
-  if (index >= 5) return Math.round(55 + (clampPercent(repo.semantic_progress) * 0.44));
+  if (index >= 5) return Math.round(55 + (semanticPercent(repo) * 0.44));
   // A step that reports "N of M" moves the bar within its own share.
   const within = index > 0 ? (phaseFraction(repo) ?? 0) : 0;
   return Math.round(((index + within) / 5) * 55);
@@ -77,7 +138,7 @@ export const statusSentence = (repo) => {
   if (repo.status === 'failed') return 'Indexing failed';
   if (repo.status === 'cancelled') return 'Indexing stopped';
   if (repo.is_indexing) {
-    if (repo.queryable) return `Keyword search ready, semantic index ${clampPercent(repo.semantic_progress)}%`;
+    if (repo.queryable) return `Keyword search ready, semantic index ${semanticPercent(repo)}%`;
     return `Indexing, ${overallProgress(repo)}%`;
   }
   return isKeywordOnly(repo) ? 'Ready, keyword search only' : 'Ready';
@@ -229,20 +290,25 @@ export const indexingActivity = (repo, { remaining = '', messageShown = false } 
   let progress = '';
   if (index === 4 && counts) progress = `${Math.floor((counts.done / counts.total) * 100)}% of files read`;
   else if (index >= 5 && repo?.embedding_status !== 'degraded') {
-    progress = counts
-      ? `${formatExact(counts.done)} of ${formatExact(counts.total)} sections embedded`
-      : `${clampPercent(repo?.semantic_progress)}% of sections embedded`;
+    // The same numbers as the header's "semantic N%" (see semanticPercent).
+    const sections = semanticSections(repo);
+    progress = sections
+      ? `${formatExact(sections.embedded)} of ${formatExact(sections.total)} sections embedded`
+      : `${semanticPercent(repo)}% of sections embedded`;
   }
 
+  // Waiting for a worker: the place in line from the API, when it has one.
+  const queue = index === 0 && !stopping ? repo?.queue : null;
   let usable;
   if (stopping) usable = 'Stopping takes a few seconds';
   else if (repo?.refreshing) usable = 'Answers use the current index until the refresh finishes';
   else if (queryable) usable = 'Keyword search is ready — you can ask questions now';
   else if (index === 4) usable = 'Questions unlock when this step finishes';
-  else if (index === 0) usable = 'Starts as soon as an indexing worker is free';
+  else if (index === 0) usable = queue?.label || 'Starts as soon as an indexing worker is free';
   else usable = 'Questions unlock once keyword search is built';
 
   const notes = [];
+  if (queue?.estimate_note) notes.push(queue.estimate_note);
   const omitted = budgetOmittedFiles(repo);
   if (omitted && selected) {
     notes.push(`Large repository: the ${formatExact(selected)} most important files go first; ${formatExact(omitted)} lower-priority files are skipped and listed in the coverage report.`);

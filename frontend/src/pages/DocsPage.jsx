@@ -50,8 +50,9 @@ const SECTIONS = [
         type: 'steps',
         items: [
           ['Sign in with Google', 'Your workspace, repositories and conversations are tied to your Google account and visible only to you.'],
-          ['Add a repository', 'Paste a public GitHub URL or the short `owner/repo` form. Both of these add the same repository:', ['https://github.com/calcom/cal.com', 'calcom/cal.com']],
-          ['Watch it index', 'Keyword search is ready within moments. The semantic index builds in the background, with live progress, and you can start asking as soon as the repository is searchable.'],
+          ['Add a repository', 'Paste a public GitHub URL or the short `owner/repo` form. Both of these add the same repository. A name GitHub does not have is reported right away and nothing is added:', ['https://github.com/calcom/cal.com', 'calcom/cal.com']],
+          ['Watch it index', 'Keyword search is ready within moments. The semantic index builds in the background, with live progress, and you can start asking as soon as the repository is searchable. If other repositories are waiting for an indexing worker, you see how many are ahead of yours and an estimated start.'],
+          ['Start here', 'Open Overview for the entry file, the core folder, the install, test and run commands and a short reading path. Each one opens the file at the line it came from.'],
           ['Ask a question', 'Pick a workflow, ask in plain language, and follow the citations into the code.'],
         ],
       },
@@ -127,6 +128,7 @@ const SECTIONS = [
         items: [
           ['Instant code search', 'Search the indexed code by keyword and see the matching files and lines right away.'],
           ['Repository overview', 'See the languages, a folder map and suggested questions to start with.'],
+          ['Start here', 'The entry file, core folder, cited install / test / run commands and 3–5 files to read in order, built from the indexed manifests, README and imports without an AI model.'],
           ['Change-impact analysis', 'Pick a file to see which files import it, before you change it.'],
         ],
       },

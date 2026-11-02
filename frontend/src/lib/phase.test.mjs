@@ -144,3 +144,66 @@ test('indexing details report counts, what works, notes and warnings', async () 
   assert.equal(stopping.pattern, 'pulse');
   assert.equal(stopping.remaining, '');
 });
+
+test('BUG-14: the header percentage, the step and the detail line read the same embedded / total', async () => {
+  const { indexingActivity, semanticPercent, semanticSections, statusSentence } = await import('./phase.js');
+  // The customer's numbers: 258 of 465 sections embedded while the stored
+  // percentage (rows written so far as the denominator) said 66%.
+  const message = 'Building the semantic index: 258 of 465 code sections (55%). Keyword search already works.';
+  const older = { is_indexing: true, status: 'searchable', queryable: true, semantic_progress: 66, message };
+  assert.deepEqual(semanticSections(older), { embedded: 258, total: 465 });
+  assert.equal(semanticPercent(older), Math.round((258 / 465) * 100));
+  assert.equal(phaseLabel(older), 'Ready · semantic 55%');
+  assert.equal(indexingActivity(older).progress, '258 of 465 sections embedded');
+  assert.equal(statusSentence(older), 'Keyword search ready, semantic index 55%');
+  assert.equal(overallProgress(older), Math.round(55 + 55 * 0.44));
+  // The API reconciles semantic_progress itself and sends the counts.
+  const current = { ...older, semantic_progress: 55, semantic_sections: { embedded: 258, total: 465 } };
+  assert.equal(phaseLabel(current), 'Ready · semantic 55%');
+  assert.equal(indexingActivity(current).progress, '258 of 465 sections embedded');
+  // No counts (degraded provider, a refresh): the stored percentage.
+  assert.equal(semanticSections({ ...current, semantic_sections: null }), null);
+  assert.equal(indexingActivity({ ...current, semantic_sections: null }).progress, '55% of sections embedded');
+  assert.equal(semanticSections({ ...older, refreshing: true }), null);
+  assert.equal(semanticSections({ ...older, message: 'Reading source files (4 of 9 changed files).' }), null);
+  assert.equal(semanticSections({ ...older, is_indexing: false }), null);
+});
+
+test('BUG-14: the step count matches the API (seven steps, Ready included)', async () => {
+  const { STEPS, stepPosition } = await import('./phase.js');
+  assert.equal(STEPS.length, 7);
+  assert.deepEqual(stepPosition({ status: 'queued', is_indexing: true, phase_step: 1, phase_steps: 7 }), { step: 1, steps: 7 });
+  assert.deepEqual(stepPosition({ status: 'searchable', is_indexing: true }), { step: 6, steps: 7 });
+  assert.deepEqual(stepPosition({ status: 'chunking', is_indexing: true, phase_step: 5, phase_steps: 7 }), { step: 5, steps: 7 });
+  assert.deepEqual(stepPosition(null), { step: 1, steps: 7 });
+});
+
+test('BUG-14: the file count is what can be searched now, never 0 while keyword search works', async () => {
+  const { searchableFiles } = await import('./phase.js');
+  // First index: coverage's indexed_files is only written at the end.
+  assert.equal(searchableFiles({ is_indexing: true, queryable: true, keyword_files: 56, indexed_files: 0 }), 56);
+  // The API's own figure wins.
+  assert.equal(searchableFiles({ is_indexing: true, queryable: true, keyword_files: 56, indexed_files: 0, searchable_files: 56 }), 56);
+  assert.equal(searchableFiles({ is_indexing: false, queryable: true, keyword_files: 200, indexed_files: 200 }), 200);
+  // A legacy index without coverage, and a refresh that reset coverage.
+  assert.equal(searchableFiles({ is_indexing: false, queryable: true, keyword_files: 90, indexed_files: 0 }), 90);
+  assert.equal(searchableFiles({ is_indexing: true, refreshing: true, queryable: true, keyword_files: 200, indexed_files: 0 }), 200);
+  assert.equal(searchableFiles({ is_indexing: true, queryable: false, keyword_files: 0, indexed_files: 0 }), 0);
+  assert.equal(searchableFiles(null), 0);
+});
+
+test('FEAT-08: a queued repository shows its place in line and the labelled estimate', async () => {
+  const { indexingActivity } = await import('./phase.js');
+  const queue = {
+    ahead: 2, running: 1, position: 3, estimated_wait_seconds: 75, estimate_runs: 7,
+    label: '2 repositories ahead of yours · usually starts in about 2 min',
+    estimate_note: 'Estimate based on how long the last 7 indexing runs took.',
+  };
+  const queued = indexingActivity({ is_indexing: true, status: 'queued', queue });
+  assert.equal(queued.label, 'Waiting for an indexing worker');
+  assert.equal(queued.usable, '2 repositories ahead of yours · usually starts in about 2 min');
+  assert.deepEqual(queued.notes, ['Estimate based on how long the last 7 indexing runs took.']);
+  // Without queue data the old line stays; once a worker claims it, the queue no longer shows.
+  assert.equal(indexingActivity({ is_indexing: true, status: 'queued', queue: null }).usable, 'Starts as soon as an indexing worker is free');
+  assert.deepEqual(indexingActivity({ is_indexing: true, status: 'cloning', queue }).notes, []);
+});

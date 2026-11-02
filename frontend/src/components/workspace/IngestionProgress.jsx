@@ -1,14 +1,13 @@
-import { Check, DoorOpen, Layers, MessageSquareText, Square, TriangleAlert } from 'lucide-react';
+import { Check, Compass, DoorOpen, Layers, MessageSquareText, Square, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useState } from 'react';
 import {
-  KEYWORD_STEP, STEPS, estimateRemainingMs, indexingActivity, phaseFraction, phaseIndex, remainingLabel, trackProgress,
+  KEYWORD_STEP, STEPS, estimateRemainingMs, indexingActivity, phaseFraction, phaseIndex, remainingLabel, semanticPercent,
+  stepPosition, trackProgress,
 } from '../../lib/phase';
 import LoadingState from '../ai/LoadingState';
 import Button from '../ui/Button';
 
 export { STEPS, overallProgress, phaseIndex, phaseLabel } from '../../lib/phase';
-
-const VISIBLE_STEPS = STEPS.slice(0, 6);
 
 /**
  * Time left for the step that is running now, measured from the progress
@@ -18,7 +17,7 @@ const VISIBLE_STEPS = STEPS.slice(0, 6);
 export const useIndexingEta = (repo) => {
   const [samples, setSamples] = useState([]);
   const index = phaseIndex(repo);
-  const fraction = !repo?.is_indexing ? null : index >= 5 ? (Number(repo.semantic_progress) || 0) / 100 : index > 0 ? phaseFraction(repo) : null;
+  const fraction = !repo?.is_indexing ? null : index >= 5 ? semanticPercent(repo) / 100 : index > 0 ? phaseFraction(repo) : null;
   const key = `${repo?.id}:${index}`;
   useEffect(() => {
     setSamples((previous) => trackProgress(previous, { key, fraction, at: Date.now() }));
@@ -95,13 +94,14 @@ const IngestionProgress = ({ repo, onStop, stopping = false }) => {
   const titleId = useId();
   const index = phaseIndex(repo);
   const eta = useIndexingEta(repo);
-  const stepNumber = Math.min(index + 1, VISIBLE_STEPS.length);
+  // The API's step count (the same seven steps listed below, Ready included).
+  const { step: stepNumber, steps: stepCount } = stepPosition(repo);
 
   return (
     <section className="w-full rounded-2xl border border-line bg-surface p-5 shadow-[var(--shadow-soft)] sm:p-6" aria-labelledby={titleId}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="eyebrow">{repo.refreshing ? 'Refreshing index' : 'Indexing'} · step {stepNumber} of {VISIBLE_STEPS.length}</p>
+          <p className="eyebrow">{repo.refreshing ? 'Refreshing index' : 'Indexing'} · step {stepNumber} of {stepCount}</p>
           <h2 id={titleId} className="mt-1.5 truncate text-lg font-semibold tracking-tight text-ink">{repo.full_name || repo.repo_name}</h2>
           {/* The worker's own words; the Loading State below says what is happening when it has none. */}
           {repo.message && <p className="mt-1 text-sm leading-relaxed text-ink-2">{repo.message}</p>}
@@ -117,19 +117,19 @@ const IngestionProgress = ({ repo, onStop, stopping = false }) => {
 
       <div className="mt-6 grid gap-6 md:grid-cols-[minmax(0,1fr)_15rem]">
         <ol className="relative space-y-0.5" aria-label="Indexing steps">
-          {VISIBLE_STEPS.map((step, stepIndex) => {
+          {STEPS.map((step, stepIndex) => {
             const state = stepIndex < index ? 'done' : stepIndex === index ? 'active' : 'pending';
             const unlocks = stepIndex === KEYWORD_STEP && state !== 'done';
             return (
               <li key={step.id} className={`relative flex items-start gap-3 rounded-xl px-2.5 py-1.5 ${state === 'active' ? 'bg-accent-soft' : ''}`}>
-                {stepIndex < VISIBLE_STEPS.length - 1 && (
+                {stepIndex < STEPS.length - 1 && (
                   <span className={`absolute left-[19px] top-7 h-[calc(100%-1.25rem)] w-px ${state === 'done' ? 'bg-success/50' : 'bg-line'}`} aria-hidden="true" />
                 )}
                 <span className="relative mt-px shrink-0 bg-inherit"><StepIcon state={state} /></span>
                 <span className="min-w-0 flex-1">
                   <span className={`flex flex-wrap items-center gap-x-2 text-[13px] ${state === 'active' ? 'font-semibold text-ink' : state === 'done' ? 'text-ink-2' : 'text-ink-3'}`}>
                     {step.label}
-                    {step.id === 'searchable' && state === 'active' && <span className="font-mono text-[12px] font-normal text-ink-2">{repo.semantic_progress}%</span>}
+                    {step.id === 'searchable' && state === 'active' && <span className="font-mono text-[12px] font-normal text-ink-2">{semanticPercent(repo)}%</span>}
                     {unlocks && <span className="rounded-full bg-surface-2 px-1.5 py-px text-[10.5px] font-medium text-ink-2">Questions unlock after this</span>}
                     <span className="sr-only">{state === 'done' ? '(done)' : state === 'active' ? '(in progress)' : '(waiting)'}</span>
                   </span>
@@ -145,6 +145,7 @@ const IngestionProgress = ({ repo, onStop, stopping = false }) => {
           <ul className="mt-2.5 space-y-2.5">
             <li className="flex gap-2"><MessageSquareText className="mt-0.5 h-3.5 w-3.5 shrink-0 text-accent" aria-hidden="true" /><span>Ask questions as soon as keyword search is ready. This page switches by itself.</span></li>
             <li className="flex gap-2"><DoorOpen className="mt-0.5 h-3.5 w-3.5 shrink-0 text-accent" aria-hidden="true" /><span>Indexing keeps running if you leave this page or close the tab.</span></li>
+            <li className="flex gap-2"><Compass className="mt-0.5 h-3.5 w-3.5 shrink-0 text-accent" aria-hidden="true" /><span>Then open Overview for where to start: the entry file, test command and a reading path.</span></li>
           </ul>
         </aside>
       </div>

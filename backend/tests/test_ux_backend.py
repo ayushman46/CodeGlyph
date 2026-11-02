@@ -629,7 +629,9 @@ class ErrorMessageTests(StoreCase):
             (RuntimeError("unexpected"), 500, "Try again in a moment."),
         )
         for error, status, fragment in cases:
+            # The GitHub existence check is a network call; GitHub says the repository exists.
             with self.subTest(error=error), \
+                    patch.object(ingest_router, "public_repository_exists", new=AsyncMock(return_value=True)), \
                     patch.object(ingest_router, "ingest_request_limiter", limiter), \
                     patch.object(ingest_router, "assert_turso_schema", new=AsyncMock()), \
                     patch.object(ingest_router, "get_turso_store", return_value=self.store), \
@@ -643,6 +645,7 @@ class ErrorMessageTests(StoreCase):
     async def test_ingest_success_says_what_happens_next(self):
         limiter = SimpleNamespace(acquire=AsyncMock(), release=AsyncMock())
         with patch.object(ingest_router, "ingest_request_limiter", limiter), \
+                patch.object(ingest_router, "public_repository_exists", new=AsyncMock(return_value=True)), \
                 patch.object(ingest_router, "assert_turso_schema", new=AsyncMock()), \
                 patch.object(ingest_router, "get_turso_store", return_value=self.store), \
                 patch.object(ingest_router, "enforce_ingestion_capacity", new=AsyncMock()), \

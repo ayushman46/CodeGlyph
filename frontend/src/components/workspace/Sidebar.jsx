@@ -2,7 +2,7 @@ import { AlertTriangle, FolderGit2, RefreshCw } from 'lucide-react';
 import { useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import { formatCount } from '../../lib/format';
-import { overallProgress, phaseLabel, statusSentence } from '../../lib/phase';
+import { overallProgress, phaseLabel, searchableFiles, statusSentence } from '../../lib/phase';
 import useStore from '../../store/useStore';
 import ContextMeter, { bytesLabels } from '../ai/ContextMeter';
 import ProgressBar from '../ui/ProgressBar';
@@ -134,8 +134,8 @@ const Sidebar = ({ onNavigate }) => {
               <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-ink">{repo.repo_name}</span>
               <span className="sr-only">, {statusSentence(repo)}</span>
               {repo.queryable && (
-                <span className="shrink-0 font-mono text-[10.5px] text-ink-3" title={`${formatCount(repo.indexed_files || 0)} indexed files`} aria-hidden="true">
-                  {formatCount(repo.indexed_files || 0)}
+                <span className="shrink-0 font-mono text-[10.5px] text-ink-3" title={`${formatCount(searchableFiles(repo))} searchable files`} aria-hidden="true">
+                  {formatCount(searchableFiles(repo))}
                 </span>
               )}
             </div>

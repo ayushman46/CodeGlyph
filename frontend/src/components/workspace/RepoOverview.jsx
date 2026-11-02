@@ -3,13 +3,14 @@ import { useEffect, useRef, useState } from 'react';
 import { errorMessage, searchRepository } from '../../api/client';
 import { parseRepository } from '../../lib/citations';
 import { formatBytes, formatCount, relativeTime, shortSha } from '../../lib/format';
-import { formatExact } from '../../lib/phase';
+import { formatExact, searchableFiles } from '../../lib/phase';
 import useStore from '../../store/useStore';
 import ContextMeter, { filesLabels } from '../ai/ContextMeter';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
 import ProgressBar from '../ui/ProgressBar';
 import Spinner from '../ui/Spinner';
+import StartHere from './StartHere';
 
 const LANGUAGE_COLORS = ['#e4561b', '#3178c6', '#f1c40f', '#2ea44f', '#8957e5', '#db61a2', '#0ea5e9', '#a3a3a3'];
 const SEARCH_LIMIT = 25;
@@ -217,7 +218,8 @@ const RepoOverview = ({ repo, onAsk, compact = false, onOpenCoverage, onShowOver
   const repository = parseRepository(repo.github_url);
   const commitUrl = repository && repo.commit_sha ? `https://github.com/${repository.fullName}/commit/${repo.commit_sha}` : null;
   const questions = data?.suggested_questions || [];
-  const indexedFiles = repo.indexed_files || data?.total_files;
+  // Files that can be searched now (while indexing too); the folder map counts the same files.
+  const indexedFiles = searchableFiles(repo) || data?.total_files || 0;
   // The selector's per-repository file budget, recorded with the snapshot.
   const fileBudget = Number(selection.selection_budget?.max_files) || 0;
 
@@ -225,7 +227,7 @@ const RepoOverview = ({ repo, onAsk, compact = false, onOpenCoverage, onShowOver
     <div className="space-y-5">
       {compact && (
         <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[12.5px] text-ink-3">
-          <span>{formatCount(repo.indexed_files || data?.total_files)} files indexed</span>
+          <span>{formatCount(indexedFiles)} files indexed</span>
           {languages[0] && <><span aria-hidden="true">·</span><span>mostly {languages[0].language}</span></>}
           {repo.indexed_at && <><span aria-hidden="true">·</span><span>updated {relativeTime(repo.indexed_at)}</span></>}
           {onShowOverview && (
@@ -265,6 +267,8 @@ const RepoOverview = ({ repo, onAsk, compact = false, onOpenCoverage, onShowOver
           </div>
         </div>
       )}
+
+      {!compact && <StartHere data={data?.start_here} loading={overview?.loading && !data} />}
 
       {!compact && repo.queryable && (
         <section aria-labelledby="code-search-title">
