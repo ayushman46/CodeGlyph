@@ -278,7 +278,7 @@ async def find_impacted_tests(store: Any, repo_id: str, files: list[dict], *, li
             [repo_id, *changed],
         )
         has_graph = bool(rows) or bool(await store.fetch_one(
-            "SELECT 1 AS present FROM repo_dependencies WHERE repo_id = ? LIMIT 1", [repo_id]))
+            "SELECT 1 AS present FROM repo_dependencies WHERE repo_id = ? AND source_file != '' LIMIT 1", [repo_id]))
     except Exception:
         logger.debug("Dependency lookup failed", exc_info=True)
         rows, has_graph = [], False

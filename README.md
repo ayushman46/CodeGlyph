@@ -11,7 +11,7 @@ It is built for the first hours in an unfamiliar codebase: new engineers onboard
 - **Exact citations.** Answers stream in real time and cite code as `path/to/file.ts:L42-L118`. Every citation opens the exact lines in a built-in file viewer and links to GitHub at the indexed commit. Sources are grouped by folder.
 - **Accurate retrieval.** File-level semantic search, keyword search with prefix matching and path weighting, path-aware ranking for component questions, the import graph for impact questions, and follow-up awareness for short questions like "where is it called?".
 - **Code editing and pull requests.** Describe a change or paste a GitHub issue URL. The agent plans the change across files (call sites, types, styles, tests, new files when needed), reads the current files from GitHub, writes exact search/replace hunks, validates every hunk against the real file, and shows the result inline in the chat. The review screen has unified and split diffs, in-place editing with a live diff, a prefilled pull request, `.patch` download, and one-click PR creation (a branch in the repository, or a fork when you lack write access). Nothing is pushed without your review.
-- **Exploration tools.** Repository overview (languages, folder map, key files, suggested questions), instant code search, and change-impact analysis.
+- **Exploration tools.** Repository overview (languages, folder map, key files, suggested questions), instant code search, and change-impact analysis: the files that import a file (up to three levels away, each opened at its import line), the affected tests, and the test functions that use a named symbol. It resolves package imports (`import flask`, `src/` layouts, `require('../')`) and is static analysis; nothing is run.
 - **Start here for new engineers.** The overview names the entry file, the core folder, the install / test / run commands and a 3–5 step reading path, each linked to the file and line it comes from. It is built from the indexed manifests, README and imports, with no model call.
 - **Clear first minutes.** A queued repository shows how many are ahead of it and an estimated start (from recent indexing runs); a mistyped `owner/repo` is reported as not found before anything is added.
 - Light and dark themes, a command palette (`⌘K` / `Ctrl+K`), keyboard-first chat, and a responsive layout down to phone width.
@@ -167,7 +167,8 @@ All routes require a Supabase bearer token except health/readiness and the GitHu
 | GET | `/api/repos/{repo}/overview` | Languages, folder map, key files, suggested questions, `start_here` (entry, core folder, cited commands, reading path) |
 | GET | `/api/repos/{repo}/search?q=` | Instant code search |
 | GET | `/api/repos/{repo}/file?path=` | One file at the indexed commit |
-| GET | `/api/repos/{repo}/impact?file_path=` | Files that import a file, and what it imports |
+| GET | `/api/repos/{repo}/impact?file_path=&depth=&symbol=` | Files that import a file (`depth` 1-3), the affected test files, test functions for `symbol`, and what it imports. A path matching several files returns `ambiguous` with `candidates` (`candidates_complete: false` when there are too many to list) |
+| GET | `/api/repos/{repo}/impact/suggestions` | The most imported files (also upgrades an import graph built by an older resolver, from the index) |
 | POST | `/api/repos/{repo}/reindex`, `/api/repos/{repo}/cancel-indexing` | Refresh or stop indexing |
 | PATCH / DELETE | `/api/repos/{repo}` | Rename or delete |
 | POST | `/api/query` | Grounded answer (JSON) |

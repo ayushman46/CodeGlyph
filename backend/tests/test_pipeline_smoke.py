@@ -849,24 +849,45 @@ class BackendSmokeTests(unittest.TestCase):
         self.assertEqual(args[:3], ["repo-1", "auth.py", "%/auth.py"])
 
     def test_repository_impact_endpoint_returns_only_resolved_dependents(self):
+        # A real (temporary) database instead of a mock that replayed the old
+        # query sequence: the endpoint now resolves the path, checks the graph
+        # version and walks the graph level by level.
         from api.repos_router import repository_impact
+        from database import TursoStore, apply_migrations
+        from ingest.pipeline import persist_dependency_manifest
 
-        store = MemoryStore()
-        store.fetch_all = AsyncMock(side_effect=[
-            [{"file_path": "src/auth.py"}],
-            [{"source_file": "src/main.py", "target_file": "src/auth.py", "import_name": "src.auth", "line_number": 4}],
-            [{"id": "caller", "file_path": "src/main.py", "start_line": 1, "end_line": 8}],
-            [{"target_file": "src/session.py"}],
-        ])
-        user = SimpleNamespace(id="user-1")
-        with patch("api.repos_router.assert_turso_schema", new=AsyncMock()), \
-             patch("api.repos_router.get_turso_store", return_value=store), \
-             patch("api.repos_router.owned_repo", new=AsyncMock(return_value={"id": "repo-1"})):
-            response = asyncio.run(repository_impact("demo", "src/auth.py", 20, user))
+        async def scenario(store):
+            await apply_migrations(store)
+            await store.execute(
+                "INSERT INTO repos (id, user_id, repo_name, github_url, status, chunk_count, created_at, updated_at) "
+                "VALUES ('repo-1', 'user-1', 'demo', 'https://github.com/o/demo.git', 'ready', 3, 'now', 'now')", [],
+            )
+            await store.insert_chunks([
+                {"id": f"c-{index}", "repo_id": "repo-1", "file_path": path, "start_line": 1, "end_line": 1,
+                 "language": "py", "symbols": [], "content": "x = 1", "embedding": None}
+                for index, path in enumerate(["src/auth.py", "src/main.py", "src/session.py"])
+            ])
+            await persist_dependency_manifest(store, "repo-1", [
+                {"source_file": "src/main.py", "target_file": "src/auth.py", "import_name": "src.auth", "line_number": 4},
+                {"source_file": "src/auth.py", "target_file": "src/session.py", "import_name": ".session", "line_number": 1},
+                # Not indexed: never reported as a dependent.
+                {"source_file": "scripts/gone.py", "target_file": "src/auth.py", "import_name": "src.auth", "line_number": 2},
+            ])
+            with patch("api.repos_router.assert_turso_schema", new=AsyncMock()), \
+                 patch("api.repos_router.get_turso_store", return_value=store):
+                return await repository_impact("demo", "src/auth.py", 20, SimpleNamespace(id="user-1"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TursoStore(f"file:{Path(tmp) / 'impact.db'}", "local-test-token")
+            try:
+                response = asyncio.run(scenario(store))
+            finally:
+                asyncio.run(store.close())
 
         self.assertEqual(response["target_files"], ["src/auth.py"])
         self.assertEqual(response["dependent_files"], ["src/main.py"])
-        self.assertEqual(response["edges"][0]["line_number"], 4)
+        self.assertEqual([edge["line_number"] for edge in response["edges"] if edge["source_file"] == "src/main.py"], [4])
+        self.assertEqual(response["dependents"][0]["line_number"], 4)
         self.assertEqual(response["imported_files"], ["src/session.py"])
 
     def test_repository_impact_rejects_path_traversal(self):

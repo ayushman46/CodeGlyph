@@ -32,7 +32,7 @@ from ingest.cloner import (
     RepositoryValidationError,
     SourceFetchCancelled,
 )
-from ingest.dependencies import build_manifest_and_dependency_manifest
+from ingest.dependencies import build_manifest_and_dependency_manifest, graph_version_edge
 from ingest.embedder import EmbeddingUnavailableError, embed_chunks
 from ingest.memory import pressure_level, rss_mb, wait_for_memory_headroom
 from ingest.summarizer import build_kt_cache
@@ -998,10 +998,14 @@ async def persist_file_manifest(store, repo_id: str, manifest: dict[str, dict[st
 
 
 async def persist_dependency_manifest(store, repo_id: str, dependencies: list[dict]) -> None:
-    """Replace the small resolved dependency graph after a successful index."""
+    """Replace the small resolved dependency graph after a successful index.
+
+    The version row goes last, so only a completely written graph counts as
+    current (an older or partial one is rebuilt from the index on use).
+    """
     await store.execute("DELETE FROM repo_dependencies WHERE repo_id = ?", [repo_id])
     statements: list[Statement] = []
-    for edge in dependencies:
+    for edge in [*dependencies, graph_version_edge()]:
         statements.append(Statement(
             "INSERT OR IGNORE INTO repo_dependencies (repo_id, source_file, target_file, import_name, line_number) "
             "VALUES (?, ?, ?, ?, ?)",
