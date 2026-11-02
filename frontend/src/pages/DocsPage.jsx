@@ -124,6 +124,7 @@ const SECTIONS = [
         ],
       },
       { type: 'callout', title: 'Long answers and copying', text: 'An answer that reaches the length limit says so; Continue writes the rest into the same message. Copy reply, or Copy section on a heading, copies Markdown with each reference linked to its lines on GitHub at the answer’s commit.' },
+      { type: 'callout', title: 'Name files and code', text: 'Name a file (`httpx/_client.py`) or a symbol (`Client.get`, `res.redirect`) to focus the evidence. A named file is searched for the parts your question is about, not read from the top. Ask which tests cover it, who calls it or what imports it, and those test files, call sites and import lines are included.' },
       { type: 'callout', title: 'Follow-up questions', text: 'Ask follow-ups in the same conversation; its recent messages are kept in context, and other conversations are not.' },
       { type: 'h2', text: 'Saved conversations' },
       { type: 'p', text: 'Each repository keeps as many conversations as you need. New chat starts an empty one and never deletes the one you were in. History, in the chat header, lists your conversations with their titles (the first question, which you can rename), when they were last used and how many messages and proposals they hold. Opening one shows all its messages, and its proposals still open for review. The open conversation is in the page link, so a reload brings you back to it.' },
