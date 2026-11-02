@@ -144,3 +144,15 @@ const INTERRUPTION_NOTE = /\n+> The answer was interrupted\.[^\n]*\s*$/;
  * @param {string} markdown
  */
 export const withoutInterruptionNote = (markdown) => String(markdown || '').replace(INTERRUPTION_NOTE, '');
+
+/**
+ * Paths an answer names that do not exist in the indexed code (the reference
+ * check's `not_in_index`), once each. The answer's prose still states them
+ * as fact, so the chat warns before the answer, not only in its footer.
+ *
+ * @param {Array<{text?: string, reason?: string}>} answerReferences
+ * @returns {string[]}
+ */
+export const unbackedPaths = (answerReferences) => [...new Set((Array.isArray(answerReferences) ? answerReferences : [])
+  .filter((item) => item?.reason === 'not_in_index' && item.text)
+  .map((item) => String(item.text).replace(/:L?\d+(?:[-–]L?\d+)?$/, '')))];

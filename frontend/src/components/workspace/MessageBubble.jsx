@@ -8,7 +8,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { errorMessage, searchRepository } from '../../api/client';
 import { citationsToSources, shouldPaceReply } from '../../lib/ai/streamingText';
-import { absenceTerms, markdownSection, searchName, splitSearchMatches, withoutInterruptionNote } from '../../lib/answerText';
+import { absenceTerms, markdownSection, searchName, splitSearchMatches, unbackedPaths, withoutInterruptionNote } from '../../lib/answerText';
 import {
   answerLinkTarget, basename, citationExcerpt, compactPath, formatLines, groupByDirectory, markdownWithPermalinks,
   matchCitation, normaliseCitationMarkdown, referenceReasonLabel, resolveReference, summariseReferences,
@@ -853,6 +853,9 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
     ? absenceTerms(message.content || '', 6).filter((term) => !flaggedNames.has(term)).slice(0, 3)
     : [];
   const showCheck = settled && !isError;
+  // Files the answer names that do not exist in the index: its prose states
+  // them as fact, so say so before the answer, not only in the footer.
+  const invented = showCheck && modelAnswers ? unbackedPaths(message.answer_references) : [];
 
   return (
     <div data-slot="message" data-from="assistant" className={`flex gap-3 ${entering ? 'animate-rise' : ''}`}>
@@ -878,6 +881,18 @@ const MessageBubble = ({ message, repo, onRegenerate, isLast, onAsk, onRevealCha
         {message.answer_notice?.message && settled && message.mode !== 'retrieval_fallback' && (
           <Notice tone="neutral" icon={Info} title={`Written by the ${PROFILE_NAMES[message.answer_notice.model_profile] || 'other'} model`}>
             {message.answer_notice.message}
+          </Notice>
+        )}
+
+        {invented.length > 0 && (
+          <Notice
+            tone="warning"
+            title={invented.length === 1 ? 'This answer names a file that is not in the indexed code' : `This answer names ${invented.length} files that are not in the indexed code`}
+          >
+            {invented.slice(0, 4).map((path, index) => (
+              <span key={path}>{index ? ', ' : ''}<code className="font-mono text-[12px]">{path}</code></span>
+            ))}
+            {invented.length > 4 ? ` and ${invented.length - 4} more` : ''}. What it says about {invented.length === 1 ? 'that file' : 'them'} is not backed by the repository; check those parts in the code before relying on them.
           </Notice>
         )}
 

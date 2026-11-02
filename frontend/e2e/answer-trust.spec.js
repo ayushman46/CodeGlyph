@@ -133,6 +133,11 @@ test('code names and references the index does not back are flagged with the act
   await expect(check.getByRole('button', { name: 'test/view.js' })).toBeVisible();
   await expect(check.locator('li', { hasText: 'lib/gone.js:L3' })).toContainText('not in the indexed snapshot');
   await expect(check.locator('li', { hasText: 'package.json:L92-L98' })).not.toContainText('not in the indexed snapshot');
+  // A file that is not in the index is called out before the answer, not only in the footer (round 2).
+  const warning = page.getByText('This answer names a file that is not in the indexed code');
+  await expect(warning).toBeVisible();
+  await expect(warning.locator('..')).toContainText('lib/gone.js');
+  await expect(warning.locator('..')).not.toContainText('view.js');
 
   // The out-of-evidence reference is still a link to the indexed file.
   await prose.getByRole('button', { name: /package\.json:92–98 \(exists in the index but was not part of this answer’s evidence\)/ }).click();

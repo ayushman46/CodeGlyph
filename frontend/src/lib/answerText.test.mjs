@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { absenceTerms, markdownSection, searchName, splitSearchMatches, withoutInterruptionNote } from './answerText.js';
+import { absenceTerms, markdownSection, searchName, splitSearchMatches, unbackedPaths, withoutInterruptionNote } from './answerText.js';
 
 const ANSWER = [
   '## Direct answer',
@@ -103,4 +103,16 @@ test('searchName checks a dotted or qualified code name by its last part', () =>
   assert.equal(searchName('std::vector'), 'vector');
   assert.equal(searchName('  _set_timeout '), '_set_timeout');
   assert.equal(searchName(''), '');
+});
+
+test('unbackedPaths lists each file the answer names that is not in the index (round 2)', () => {
+  const references = [
+    { text: 'lib/router.js', reason: 'not_in_index' },
+    { text: 'lib/router.js:L10-L20', reason: 'not_in_index' },
+    { text: 'lib/static.js:12', reason: 'not_in_index' },
+    { text: 'index.js', reason: 'ambiguous' },
+    { text: 'lib/response.js:L1-L9', valid: true, reason: null },
+  ];
+  assert.deepEqual(unbackedPaths(references), ['lib/router.js', 'lib/static.js']);
+  assert.deepEqual(unbackedPaths(undefined), []);
 });
