@@ -205,6 +205,12 @@ export const listRepositoryFiles = (repo_name, params = {}, config = {}) => api.
 export const searchRepositorySymbols = (repo_name, q, config = {}) => api.get(
   `/repos/${encodeURIComponent(repo_name)}/symbols`, { params: { q, limit: 12 }, ...config },
 );
+/**
+ * Write the rest of a stored answer that stopped at the output limit
+ * (`payload.continue_from` is its stored id). JSON fallback for streamQuery,
+ * which sends the same payload to /query/stream.
+ */
+export const continueAnswerRequest = (payload, config = {}) => api.post('/query', payload, { timeout: 300000, ...config });
 
 export default api;
 

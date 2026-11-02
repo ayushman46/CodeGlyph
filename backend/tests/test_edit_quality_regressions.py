@@ -26,7 +26,7 @@ from openai import APIStatusError, APITimeoutError
 
 from agent import conventions as repo_conventions
 from agent import nemotron
-from agent.agent import run_agent_loop, stream_agent_answer
+from agent.agent import ModelSwitch, run_agent_loop, stream_agent_answer
 from agent.nemotron import ANSWER_RESTART, AnswerRestart, LLMProviderError, StreamingContentFilter, strip_reasoning, user_facing_content
 from agent.quality import changed_string_literals
 from agent.review import evidence_snippets, locate_evidence, redundant_guard
@@ -749,7 +749,12 @@ class AlternateChatModelTests(unittest.TestCase):
 
         with patch("agent.agent.stream_complete", fake_stream):
             parts = asyncio.run(collect())
-        self.assertEqual(parts, ["From the detailed model."])
+        # The switch is announced (an empty marker naming the model that
+        # answers and the failure), so the chat can say which model wrote it.
+        self.assertIsInstance(parts[0], ModelSwitch)
+        self.assertEqual((parts[0], parts[0].profile), ("", "detailed"))
+        self.assertEqual(parts[0].error.__cause__.status_code, 503)
+        self.assertEqual(parts[1:], ["From the detailed model."])
         self.assertEqual(calls, ["nvidia/fast", "nvidia/detailed"])
 
     def test_an_interrupted_stream_is_not_restarted_on_another_model(self):

@@ -34,12 +34,20 @@ class Settings(BaseSettings):
     # Preserve a few embedding slots for interactive questions while a large
     # repository is being indexed in the background.
     query_embedding_reserve_per_minute: int = 8
-    # Answers are source-grounded and streamed, so a slightly larger budget
-    # gives complete explanations without making the first token slower.
+    # Answers are source-grounded and streamed, so a larger budget gives
+    # complete explanations without making the first token slower. At 1,400
+    # (Fast) and 3,000 (Detailed) walk-through answers were cut off
+    # mid-sentence; the prompt also asks for a matching word budget, and an
+    # answer that still reaches the limit is marked incomplete and can be
+    # continued.
     nvidia_enable_thinking: bool = False
-    answer_max_tokens: int = 1_400
-    detailed_nvidia_enable_thinking: bool = True
-    detailed_answer_max_tokens: int = 3_000
+    answer_max_tokens: int = 2_400
+    # Thinking stays off for Detailed answers too: Nemotron Ultra wrote its
+    # reasoning, untagged, into the answer text (shown to the user as the
+    # reply, or rejected as planning so the question fell back to evidence)
+    # and spent most of the output budget on it, taking 75-90 s.
+    detailed_nvidia_enable_thinking: bool = False
+    detailed_answer_max_tokens: int = 4_096
     code_editing_enable_thinking: bool = False
     # Multi-file patches are JSON with exact search/replace hunks. A small
     # output budget truncates the JSON and makes every non-trivial edit fail

@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  compactPath, githubBlobUrl, groupByDirectory, looksLikePath, matchCitation, normaliseCitationMarkdown, parseReference, parseRepository,
-  resolveReference,
+  answerLinkTarget, commitFromCitations, compactPath, githubBlobUrl, groupByDirectory, looksLikePath, markdownWithPermalinks,
+  matchCitation, normaliseCitationMarkdown, parseReference, parseRepository, referenceReasonLabel, resolveReference,
+  summariseReferences,
 } from './citations.js';
 
 test('looksLikePath accepts repository paths and rejects prose', () => {
@@ -135,4 +136,75 @@ test('compactPath keeps the trailing folders that tell same-named files apart (F
   assert.equal(compactPath('packages/app-store/googlecalendar/lib/CalendarService.ts', 36), '…/lib/CalendarService.ts');
   assert.equal(compactPath('packages/app-store/googlecalendar/lib/CalendarService.ts', 44), '…/googlecalendar/lib/CalendarService.ts');
   assert.equal(compactPath('packages/app-store/office365calendar/lib', 30), '…/office365calendar/lib');
+});
+
+test('unverified references carry what is actually wrong (BUG-07)', () => {
+  const answerReferences = [
+    { text: 'package.json:L92-L98', file_path: 'package.json', start_line: 92, end_line: 98, valid: false, reason: 'range_outside_evidence' },
+    { text: 'view.js', file_path: null, start_line: null, end_line: null, valid: false, reason: 'ambiguous', candidates: ['lib/view.js', 'test/view.js'] },
+    { text: 'lib/gone.js:L3', file_path: null, start_line: 3, end_line: 3, valid: false, reason: 'not_in_index' },
+    { text: 'package.json:L140', file_path: 'package.json', start_line: 140, end_line: 140, valid: false, reason: 'lines_outside_file', file_lines: 99 },
+    { text: 'lib/router.js:L1-L2', file_path: 'lib/router.js', start_line: 1, end_line: 2, valid: true },
+  ];
+  assert.deepEqual(resolveReference('package.json:L92-L98', { answerReferences }), {
+    status: 'outside_evidence', reference: { path: 'package.json', start: 92, end: 98 },
+    reason: 'range_outside_evidence', label: 'exists in the index but was not part of this answer’s evidence',
+  });
+  const ambiguous = resolveReference('view.js', { answerReferences });
+  assert.equal(ambiguous.status, 'unverified');
+  assert.equal(ambiguous.label, 'matches several files');
+  assert.deepEqual(ambiguous.candidates, ['lib/view.js', 'test/view.js']);
+  assert.equal(resolveReference('lib/gone.js:L3', { answerReferences }).label, 'not in the indexed snapshot');
+  assert.equal(resolveReference('package.json:L140', { answerReferences }).label, 'the file exists but has only 99 lines');
+  assert.equal(referenceReasonLabel({ reason: 'lookup_failed' }), 'could not be checked: the index lookup failed');
+  assert.deepEqual(summariseReferences(answerReferences), {
+    total: 5, verified: 1, unverified: 4, repaired: 0, inIndex: 2,
+    byReason: { range_outside_evidence: 1, ambiguous: 1, not_in_index: 1, lines_outside_file: 1 },
+  });
+});
+
+test('copied answers link every resolvable reference to its commit-pinned GitHub lines (FEAT-09)', () => {
+  const sha = '3c7baaa0e6bd31ebbd3f2b0f0f7ec6c2a1b2c3d4';
+  const answerReferences = [
+    { text: 'src/requests/models.py:L245', file_path: 'src/requests/models.py', start_line: 245, end_line: 245, valid: true },
+    { text: 'models.py:L576-L652', file_path: 'src/requests/models.py', start_line: 576, end_line: 652, valid: true },
+    { text: 'src/requests/utils.py:L900-L910', file_path: 'src/requests/utils.py', start_line: 900, end_line: 910, valid: false, reason: 'range_outside_evidence' },
+    { text: 'src/requests/ghost.py:L1', file_path: null, start_line: 1, end_line: 1, valid: false, reason: 'not_in_index' },
+  ];
+  const markdown = [
+    '## Draft GitHub comment',
+    'The crash starts in `src/requests/models.py:L245` (see also `models.py:L576-L652`),',
+    'then `src/requests/utils.py:L900-L910`; `src/requests/ghost.py:L1` and `to_native_string` are not linked.',
+    '```py',
+    'path = "src/requests/models.py:L245"',
+    '```',
+  ].join('\n');
+  const copied = markdownWithPermalinks(markdown, { githubUrl: 'https://github.com/psf/requests.git', commit: sha, answerReferences });
+  const base = `https://github.com/psf/requests/blob/${sha}`;
+  assert.ok(copied.includes(`[\`src/requests/models.py:L245\`](${base}/src/requests/models.py#L245)`));
+  assert.ok(copied.includes(`[\`models.py:L576-L652\`](${base}/src/requests/models.py#L576-L652)`));
+  assert.ok(copied.includes(`[\`src/requests/utils.py:L900-L910\`](${base}/src/requests/utils.py#L900-L910)`));
+  // Not in the index: no link to a file that does not exist; names and code blocks stay as they were.
+  assert.ok(copied.includes('`src/requests/ghost.py:L1`') && !copied.includes('ghost.py#L1'));
+  assert.ok(copied.includes('`to_native_string`'));
+  assert.ok(copied.includes('path = "src/requests/models.py:L245"'));
+  // Running it twice changes nothing.
+  assert.equal(markdownWithPermalinks(copied, { githubUrl: 'https://github.com/psf/requests', commit: sha, answerReferences }), copied);
+  // Without a repository or commit the Markdown is returned unlinked.
+  assert.ok(!markdownWithPermalinks(markdown, { answerReferences }).includes('https://'));
+  // Older answers without server checks link only references among their sources.
+  const citations = [{ file_path: 'src/requests/models.py', start_line: 240, end_line: 260, github_url: `${base}/src/requests/models.py#L240-L260` }];
+  const legacy = markdownWithPermalinks('See `models.py:L245` and `other/file.py:L3`.', { githubUrl: 'https://github.com/psf/requests', commit: sha, citations });
+  assert.equal(legacy, `See [\`models.py:L245\`](${base}/src/requests/models.py#L245) and \`other/file.py:L3\`.`);
+});
+
+test('the link target is the commit the answer was written against', () => {
+  const citations = [{ github_url: 'https://github.com/psf/requests/blob/abc1234def/src/a.py#L1-L2' }];
+  assert.equal(commitFromCitations(citations), 'abc1234def');
+  assert.equal(commitFromCitations([{ github_url: null }]), null);
+  const repo = { github_url: 'https://github.com/psf/requests.git', commit_sha: 'beef999' };
+  assert.deepEqual(answerLinkTarget({ citations }, repo), { githubUrl: repo.github_url, commit: 'abc1234def' });
+  assert.deepEqual(answerLinkTarget({ snapshot: { commit_sha: 'cafe123', github_url: repo.github_url } }, repo), { githubUrl: repo.github_url, commit: 'cafe123' });
+  assert.deepEqual(answerLinkTarget({}, repo), { githubUrl: repo.github_url, commit: 'beef999' });
+  assert.equal(answerLinkTarget({}, { github_url: 'not github' }), null);
 });

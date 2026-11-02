@@ -17,10 +17,20 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from agent.agent import run_agent_loop, stream_agent_answer
+from agent.agent import ModelSwitch, run_agent_loop, stream_agent_answer, stream_answer_continuation
 from agent.code_edit import create_edit_ticket, edit_file_paths
 from agent.editor import EditRequest, run_code_edit
-from agent.nemotron import AnswerRestart, LLMProviderError
+from agent.nemotron import AnswerRestart, LLMProviderError, TruncatedAnswer
+from api.answer_trust import (
+    annotate_history_names,
+    answer_check_entry,
+    continuation_base,
+    describe_answer_failure,
+    describe_model_switch,
+    find_unverified_identifiers,
+    join_continuation,
+    restore_answer_check,
+)
 from api.auth import get_current_user
 from api.repository_state import fetch_owned_repository
 from config import ModelConfigurationError, get_editing_ticket_secret, query_request_limiter, settings
@@ -84,6 +94,9 @@ class QueryRequest(BaseModel):
     question: str = Field(min_length=1, max_length=8_000)
     model_profile: Literal["fast", "detailed", "code"] = "fast"
     workflow: Literal["general", "onboarding", "security", "architecture", "contributor", "due_diligence", "editing"] = "general"
+    # The stored id of an answer that stopped at the output limit: write the
+    # rest of that answer instead of answering ``question`` again.
+    continue_from: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 def timestamp() -> str:
@@ -246,10 +259,12 @@ def build_context(chunks: list[dict], *, max_characters: int | None = None) -> s
     return build_context_with_coverage(chunks, max_characters=max_characters)[0]
 
 
-def build_retrieval_fallback(chunks: list[dict], workflow: str = "general") -> str:
+def build_retrieval_fallback(chunks: list[dict], workflow: str = "general", reason: str | None = None) -> str:
+    """The evidence-only reply when no model could write an answer; ``reason`` says why."""
     lines = [
         "## Retrieved code context",
-        "Live answer generation is temporarily unavailable. The most relevant repository evidence is below.",
+        f"No answer was written. {reason} The most relevant repository evidence is below."
+        if reason else "Live answer generation is temporarily unavailable. The most relevant repository evidence is below.",
         "",
         "## Relevant files",
     ]
@@ -566,6 +581,28 @@ async def _indexed_paths_for(store, repo_id: str, reference_paths: list[str]) ->
     return {path: _suffix_matches(found, path) for path in wanted}
 
 
+async def _indexed_line_counts(store, repo_id: str, paths: list[str]) -> dict[str, int]:
+    """The last indexed line of each file (one grouped query); {} when unavailable."""
+    wanted = list(dict.fromkeys(path for path in paths if path))[:40]
+    if not wanted or not repo_id:
+        return {}
+    try:
+        rows = await store.fetch_all(
+            f"SELECT file_path, MAX(end_line) AS last_line FROM chunks WHERE repo_id = ? "
+            f"AND file_path IN ({', '.join('?' for _ in wanted)}) GROUP BY file_path",
+            [repo_id, *wanted],
+        )
+    except Exception as error:
+        logger.debug("Reference line lookup unavailable (%s)", type(error).__name__)
+        return {}
+    counts = {}
+    for row in rows or []:
+        if isinstance(row, dict) and row.get("file_path"):
+            with suppress(TypeError, ValueError):
+                counts[str(row["file_path"])] = int(row.get("last_line") or 0)
+    return counts
+
+
 async def validate_answer_references(
     store,
     repo_id: str | None,
@@ -583,6 +620,12 @@ async def validate_answer_references(
 
     Returns the (possibly repaired) answer and the ``answer_references``
     list: ``{text, file_path, start_line, end_line, valid, reason, repaired}``.
+    ``reason`` says why a reference is not valid, so the chat can say what is
+    actually wrong: "range_outside_evidence" (the file is indexed and
+    ``file_path`` is set, but the lines were not in this answer's evidence),
+    "lines_outside_file" (the file has only ``file_lines`` lines),
+    "ambiguous" (``candidates`` lists the files the name matches),
+    "not_in_index", or "lookup_failed".
     """
     references = extract_answer_references(answer)
     if not references:
@@ -603,6 +646,7 @@ async def validate_answer_references(
     for reference in references:
         path, start, end = reference["path"], reference["start"], reference["end"]
         resolved, reason, repaired = None, None, False
+        ambiguous_files: list[str] = []
         matches = reference.pop("_evidence_matches")
         exact = [item for item in matches if item.lower() == path.lower()]
         candidates = exact or matches
@@ -614,13 +658,15 @@ async def validate_answer_references(
         if len(candidates) == 1:
             resolved = candidates[0]
         elif len(candidates) > 1:
-            reason = "ambiguous"
+            reason, ambiguous_files = "ambiguous", candidates
         else:
             in_index = (indexed or {}).get(path) if indexed is not None else None
-            if in_index and len(in_index) == 1:
-                resolved = in_index[0]
+            # `index.js` is the root index.js even when examples/*/index.js exist.
+            exact_in_index = [item for item in in_index or [] if item.lower() == path.lower()]
+            if in_index and (len(in_index) == 1 or len(exact_in_index) == 1):
+                resolved = exact_in_index[0] if exact_in_index else in_index[0]
             elif in_index and len(in_index) > 1:
-                reason = "ambiguous"
+                reason, ambiguous_files = "ambiguous", in_index
             else:
                 # Re-anchor a wrong folder: the same file name (and range) in
                 # exactly one evidence file.
@@ -642,7 +688,7 @@ async def validate_answer_references(
             new_text = text.replace(path, resolved, 1)
             replacements.append((reference["span"], new_text))
             text = new_text
-        results.append({
+        result = {
             "text": text,
             "file_path": resolved,
             "start_line": start,
@@ -650,7 +696,22 @@ async def validate_answer_references(
             "valid": bool(valid),
             "reason": reason,
             "repaired": bool(repaired and valid),
-        })
+        }
+        if ambiguous_files:
+            # Shallowest first: the files a reader most likely meant.
+            ranked = sorted(dict.fromkeys(ambiguous_files), key=lambda item: (item.count("/"), item))
+            result["candidates"], result["candidate_count"] = ranked[:8], len(ranked)
+        results.append(result)
+    # An indexed file referenced outside the evidence: lines past its end do
+    # not exist at all (`index.js:L1-L99` for an 11-line file), which is a
+    # different problem from lines that exist but were not shown.
+    outside = [item for item in results if item["reason"] == "range_outside_evidence" and item["file_path"]]
+    if outside and repo_id:
+        line_counts = await _indexed_line_counts(store, repo_id, [item["file_path"] for item in outside])
+        for item in outside:
+            last_line = line_counts.get(item["file_path"])
+            if last_line and item["start_line"] and (item["end_line"] or item["start_line"]) > last_line:
+                item["reason"], item["file_lines"] = "lines_outside_file", last_line
     if replacements:
         pieces, cursor = [], 0
         for (span_start, span_end), new_text in sorted(replacements, key=lambda item: item[0][0]):
@@ -692,13 +753,16 @@ def rank_citations_by_answer(answer: str, citations: list[dict], references: lis
 
 async def save_message(store, *, repo_id: str, user_id: str, role: str, content: str,
                        citations: list | None = None, tool_calls: list | None = None,
-                       mode: str | None = None, latency_ms: int | None = None) -> None:
+                       mode: str | None = None, latency_ms: int | None = None, message_id: str | None = None) -> str:
+    """Store one chat message and return its id."""
+    message_id = message_id or str(uuid4())
     executor = getattr(store, "execute_idempotent", store.execute)
     await executor(
         "INSERT INTO chat_messages (id, repo_id, user_id, role, content, citations, tool_calls, mode, latency_ms, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
-        [str(uuid4()), repo_id, user_id, role, content, json.dumps(citations or []), json.dumps(tool_calls or []), mode, latency_ms, timestamp()],
+        [message_id, repo_id, user_id, role, content, json.dumps(citations or []), json.dumps(tool_calls or []), mode, latency_ms, timestamp()],
     )
+    return message_id
 
 
 def _compact_proposal(proposal: dict, max_bytes: int = 3_000_000) -> str:
@@ -769,6 +833,10 @@ async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool) -
     started = time.time()
     repo_name = str(getattr(req, "repo_name"))
     _check_answerable(repo, req)
+    if getattr(req, "continue_from", None):
+        async for event in continue_answer_events(store, repo, req, user_id, stream=stream):
+            yield event
+        return
     question = str(getattr(req, "question", "")).strip()
     workflow = getattr(req, "workflow", "general") or "general"
     model_profile = getattr(req, "model_profile", "fast") or "fast"
@@ -779,6 +847,11 @@ async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool) -
     tool_calls: list[dict] = []
     citations: list[dict] = []
     answer_references: list[dict] = []
+    unverified_identifiers: list[dict] = []
+    # Stopped at the output limit; why no model answered; which model did.
+    truncated = False
+    answer_failure: dict | None = None
+    answer_notice: dict | None = None
     mode = "rag"
 
     if is_greeting(question):
@@ -805,6 +878,8 @@ async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool) -
             # History improves continuity but is not required to answer.
             logger.warning("Conversation history unavailable for repository %s: %s", repo["id"], type(error).__name__)
             history = []
+        if workflow != "editing":
+            await annotate_history_names(store, repo["id"], history)
         retrieval_query, boost_paths = build_retrieval_query(question, history)
         yield "stage", {"stage": "retrieving", "detail": "Searching the indexed code"}
         chunks = await retrieve_context(
@@ -909,16 +984,30 @@ async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool) -
                                 parts.clear()
                                 yield "reset", {}
                                 continue
+                            if isinstance(text, TruncatedAnswer):
+                                truncated = True
+                                continue
+                            if isinstance(text, ModelSwitch):
+                                answer_notice = describe_model_switch(text, effective_model_profile)
+                                continue
                             parts.append(text)
                             yield "token", {"text": text}
                         answer = "".join(parts)
-                    except (LLMProviderError, ModelConfigurationError):
+                    except (LLMProviderError, ModelConfigurationError) as error:
+                        answer_failure = describe_answer_failure(error, effective_model_profile)
                         if parts:
-                            answer = "".join(parts) + "\n\n> The answer was interrupted. Ask again to regenerate it."
+                            # Named here too, for API clients and copied text;
+                            # the chat shows answer_failure as a notice instead.
+                            answer = "".join(parts) + (
+                                f"\n\n> The answer was interrupted. {answer_failure['message']} Ask again to regenerate it."
+                            )
                             mode = "partial"
                         else:
-                            logger.warning("Live answer generation unavailable for repository %s; returning evidence", repo["id"])
-                            answer, mode = build_retrieval_fallback(citation_chunks, workflow), "retrieval_fallback"
+                            # The other model failed too: nothing was written by it.
+                            answer_notice = None
+                            logger.warning("Live answer generation unavailable for repository %s (%s); returning evidence",
+                                           repo["id"], answer_failure["reason"])
+                            answer, mode = build_retrieval_fallback(citation_chunks, workflow, answer_failure["message"]), "retrieval_fallback"
                 else:
                     try:
                         result = await run_agent_loop(
@@ -926,9 +1015,14 @@ async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool) -
                             workflow=workflow, evidence_plan=evidence_plan, repo_map_text=repo_map_text,
                         )
                         answer, tool_calls = result[0], list(result[1] or [])
-                    except (LLMProviderError, ModelConfigurationError):
-                        logger.warning("Live answer generation unavailable for repository %s; returning evidence", repo["id"])
-                        answer, tool_calls, mode = build_retrieval_fallback(citation_chunks, workflow), [], "retrieval_fallback"
+                        truncated = isinstance(answer, TruncatedAnswer)
+                    except (LLMProviderError, ModelConfigurationError) as error:
+                        answer_failure = describe_answer_failure(error, effective_model_profile)
+                        logger.warning("Live answer generation unavailable for repository %s (%s); returning evidence",
+                                       repo["id"], answer_failure["reason"])
+                        answer, tool_calls, mode = (
+                            build_retrieval_fallback(citation_chunks, workflow, answer_failure["message"]), [], "retrieval_fallback",
+                        )
             # Verify every file/line reference in the answer against the
             # evidence the model was given; repair a wrong folder when the
             # file name and range identify one evidence file.
@@ -942,33 +1036,177 @@ async def answer_events(store, repo: dict, req, user_id: str, *, stream: bool) -
             except Exception:
                 logger.warning("Answer reference validation failed", exc_info=True)
                 answer_references = []
-            if answer_references:
+            if workflow != "editing" and mode in {"rag", "partial"}:
+                # A model-written answer: every backticked code name must
+                # exist somewhere in the indexed code.
+                try:
+                    unverified_identifiers = await find_unverified_identifiers(
+                        store, repo.get("id"), answer, evidence_for_check,
+                    )
+                except Exception:
+                    logger.warning("Answer identifier check failed", exc_info=True)
+                    unverified_identifiers = []
+            if answer_references or unverified_identifiers:
                 invalid = [item for item in answer_references if not item["valid"]]
                 evidence_plan["reference_check"] = {
                     "checked": len(answer_references), "unverified": len(invalid),
                     "repaired": sum(1 for item in answer_references if item.get("repaired")),
+                    "identifiers_not_found": len(unverified_identifiers),
                 }
             if region_citations:
                 # An edit cites the lines its hunks change.
                 citations = region_citations
             else:
                 citations = rank_citations_by_answer(answer, citations, answer_references)
+            if truncated and mode == "rag":
+                # Stored as incomplete until the rest is written (Continue).
+                mode = "truncated"
 
     latency_ms = int((time.time() - started) * 1000)
+    stored_tool_calls = tool_calls
+    if workflow != "editing":
+        check = answer_check_entry(
+            answer_references=answer_references, unverified_identifiers=unverified_identifiers,
+            answer_failure=answer_failure, answer_notice=answer_notice,
+        )
+        stored_tool_calls = [*tool_calls, check] if check else tool_calls
+    message_id: str | None = None
     try:
         await save_message(store, repo_id=repo["id"], user_id=user_id, role="user", content=question)
-        await save_message(
+        message_id = await save_message(
             store, repo_id=repo["id"], user_id=user_id, role="assistant", content=answer,
-            citations=citations, tool_calls=tool_calls, mode=mode, latency_ms=latency_ms,
+            citations=citations, tool_calls=stored_tool_calls, mode=mode, latency_ms=latency_ms,
         )
     except Exception:
         # Chat history is durable telemetry, not a prerequisite for the answer.
         logger.warning("Could not persist chat history for repository %s", repo["id"], exc_info=True)
+        message_id = None
     yield "done", {
         "answer": answer, "mode": mode, "citations": citations, "tool_calls": tool_calls,
         "latency_ms": latency_ms, "tokens_used": 0, "model_profile": effective_model_profile,
         "workflow": workflow, "evidence_plan": evidence_plan, "answer_references": answer_references,
+        "unverified_identifiers": unverified_identifiers, "truncated": mode == "truncated",
+        "answer_failure": answer_failure, "answer_notice": answer_notice, "message_id": message_id,
         "edit_suggestion": edit_suggestion, "edit_ticket": edit_ticket,
+        "snapshot": {"commit_sha": repo.get("commit_sha"), "github_url": repo.get("github_url")},
+    }
+
+
+async def continue_answer_events(store, repo: dict, req, user_id: str, *, stream: bool) -> AsyncIterator[tuple[str, dict]]:
+    """Write the rest of a stored answer that stopped at the output limit.
+
+    The model gets the original question, the evidence stored with the answer
+    (its citations hold exactly the lines the model was shown) and the answer
+    so far, cut back to its last complete sentence. The joined answer is
+    checked like a new one and replaces the stored message, which stays
+    marked "truncated" only if the continuation reached the limit too.
+    Events: stage, ``continue`` (the kept text, which the client shows in
+    place of the cut-off answer), token, done; a failure leaves the stored
+    answer unchanged.
+    """
+    started = time.time()
+    message_id = str(getattr(req, "continue_from") or "")
+    model_profile = getattr(req, "model_profile", "fast") or "fast"
+    workflow = getattr(req, "workflow", "general") or "general"
+    if workflow == "editing" or model_profile == "code":
+        raise HTTPException(status_code=422, detail="Only answers to questions can be continued.")
+    row = await store.fetch_one(
+        "SELECT id, role, content, citations, tool_calls, mode, created_at FROM chat_messages "
+        "WHERE id = ? AND repo_id = ? AND user_id = ?",
+        [message_id, repo["id"], user_id],
+    )
+    if not row or row.get("role") != "assistant":
+        raise HTTPException(status_code=404, detail="That answer is not in this conversation any more.")
+    if row.get("mode") != "truncated":
+        raise HTTPException(status_code=409, detail="That answer is already complete.")
+    stored_citations = [item for item in row.get("citations") or [] if isinstance(item, dict)]
+    evidence = [
+        {**item, "_retrieval_reasons": item.get("retrieval_reasons") or []}
+        for item in stored_citations if item.get("file_path") and isinstance(item.get("content"), str)
+    ]
+    if not evidence:
+        raise HTTPException(status_code=409, detail="The evidence for that answer is no longer stored. Ask the question again.")
+    question_row = await store.fetch_one(
+        "SELECT content FROM chat_messages WHERE repo_id = ? AND user_id = ? AND role = 'user' AND created_at <= ? "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        [repo["id"], user_id, row.get("created_at") or ""],
+    )
+    question = str((question_row or {}).get("content") or getattr(req, "question", "")).strip()
+    evidence_plan = build_evidence_plan(question, workflow)
+    context, shown = build_context_with_coverage(evidence)
+    try:
+        repo_map_text = (await build_repo_map(store, repo["id"])).get("text", "")
+    except Exception:
+        logger.debug("Repository map unavailable", exc_info=True)
+        repo_map_text = ""
+    base = continuation_base(str(row.get("content") or ""))
+    yield "stage", {"stage": "generating", "detail": "Writing the rest of the answer"}
+    yield "continue", {"base": base, "message_id": message_id}
+    parts: list[str] = []
+    truncated = False
+    try:
+        async for text in stream_answer_continuation(
+            question, context, base, model_profile, workflow, evidence_plan, repo_map_text,
+        ):
+            if isinstance(text, AnswerRestart):
+                parts.clear()
+                if stream:
+                    yield "continue", {"base": base, "message_id": message_id}
+                continue
+            if isinstance(text, TruncatedAnswer):
+                truncated = True
+                continue
+            parts.append(text)
+            if stream:
+                yield "token", {"text": text}
+    except (LLMProviderError, ModelConfigurationError) as error:
+        failure = describe_answer_failure(error, model_profile)
+        logger.warning("Answer continuation failed for repository %s (%s)", repo["id"], failure["reason"])
+        raise HTTPException(
+            status_code=503, detail=f"The rest of the answer could not be written. {failure['message']} The answer so far is unchanged.",
+        ) from error
+    addition = "".join(parts)
+    if not addition.strip():
+        raise HTTPException(status_code=503, detail="The model returned nothing more to add. The answer so far is unchanged.")
+    answer = join_continuation(base, addition)
+    try:
+        answer, answer_references = await validate_answer_references(store, repo["id"], answer, shown)
+    except Exception:
+        logger.warning("Answer reference validation failed", exc_info=True)
+        answer_references = []
+    try:
+        unverified_identifiers = await find_unverified_identifiers(store, repo["id"], answer, shown)
+    except Exception:
+        logger.warning("Answer identifier check failed", exc_info=True)
+        unverified_identifiers = []
+    citations = rank_citations_by_answer(answer, [dict(item) for item in stored_citations], answer_references)
+    mode = "truncated" if truncated else "rag"
+    previous = restore_answer_check({"tool_calls": row.get("tool_calls") or []})
+    answer_notice = previous.get("answer_notice")
+    check = answer_check_entry(
+        answer_references=answer_references, unverified_identifiers=unverified_identifiers, answer_notice=answer_notice,
+    )
+    evidence_plan["reference_check"] = {
+        "checked": len(answer_references), "unverified": sum(1 for item in answer_references if not item["valid"]),
+        "repaired": sum(1 for item in answer_references if item.get("repaired")),
+        "identifiers_not_found": len(unverified_identifiers),
+    }
+    try:
+        await store.execute(
+            "UPDATE chat_messages SET content = ?, citations = ?, tool_calls = ?, mode = ? "
+            "WHERE id = ? AND repo_id = ? AND user_id = ?",
+            [answer, json.dumps(citations), json.dumps([*previous.get("tool_calls", []), *([check] if check else [])]),
+             mode, message_id, repo["id"], user_id],
+        )
+    except Exception:
+        logger.warning("Could not store the continued answer for repository %s", repo["id"], exc_info=True)
+    yield "done", {
+        "answer": answer, "mode": mode, "citations": citations, "tool_calls": [],
+        "latency_ms": int((time.time() - started) * 1000), "tokens_used": 0, "model_profile": model_profile,
+        "workflow": workflow, "evidence_plan": evidence_plan, "answer_references": answer_references,
+        "unverified_identifiers": unverified_identifiers, "truncated": truncated,
+        "answer_failure": None, "answer_notice": answer_notice, "message_id": message_id, "continued": True,
+        "edit_suggestion": None, "edit_ticket": None,
         "snapshot": {"commit_sha": repo.get("commit_sha"), "github_url": repo.get("github_url")},
     }
 
@@ -1277,6 +1515,7 @@ async def get_conversation(
         page = rows[:limit]
         for message in page:
             message["citations"] = _history_citations(message.get("citations"))
+            restore_answer_check(message)
         messages = list(reversed(page))
         return {
             "messages": messages,

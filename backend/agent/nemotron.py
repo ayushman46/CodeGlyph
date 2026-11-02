@@ -17,7 +17,26 @@ logger = logging.getLogger(__name__)
 
 
 class LLMProviderError(RuntimeError):
-    """A safe, user-facing failure from the configured model provider."""
+    """A safe, user-facing failure from the configured model provider.
+
+    ``reason`` names the cause in one word so the answer pipeline can tell
+    the user what went wrong: "timeout", "connection", "rate_limited",
+    "unavailable" (HTTP 5xx), "http_error", "planning" (reasoning instead of
+    an answer), "length" (the output budget ran out before any answer),
+    "empty", "interrupted" or "invalid". ``status`` is the HTTP status, if any.
+    ``cause`` says why an "interrupted" stream stopped ("timeout",
+    "connection", "unavailable", ...), when that is known.
+    """
+
+    default_reason = "invalid"
+
+    def __init__(
+        self, message: str = "", *, reason: str | None = None, status: int | None = None, cause: str | None = None,
+    ):
+        super().__init__(message)
+        self.reason = reason or self.default_reason
+        self.status = status
+        self.cause = cause
 
 
 class LLMOutputTruncatedError(LLMProviderError):
@@ -27,9 +46,26 @@ class LLMOutputTruncatedError(LLMProviderError):
     editor answers with a plan to split the change instead.
     """
 
+    default_reason = "length"
+
 
 class _EmptyCompletion(LLMProviderError):
     """A model returned no answer content; another model may still answer."""
+
+    default_reason = "empty"
+
+
+class TruncatedAnswer(str):
+    """An answer that stopped at ``max_tokens`` (finish_reason "length").
+
+    complete() returns the visible answer as this type, and stream_complete()
+    yields an empty instance after the last text. The text is real answer
+    content, but it ends wherever the budget ran out, often mid-sentence, so
+    it must never be presented or stored as a complete answer.
+    """
+
+
+ANSWER_TRUNCATED = TruncatedAnswer("")
 
 
 _THINKING_BLOCK = re.compile(r"<(?:think|analysis|reasoning)>.*?</(?:think|analysis|reasoning)>", re.IGNORECASE | re.DOTALL)
@@ -59,9 +95,24 @@ _CODE_EDIT_BLOCK = re.compile(r"<code_edit>\s*.*?</code_edit>", re.IGNORECASE | 
 _FINAL_LABEL = re.compile(
     r"(?ims)^\s*(?:final(?:\s+(?:answer|response))?|assistant\s+response)\s*:\s*(.+)\Z"
 )
+# Reasoning a model printed as its answer. With thinking enabled, Nemotron
+# Ultra wrote untagged reasoning ("The user wants a go/no-go risk summary...
+# I need to use only the evidence provided") into ``content``, and the user saw
+# it as the reply. Every phrase here is one a real answer does not start with.
+# Answers about user-facing flows do start "The user needs a valid session
+# token" or "The user requests a reset through `POST /reset`", so "wants",
+# "needs" and similar count only when they describe the question: aimed at the
+# assistant ("wants me to") or asking for an answer ("wants a summary", "would
+# like to know"). Every phrase stays shorter than the 40-character paragraph
+# threshold, so the streaming filter can decide as soon as it has 40 characters.
 _INTERNAL_PLANNING_PREFIX = re.compile(
-    r"^\s*(?:analysis\s*:|reasoning\s*:|the user (?:said|asked|is asking)|"
-    r"i (?:should|need to|will)|we (?:should|need to|will)|no need to)\b",
+    r"^\s*(?:analysis\s*:|reasoning\s*:|"
+    r"the user (?:said|asked|is asking|has asked)|"
+    r"the user (?:wants|would like|needs|is requesting|requests) (?:me|us)|"
+    r"the user (?:wants|would like|is requesting) (?:a|an|to know|to understand)|"
+    r"i (?:should|need to|will)|we (?:should|need to|will)|no need to|"
+    r"let me (?:think|analy[sz]e|re-?read|figure out|look (?:at|through) the evidence|check the evidence)|"
+    r"(?:okay|ok|alright)[,.]?\s+(?:so|let(?:'s| me)|the user|i|we))\b",
     re.IGNORECASE,
 )
 
@@ -156,7 +207,7 @@ def _user_facing_answer(visible: str) -> str:
     if final_match:
         cleaned = final_match.group(1).strip()
     if not cleaned or _INTERNAL_PLANNING_PREFIX.match(cleaned):
-        raise LLMProviderError("NVIDIA returned internal planning instead of a user-facing answer.")
+        raise LLMProviderError("NVIDIA returned internal planning instead of a user-facing answer.", reason="planning")
     return cleaned
 
 
@@ -283,8 +334,10 @@ async def complete(
                         raise _EmptyCompletion("NVIDIA returned an empty completion.")
                     choice = response.choices[0]
                     content = choice.message.content
-                    if tag and getattr(choice, "finish_reason", None) == "length":
+                    truncated = getattr(choice, "finish_reason", None) == "length"
+                    if truncated:
                         logger.warning("NVIDIA reply truncated: model=%s max_tokens=%d", model_name, token_limit)
+                    if tag and truncated:
                         raise LLMOutputTruncatedError(
                             f"The reply reached the {token_limit:,}-token output limit before it was complete."
                         )
@@ -303,7 +356,15 @@ async def complete(
                         # No tagged block: the caller's parser reports exactly
                         # what is missing, which a repair request can name.
                         return visible
-                    return user_facing_content(content)
+                    try:
+                        answer = user_facing_content(content)
+                    except LLMProviderError as error:
+                        if truncated:
+                            raise _length_failure() from error
+                        raise
+                    # An answer cut at the budget is still returned, marked so
+                    # it is shown as incomplete and can be continued.
+                    return TruncatedAnswer(answer) if truncated else answer
                 except _EmptyCompletion as error:
                     # An empty reply is transient for this model: try the
                     # next configured model instead of failing the request.
@@ -333,16 +394,8 @@ async def complete(
                 break
 
         if isinstance(last_error, _EmptyCompletion):
-            raise LLMProviderError(str(last_error)) from last_error
-        if isinstance(last_error, APITimeoutError):
-            raise LLMProviderError("NVIDIA timed out while generating the answer after retries.") from last_error
-        if isinstance(last_error, APIConnectionError):
-            raise LLMProviderError("Could not connect to NVIDIA while generating the answer after retries.") from last_error
-        if isinstance(last_error, APIStatusError):
-            raise LLMProviderError(
-                f"NVIDIA could not generate the answer after retries (HTTP {last_error.status_code})."
-            ) from last_error
-        raise LLMProviderError("NVIDIA returned an invalid response.") from last_error
+            raise LLMProviderError(str(last_error), reason="empty") from last_error
+        raise _provider_failure(last_error) from last_error
     except LLMProviderError:
         raise
     except Exception as error:
@@ -734,14 +787,23 @@ def _as_sdk_error(error: Exception, stream: Any) -> Exception:
 
 
 def _provider_failure(last_error: Exception | None) -> LLMProviderError:
-    """Build the same user-facing failure complete() raises after its retries."""
+    """Build the user-facing failure complete() and stream_complete() raise after their retries."""
     if isinstance(last_error, APITimeoutError):
-        return LLMProviderError("NVIDIA timed out while generating the answer after retries.")
+        return LLMProviderError("NVIDIA timed out while generating the answer after retries.", reason="timeout")
     if isinstance(last_error, APIConnectionError):
-        return LLMProviderError("Could not connect to NVIDIA while generating the answer after retries.")
+        return LLMProviderError("Could not connect to NVIDIA while generating the answer after retries.", reason="connection")
     if isinstance(last_error, APIStatusError):
-        return LLMProviderError(f"NVIDIA could not generate the answer after retries (HTTP {last_error.status_code}).")
+        status = last_error.status_code
+        reason = "rate_limited" if status == 429 else "unavailable" if status >= 500 else "http_error"
+        return LLMProviderError(
+            f"NVIDIA could not generate the answer after retries (HTTP {status}).", reason=reason, status=status,
+        )
     return LLMProviderError("NVIDIA returned an invalid response.")
+
+
+def _length_failure() -> LLMProviderError:
+    """The output budget ran out before any answer text: the model only reasoned."""
+    return LLMProviderError("The model reached its output limit before it wrote an answer.", reason="length")
 
 
 def _chunk_content(chunk: Any) -> str:
@@ -751,6 +813,15 @@ def _chunk_content(chunk: Any) -> str:
         return ""
     content = getattr(getattr(choices[0], "delta", None), "content", None)
     return content if isinstance(content, str) else ""
+
+
+def _chunk_finish_reason(chunk: Any) -> str | None:
+    """Return why generation stopped ("stop", "length", ...) when this chunk says so."""
+    choices = getattr(chunk, "choices", None)
+    if not choices:
+        return None
+    reason = getattr(choices[0], "finish_reason", None)
+    return reason if isinstance(reason, str) else None
 
 
 async def _close_stream(stream: Any) -> None:
@@ -778,6 +849,7 @@ async def stream_complete(
     would restart an answer the user is already reading. Consumers that may
     stop early should iterate inside ``contextlib.aclosing`` so the provider
     stream closes immediately rather than when the generator is collected.
+    An answer that stopped at ``max_tokens`` ends with ``ANSWER_TRUNCATED``.
     """
     api_key = require_nvidia_api_key()
     if not api_key:
@@ -792,6 +864,7 @@ async def stream_complete(
         # starts with a fresh filter instead of mixing two generations.
         content_filter = StreamingContentFilter()
         stream: Any = None
+        finish_reason: str | None = None
         try:
             await nvidia_rate_limiter.acquire()
             stream = await client.chat.completions.create(
@@ -812,6 +885,7 @@ async def stream_complete(
             )
             try:
                 async for chunk in stream:
+                    finish_reason = _chunk_finish_reason(chunk) or finish_reason
                     safe_text = content_filter.feed(_chunk_content(chunk))
                     if content_filter.take_restart():
                         # Text already shown was reasoning (a stray closing
@@ -824,20 +898,41 @@ async def stream_complete(
                 # Runs on errors, early consumer exit (GeneratorExit) and
                 # cancellation alike; none of them are swallowed here.
                 await _close_stream(stream)
-            remaining = content_filter.finish()
+            truncated = finish_reason == "length"
+            try:
+                remaining = content_filter.finish()
+            except LLMProviderError as error:
+                # Reasoning that ran out of budget is a "length" failure, not a
+                # planning reply the model chose to send.
+                if truncated:
+                    raise _length_failure() from error
+                raise
             if remaining:
                 yielded = True
                 yield remaining
             if not yielded:
-                raise LLMProviderError("NVIDIA returned a completion without answer content.")
+                if truncated:
+                    raise _length_failure()
+                raise LLMProviderError("NVIDIA returned a completion without answer content.", reason="empty")
+            if truncated:
+                logger.warning("NVIDIA answer truncated: model=%s max_tokens=%d", model_name,
+                               max_tokens or settings.answer_max_tokens)
+                yield ANSWER_TRUNCATED
             return
         except LLMProviderError:
             raise
         except Exception as error:
-            _log_provider_failure(model_name, attempt, attempts, _as_sdk_error(error, stream))
+            sdk_error = _as_sdk_error(error, stream)
+            _log_provider_failure(model_name, attempt, attempts, sdk_error)
             if yielded:
-                raise LLMProviderError("The answer stream was interrupted.") from error
-            last_error = _as_sdk_error(error, stream)
+                # The cause stays with the error so the chat can say why the
+                # answer stopped (a read timeout, a dropped connection, ...).
+                cause = _provider_failure(sdk_error)
+                raise LLMProviderError(
+                    "The answer stream was interrupted.", reason="interrupted",
+                    cause=cause.reason if cause.reason != "invalid" else None, status=cause.status,
+                ) from error
+            last_error = sdk_error
             # Same rule as complete(): retired models (404/410), auth and
             # validation errors never recover, so only outages are retried.
             if not is_transient_provider_error(last_error) or attempt == attempts - 1:
